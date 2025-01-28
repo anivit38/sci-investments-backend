@@ -17,7 +17,7 @@ app.get("/api/stock-finder", (req, res) => {
     res.json({ message: "Stock Finder data goes here" });
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
 });
