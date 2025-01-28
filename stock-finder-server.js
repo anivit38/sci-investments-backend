@@ -5,10 +5,22 @@ const yahooFinance = require("yahoo-finance2").default;
 const axios = require("axios");
 
 const app = express();
-app.use(cors());
+app.use(cors()); // Allows frontend to access the API
 app.use(express.json());
 
-const PORT = 5002; // ✅ Now running on port 5002
+app.get("/", (req, res) => {
+    res.send("Stock Finder API is running!");
+});
+
+// Example API route for stock finder
+app.get("/api/stock-finder", (req, res) => {
+    res.json({ message: "Stock Finder data goes here" });
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+});
 
 // Load symbols and industry data
 let symbols = {};
