@@ -6,7 +6,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 5001; // Different port to avoid conflict with the stock finder server
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+});
 
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent, avgVolume } = req.body;
