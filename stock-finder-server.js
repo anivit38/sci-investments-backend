@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const bcrypt = require("bcrypt");
+const bcrypt = require("bcryptjs");
 const mongoose = require('mongoose');
 const UserModel = require('../models/User');
 
@@ -47,6 +47,7 @@ app.post("/signup", async (req, res) => {
   
       console.log("Hashing password...");
       const hashedPassword = await bcrypt.hash(password, 10);
+
   
       console.log("Saving new user...");
       const user = new UserModel({ email, username, password: hashedPassword });
