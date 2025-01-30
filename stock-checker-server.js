@@ -7,15 +7,17 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
+
+// Health check route (important for Render)
+app.get("/", (req, res) => {
+  res.send("✅ Stock Checker API is running!");
 });
 
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent, avgVolume } = req.body;
 
-  if (!symbol || !intent) {
-    return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
+  if (!symbol || !intent || typeof avgVolume !== "number") {
+    return res.status(400).json({ message: "Stock symbol, intent (buy/sell), and avgVolume (number) are required." });
   }
 
   try {
@@ -23,20 +25,20 @@ app.post("/api/check-stock", async (req, res) => {
       modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
     });
 
-    if (!stock) {
-      return res.status(404).json({ message: "Stock not found." });
+    if (!stock || !stock.price) {
+      return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
 
     const metrics = {
-      volume: stock.price?.regularMarketVolume,
-      currentPrice: stock.price?.regularMarketPrice,
-      peRatio: stock.summaryDetail?.trailingPE,
-      pbRatio: stock.summaryDetail?.priceToBook,
-      dividendYield: stock.summaryDetail?.dividendYield,
-      earningsGrowth: stock.financialData?.earningsGrowth,
-      debtRatio: stock.financialData?.debtToEquity,
-      avg50Days: stock.price?.fiftyDayAverage,
-      avg200Days: stock.price?.twoHundredDayAverage,
+      volume: stock.price?.regularMarketVolume ?? 0,
+      currentPrice: stock.price?.regularMarketPrice ?? 0,
+      peRatio: stock.summaryDetail?.trailingPE ?? 0,
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,
+      earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
+      debtRatio: stock.financialData?.debtToEquity ?? 0,
+      avg50Days: stock.price?.fiftyDayAverage ?? 0,
+      avg200Days: stock.price?.twoHundredDayAverage ?? 0,
     };
 
     let stockRating = 0;
@@ -52,7 +54,6 @@ app.post("/api/check-stock", async (req, res) => {
     else if (metrics.pbRatio > 3) stockRating -= 2;
 
     if (metrics.dividendYield > 0.05) stockRating += 2;
-
     if (metrics.earningsGrowth > 0.05) stockRating += 2;
 
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
@@ -75,11 +76,12 @@ app.post("/api/check-stock", async (req, res) => {
 
     res.json({ symbol, stockRating, advice, metrics });
   } catch (error) {
-    console.error("Error fetching stock data:", error.message);
-    res.status(500).json({ message: "Error fetching stock data." });
+    console.error("❌ Error fetching stock data:", error);
+    res.status(500).json({ message: "Error fetching stock data.", error: error.message });
   }
 });
 
+// Start the server
 app.listen(PORT, () => {
-  console.log(`Stock Checker server running on http://localhost:${PORT}`);
+  console.log(`🚀 Stock Checker API running on http://localhost:${PORT}`);
 });

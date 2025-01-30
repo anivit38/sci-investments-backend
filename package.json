@@ -6,11 +6,7 @@
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
-  "description": "",
   "dependencies": {
     "axios": "^1.7.9",
     "bcrypt": "^5.1.1",
@@ -19,6 +15,7 @@
     "express": "^4.21.2",
     "mongoose": "^8.9.3",
     "node-fetch": "^3.3.2",
-    "yahoo-finance2": "^2.13.3"
+    "yahoo-finance2": "^2.13.3",
+    "dotenv": "^16.3.1" 
   }
 }

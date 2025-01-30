@@ -1,24 +1,59 @@
-const fs = require('fs');
+const fs = require("fs");
+const path = require("path");
 
-// Path to your symbols.json file
-const filePath = './symbols.json';
+// ✅ Use absolute path for better compatibility (Render support)
+const filePath = path.resolve(__dirname, "symbols.json");
 
 try {
-    // Read and parse the symbols.json file
-    const symbols = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  if (!fs.existsSync(filePath)) {
+    throw new Error("symbols.json file not found! Please ensure it exists.");
+  }
 
-    // Validate each symbol
-    const validSymbols = symbols.filter(symbol => typeof symbol === 'string' && symbol.trim() !== '');
-    const invalidSymbols = symbols.filter(symbol => typeof symbol !== 'string' || symbol.trim() === '');
+  // Read & parse file
+  const rawData = fs.readFileSync(filePath, "utf-8");
+  const symbolsData = JSON.parse(rawData);
 
-    // Log results
-    console.log(`Total Symbols: ${symbols.length}`);
-    console.log(`Valid Symbols: ${validSymbols.length}`);
-    console.log(`Invalid Symbols: ${invalidSymbols.length}`);
+  if (typeof symbolsData !== "object" || Array.isArray(symbolsData)) {
+    throw new Error("Invalid symbols.json format. Expected an object with exchanges as keys.");
+  }
 
-    // Optionally write the valid symbols back to the file
-    fs.writeFileSync(filePath, JSON.stringify(validSymbols, null, 2), 'utf-8');
-    console.log('Valid symbols have been saved back to symbols.json');
+  let totalSymbols = 0;
+  let validSymbolsData = {};
+  let invalidSymbols = [];
+
+  // Validate each exchange
+  Object.keys(symbolsData).forEach((exchange) => {
+    const symbols = symbolsData[exchange];
+
+    if (!Array.isArray(symbols)) {
+      console.error(`❌ Invalid data for exchange "${exchange}". Expected an array.`);
+      return;
+    }
+
+    const validSymbols = symbols.filter((symbol) => typeof symbol === "string" && symbol.trim() !== "");
+    const invalid = symbols.filter((symbol) => typeof symbol !== "string" || symbol.trim() === "");
+
+    totalSymbols += symbols.length;
+    validSymbolsData[exchange] = validSymbols;
+    invalidSymbols.push(...invalid.map((symbol) => ({ exchange, symbol })));
+  });
+
+  // ✅ Log Results
+  console.log(`🔍 Total Symbols Processed: ${totalSymbols}`);
+  console.log(`✅ Valid Symbols: ${Object.values(validSymbolsData).flat().length}`);
+  console.log(`❌ Invalid Symbols: ${invalidSymbols.length}`);
+
+  if (invalidSymbols.length > 0) {
+    console.log("🛑 Invalid Symbols Found:", JSON.stringify(invalidSymbols, null, 2));
+  }
+
+  // ✅ Write back only if changes are needed
+  if (invalidSymbols.length > 0) {
+    fs.writeFileSync(filePath, JSON.stringify(validSymbolsData, null, 2), "utf-8");
+    console.log("✅ Cleaned symbols have been saved to symbols.json");
+  } else {
+    console.log("✅ No invalid symbols found. No changes made.");
+  }
 } catch (error) {
-    console.error('Error validating symbols.json:', error.message);
+  console.error("❌ Error validating symbols.json:", error.message);
 }
