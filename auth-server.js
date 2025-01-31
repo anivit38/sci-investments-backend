@@ -6,7 +6,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken"); // 🔑 Added JWT for authentication
 const mongoose = require("mongoose");
 const path = require("path");
-const UserModel = require('../../models/User');
+const UserModel = require(path.join(__dirname, "models/User"));
+
 
 
 console.log("Current Directory:", __dirname);
