@@ -5,7 +5,7 @@ const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken"); // 🔑 Added JWT for authentication
 const mongoose = require("mongoose");
-const UserModel = require("../models/User");
+const UserModel = require('../../models/User');
 
 const app = express();
 app.use(cors());
