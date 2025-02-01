@@ -10,7 +10,8 @@ const UserModel = require(path.join(__dirname, "models", "User"));
 
 const app = express();
 app.use(cors());
-app.use(bodyPalrser.json());
+app.use(bodyParser.json());
+
 
 // Updated Port for the Express Server
 const PORT = 5002;
