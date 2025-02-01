@@ -12,7 +12,7 @@ const UserModel = require(path.join(__dirname, "models", "User"));
 
 console.log("Current Directory:", __dirname);
 console.log("Checking if User.js exists:", require("fs").existsSync(__dirname + "/models/User.js"));
-
+console.log("✅ Checking if models/user.js exists:", require("fs").existsSync(__dirname + "/models/user.js"));
 
 const app = express();
 app.use(cors());

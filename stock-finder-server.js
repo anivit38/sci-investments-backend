@@ -3,7 +3,10 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const mongoose = require('mongoose');
-const UserModel = require('../models/User');
+const path = require("path");
+const UserModel = require(path.join(__dirname, "models", "User"));
+
+
 
 const app = express();
 app.use(cors());
