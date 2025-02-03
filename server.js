@@ -201,6 +201,66 @@ app.post("/api/check-stock", async (req, res) => {
  * routes in stock-finder not covered above, add them here.
  ******************************************************/
 
+// Below, we add the stock-finder endpoints under a new "/finder" prefix to keep them separate.
+const finderRouter = express.Router();
+
+finderRouter.post("/signup", async (req, res) => {
+  console.log("Stock Finder - Incoming Request Body:", req.body);
+  const { email, username, password } = req.body;
+  if (!email || !username || !password) {
+    console.error("Missing required fields!");
+    return res.status(400).json({ message: "All fields are required." });
+  }
+  
+  try {
+    console.log("Stock Finder - Checking if user exists...");
+    const existingUser = await UserModel.findOne({ email });
+    if (existingUser) {
+      console.error("Stock Finder - User already exists!");
+      return res.status(400).json({ message: "Email already in use." });
+    }
+  
+    console.log("Stock Finder - Hashing password...");
+    const hashedPassword = await bcrypt.hash(password, 10);
+  
+    console.log("Stock Finder - Saving new user...");
+    const user = new UserModel({ email, username, password: hashedPassword });
+    await user.save();
+  
+    console.log("Stock Finder - User saved successfully!");
+    return res.status(201).json({ message: "User registered successfully." });
+  } catch (error) {
+    console.error("Stock Finder - Signup Error:", error);
+    return res.status(500).json({ message: "Error during signup." });
+  }
+});
+
+finderRouter.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: "Username and password are required." });
+  }
+
+  try {
+    const user = await UserModel.findOne({ username });
+    if (!user) {
+      return res.status(401).json({ message: "Invalid credentials." });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: "Invalid credentials." });
+    }
+
+    return res.status(200).json({ message: "Login successful." });
+  } catch (error) {
+    console.error("Stock Finder - Login Error:", error);
+    return res.status(500).json({ message: "Error during login." });
+  }
+});
+
+app.use("/finder", finderRouter);
+
 /******************************************************
  * START THE COMBINED SERVER
  ******************************************************/
