@@ -204,6 +204,7 @@ app.post("/api/check-stock", async (req, res) => {
 // Below, we add the stock-finder endpoints under a new "/finder" prefix to keep them separate.
 const finderRouter = express.Router();
 
+// ✅ Signup Endpoint
 finderRouter.post("/signup", async (req, res) => {
   console.log("Stock Finder - Incoming Request Body:", req.body);
   const { email, username, password } = req.body;
@@ -235,6 +236,7 @@ finderRouter.post("/signup", async (req, res) => {
   }
 });
 
+// ✅ Login Endpoint
 finderRouter.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -259,7 +261,36 @@ finderRouter.post("/login", async (req, res) => {
   }
 });
 
+// ✅ Stock Finder Endpoint (Moved Outside Login)
+finderRouter.post("/api/find-stocks", async (req, res) => {
+  const { category, exchange, minVolume } = req.body;
+
+  if (!category || !exchange || !minVolume) {
+    return res.status(400).json({ message: "Category, exchange, and minVolume are required." });
+  }
+
+  try {
+    // Fetch stocks from Yahoo Finance
+    const stocks = await yahooFinance.search(category);
+
+    if (!stocks.quotes || stocks.quotes.length === 0) {
+      return res.status(404).json({ message: "No stocks found matching criteria." });
+    }
+
+    // Filter stocks based on exchange and minVolume
+    const filteredStocks = stocks.quotes.filter(stock =>
+      stock.exchange === exchange && stock.regularMarketVolume >= minVolume
+    );
+
+    return res.json({ stocks: filteredStocks });
+  } catch (error) {
+    return res.status(500).json({ message: "Error fetching stocks.", error: error.message });
+  }
+});
+
+// ✅ Attach the Finder Router
 app.use("/finder", finderRouter);
+
 
 /******************************************************
  * START THE COMBINED SERVER
