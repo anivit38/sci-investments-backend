@@ -6,7 +6,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const bodyParser = require("body-parser"); 
+const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -20,7 +20,7 @@ const yahooFinance = require("yahoo-finance2").default;
 // 3. Create a Single Express App
 const app = express();
 app.use(cors());
-app.use(bodyParser.json()); // or app.use(express.json())
+app.use(bodyParser.json());
 
 // 4. Connect to MongoDB (only once)
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
@@ -194,17 +194,28 @@ app.post("/api/check-stock", async (req, res) => {
   }
 });
 
+
 /******************************************************
- * SECTION C: (Optional) Stock-Finder Extra Endpoints
- * The stock-finder file duplicates signup/login, so
- * we skip them to avoid conflicts. If you have unique
- * routes in stock-finder not covered above, add them here.
+ * SECTION C: Stock-Finder Extra Endpoints
+ * These endpoints use unique routes under the "/finder" prefix.
  ******************************************************/
+finderRouter.post("/api/find-stocks", async (req, res) => {
+  console.log("⏰ Incoming body for find-stocks:", req.body);  // <--- Add this
 
-// Below, we add the stock-finder endpoints under a new "/finder" prefix to keep them separate.
-const finderRouter = express.Router();
+  const { stockType, exchange, maxPrice } = req.body;
+  if (!stockType || !exchange || maxPrice == null) {
+    console.log("❌ Validation failed. Body was:", req.body);
+    return res.status(400).json({ message: "stockType, exchange, and maxPrice are required." });
+  }
+  if (stockType !== "growth" && stockType !== "stable") {
+    console.log("❌ Unknown stockType:", stockType);
+    return res.status(400).json({ message: "stockType must be either 'growth' or 'stable'." });
+  }
 
-// ✅ Signup Endpoint
+  // (rest of your code)
+});
+
+// Stock Finder Signup Endpoint
 finderRouter.post("/signup", async (req, res) => {
   console.log("Stock Finder - Incoming Request Body:", req.body);
   const { email, username, password } = req.body;
@@ -220,14 +231,14 @@ finderRouter.post("/signup", async (req, res) => {
       console.error("Stock Finder - User already exists!");
       return res.status(400).json({ message: "Email already in use." });
     }
-  
+    
     console.log("Stock Finder - Hashing password...");
     const hashedPassword = await bcrypt.hash(password, 10);
-  
+    
     console.log("Stock Finder - Saving new user...");
     const user = new UserModel({ email, username, password: hashedPassword });
     await user.save();
-  
+    
     console.log("Stock Finder - User saved successfully!");
     return res.status(201).json({ message: "User registered successfully." });
   } catch (error) {
@@ -236,24 +247,24 @@ finderRouter.post("/signup", async (req, res) => {
   }
 });
 
-// ✅ Login Endpoint
+// Stock Finder Login Endpoint
 finderRouter.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ message: "Username and password are required." });
   }
-
+  
   try {
     const user = await UserModel.findOne({ username });
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
+    
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
+    
     return res.status(200).json({ message: "Login successful." });
   } catch (error) {
     console.error("Stock Finder - Login Error:", error);
@@ -261,36 +272,175 @@ finderRouter.post("/login", async (req, res) => {
   }
 });
 
-// ✅ Stock Finder Endpoint (Moved Outside Login)
+// Stock Finder Main Endpoint
 finderRouter.post("/api/find-stocks", async (req, res) => {
-  const { category, exchange, minVolume } = req.body;
+  const { stockType, exchange, maxPrice } = req.body;
 
-  if (!category || !exchange || !minVolume) {
-    return res.status(400).json({ message: "Category, exchange, and minVolume are required." });
+  // Validate input
+  if (!stockType || !exchange || maxPrice == null) {
+    return res.status(400).json({ message: "stockType, exchange, and maxPrice are required." });
+  }
+  if (stockType !== "growth" && stockType !== "stable") {
+    return res.status(400).json({ message: "stockType must be either 'growth' or 'stable'." });
   }
 
-  try {
-    // Fetch stocks from Yahoo Finance
-    const stocks = await yahooFinance.search(category);
+  // 1. Load the entire JSON object with keys: { NASDAQ: [...], NYSE: [...], TSX: [...] }
+  const symbolGroups = require(path.join(__dirname, "symbols.json"));
+  console.log("Loaded symbolGroups:", symbolGroups);
 
-    if (!stocks.quotes || stocks.quotes.length === 0) {
-      return res.status(404).json({ message: "No stocks found matching criteria." });
+  // 2. Access the array of strings for the user's chosen exchange
+  const symbolsForExchange = symbolGroups[exchange.toUpperCase()];
+  if (!symbolsForExchange || symbolsForExchange.length === 0) {
+    return res.status(404).json({ message: `No symbols found for the exchange: ${exchange}` });
+  }
+
+  // 3. Convert each string symbol into an object { symbol, exchange }
+  let filteredSymbols = symbolsForExchange.map((symbolStr) => ({
+    symbol: symbolStr,
+    exchange: exchange,
+  }));
+
+  // 4. Fetch Yahoo Finance data for each symbol
+  let detailedStocks = await Promise.all(
+    filteredSymbols.map(async (symObj) => {
+      try {
+        const detailed = await yahooFinance.quoteSummary(symObj.symbol, {
+          modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
+        });
+        return { ...symObj, detailed };
+      } catch (error) {
+        console.error(`Error fetching data for ${symObj.symbol}:`, error.message);
+        return null;
+      }
+    })
+  );
+
+  // Filter out nulls (failed lookups)
+  detailedStocks = detailedStocks.filter((stock) => stock !== null);
+
+  // Debug: Log all current prices
+  console.log("🔎 Checking current prices for symbols in exchange:", exchange);
+  detailedStocks.forEach((stock) => {
+    const currentPrice = stock.detailed?.price?.regularMarketPrice;
+    console.log(`Symbol: ${stock.symbol} - Current Price: ${currentPrice}`);
+  });
+
+  // 5. Filter stocks by maxPrice (optional: relax this for debugging)
+  let priceFilteredStocks = detailedStocks.filter((stock) => {
+    const currentPrice = stock.detailed?.price?.regularMarketPrice;
+    console.log(
+      `Comparing ${stock.symbol}: Current Price = ${currentPrice}, maxPrice = ${maxPrice}`
+    );
+    // If you want strict filtering:
+    // return currentPrice !== undefined && currentPrice <= maxPrice;
+    // For debugging, let's accept all with a defined currentPrice:
+    return currentPrice !== undefined;
+  });
+
+  if (priceFilteredStocks.length === 0) {
+    let prices = detailedStocks.map((stock) => ({
+      symbol: stock.symbol,
+      currentPrice: stock.detailed?.price?.regularMarketPrice,
+    }));
+    console.warn("No stocks passed the maxPrice filter. Available prices:", prices);
+    return res.status(404).json({
+      message:
+        "No stocks found with a price at or below the specified maxPrice. Please adjust your maxPrice.",
+    });
+  }
+
+  // 6. Calculate average volume
+  const totalVolume = priceFilteredStocks.reduce((sum, stock) => {
+    const vol = stock.detailed?.price?.regularMarketVolume ?? 0;
+    return sum + vol;
+  }, 0);
+  const avgVolume = totalVolume / priceFilteredStocks.length;
+  console.log(`Calculated average volume: ${avgVolume}`);
+
+  // 7. Score & classify
+  const evaluatedStocks = priceFilteredStocks.map((stock) => {
+    const priceData = stock.detailed.price || {};
+    const summaryData = stock.detailed.summaryDetail || {};
+    const financialData = stock.detailed.financialData || {};
+
+    const metrics = {
+      volume: priceData.regularMarketVolume ?? 0,
+      currentPrice: priceData.regularMarketPrice ?? 0,
+      peRatio: summaryData.trailingPE ?? 0,
+      pbRatio: summaryData.priceToBook ?? 0,
+      dividendYield: summaryData.dividendYield ?? 0,
+      earningsGrowth: financialData.earningsGrowth ?? 0,
+      debtRatio: financialData.debtToEquity ?? 0,
+      avg50Days: priceData.fiftyDayAverage ?? 0,
+      avg200Days: priceData.twoHundredDayAverage ?? 0,
+    };
+
+    let stockRating = 0;
+
+    // Scoring based on volume relative to avgVolume
+    if (metrics.volume > avgVolume * 1.1) stockRating += 2;
+    else if (metrics.volume < avgVolume * 0.9) stockRating -= 2;
+
+    // P/E ratio
+    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
+    else if (metrics.peRatio > 20) stockRating -= 1;
+
+    // P/B ratio
+    if (metrics.pbRatio < 1) stockRating += 2;
+    else if (metrics.pbRatio > 3) stockRating -= 2;
+
+    // Dividend yield + earnings growth
+    if (metrics.dividendYield > 0.05) stockRating += 2;
+    if (metrics.earningsGrowth > 0.05) stockRating += 2;
+
+    // Debt-to-equity
+    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
+    else if (metrics.debtRatio > 0.7) stockRating -= 2;
+
+    // Moving averages
+    if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
+      stockRating += 2;
+    } else if (metrics.currentPrice < metrics.avg50Days && metrics.avg50Days < metrics.avg200Days) {
+      stockRating -= 2;
     }
 
-    // Filter stocks based on exchange and minVolume
-    const filteredStocks = stocks.quotes.filter(stock =>
-      stock.exchange === exchange && stock.regularMarketVolume >= minVolume
-    );
+    // Classification
+    const classification =
+      stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
 
-    return res.json({ stocks: filteredStocks });
-  } catch (error) {
-    return res.status(500).json({ message: "Error fetching stocks.", error: error.message });
-  }
+    // Advice
+    let advice;
+    if (stockRating >= 25) advice = "Very Good Stock to Buy";
+    else if (stockRating >= 15) advice = "Good Stock to Buy";
+    else if (stockRating >= 5) advice = "Okay Stock to Buy";
+    else if (stockRating >= -5) advice = "Neutral Stock";
+    else advice = "Bad Stock to Buy";
+
+    return {
+      symbol: stock.symbol,
+      exchange: stock.exchange,
+      currentPrice: metrics.currentPrice,
+      metrics,
+      stockRating,
+      classification,
+      advice,
+    };
+  });
+
+  // Log all evaluated stocks
+  console.log("Evaluated Stocks:", evaluatedStocks);
+
+  // 8. Filter by user’s desired stockType
+  const matchingStocks = evaluatedStocks.filter(
+    (stock) => stock.classification === stockType
+  );
+  console.log(`Found ${matchingStocks.length} matching stocks for type "${stockType}".`);
+
+  return res.json({ stocks: matchingStocks });
 });
 
-// ✅ Attach the Finder Router
+// Attach the Finder Router to the main app.
 app.use("/finder", finderRouter);
-
 
 /******************************************************
  * START THE COMBINED SERVER
