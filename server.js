@@ -445,6 +445,71 @@ finderRouter.post("/login", async (req, res) => {
 app.use("/finder", finderRouter);
 
 /******************************************************
+ * SECTION D: Dashboard Popular Stocks Endpoint
+ * This endpoint returns the top 10 stocks based on daily performance.
+ * It accepts a query parameter "marketState" (either "open" or "closed")
+ * to determine whether to filter for intraday positive change (open)
+ * or simply return the top gainers (when closed).
+ ******************************************************/
+app.get("/api/popular-stocks", async (req, res) => {
+  const marketState = req.query.marketState || "open"; // default to "open"
+  
+  try {
+    // For this example, we use the NASDAQ symbols from symbols.json.
+    const symbolGroups = require(path.join(__dirname, "symbols.json"));
+    const nasdaqSymbols = symbolGroups["NASDAQ"] || [];
+    if (nasdaqSymbols.length === 0) {
+      return res.status(404).json({ message: "No symbols available for NASDAQ." });
+    }
+  
+    // Fetch price data for each symbol concurrently
+    let stockData = await Promise.all(
+      nasdaqSymbols.map(async (symbol) => {
+        try {
+          const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
+          return { symbol, price: data.price };
+        } catch (error) {
+          console.error(`Error fetching data for ${symbol}:`, error.message);
+          return null;
+        }
+      })
+    );
+  
+    // Filter out failed lookups and ensure required fields are present
+    stockData = stockData.filter(
+      (s) => s !== null && s.price && s.price.regularMarketChangePercent !== undefined
+    );
+  
+    // Sort descending by change percent
+    stockData.sort(
+      (a, b) =>
+        b.price.regularMarketChangePercent - a.price.regularMarketChangePercent
+    );
+  
+    // If the market is open, return only stocks with positive change
+    if (marketState === "open") {
+      stockData = stockData.filter((s) => s.price.regularMarketChangePercent > 0);
+    }
+  
+    // Limit to top 10 stocks
+    const topStocks = stockData.slice(0, 10).map((s) => ({
+      symbol: s.symbol,
+      score: s.price.regularMarketChangePercent, // using change percent as a "score"
+      metrics: {
+        currentPrice: s.price.regularMarketPrice,
+        changePercent: s.price.regularMarketChangePercent,
+        previousClose: s.price.regularMarketPreviousClose,
+      },
+    }));
+  
+    return res.json(topStocks);
+  } catch (error) {
+    console.error("❌ Error in /api/popular-stocks:", error.message);
+    return res.status(500).json({ message: "Error fetching popular stocks." });
+  }
+});
+
+/******************************************************
  * START THE COMBINED SERVER
  ******************************************************/
 const PORT = process.env.PORT || 5000;
