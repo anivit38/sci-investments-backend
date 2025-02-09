@@ -125,11 +125,12 @@ app.get("/protected", (req, res) => {
  * SECTION B: Stock Checker (from stock-checker-server.js)
  ******************************************************/
 app.post("/api/check-stock", async (req, res) => {
-  const { symbol, intent, avgVolume } = req.body;
-  if (!symbol || !intent || typeof avgVolume !== "number") {
+  // Remove avgVolume from the required fields.
+  const { symbol, intent } = req.body;
+  if (!symbol || !intent) {
     return res
       .status(400)
-      .json({ message: "Stock symbol, intent (buy/sell), and avgVolume (number) are required." });
+      .json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
 
   try {
@@ -140,6 +141,12 @@ app.post("/api/check-stock", async (req, res) => {
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
+
+    // Compute average volume from Yahoo Finance data:
+    // Try to get the average daily volume for the past 3 months.
+    const computedAvgVolume = stock.summaryDetail?.averageDailyVolume3Month 
+      || stock.price?.regularMarketVolume 
+      || 0;
 
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
@@ -155,21 +162,38 @@ app.post("/api/check-stock", async (req, res) => {
 
     let stockRating = 0;
 
-    // Perform analysis
-    if (metrics.volume > avgVolume * 1.1) stockRating += 2;
-    else if (metrics.volume < avgVolume * 0.9) stockRating -= 2;
+    // Perform analysis using the computed average volume.
+    // Compare the current volume with the computed average volume.
+    if (metrics.volume > computedAvgVolume * 1.1) {
+      stockRating += 2;
+    } else if (metrics.volume < computedAvgVolume * 0.9) {
+      stockRating -= 2;
+    }
 
-    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
-    else if (metrics.peRatio > 20) stockRating -= 1;
+    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
+      stockRating += 2;
+    } else if (metrics.peRatio > 20) {
+      stockRating -= 1;
+    }
 
-    if (metrics.pbRatio < 1) stockRating += 2;
-    else if (metrics.pbRatio > 3) stockRating -= 2;
+    if (metrics.pbRatio < 1) {
+      stockRating += 2;
+    } else if (metrics.pbRatio > 3) {
+      stockRating -= 2;
+    }
 
-    if (metrics.dividendYield > 0.05) stockRating += 2;
-    if (metrics.earningsGrowth > 0.05) stockRating += 2;
+    if (metrics.dividendYield > 0.05) {
+      stockRating += 2;
+    }
+    if (metrics.earningsGrowth > 0.05) {
+      stockRating += 2;
+    }
 
-    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
-    else if (metrics.debtRatio > 0.7) stockRating -= 2;
+    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) {
+      stockRating += 2;
+    } else if (metrics.debtRatio > 0.7) {
+      stockRating -= 2;
+    }
 
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
@@ -177,13 +201,13 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 2;
     }
 
-    // Determine advice
+    // Determine advice based on the user's intent.
     let advice;
     if (intent === "buy") {
-      if (stockRating >= 25) advice = "Very Good Stock to Buy";
-      else if (stockRating >= 15) advice = "Good Stock to Buy";
-      else if (stockRating >= 5) advice = "Okay Stock to Buy";
-      else if (stockRating >= -5) advice = "Neutral Stock";
+      if (stockRating >= 8) advice = "Very Good Stock to Buy";
+      else if (stockRating >= 5) advice = "Good Stock to Buy";
+      else if (stockRating >= 0) advice = "Okay Stock to Buy";
+      else if (stockRating >= -5) advice = "Bad Stock";
       else advice = "Bad Stock to Buy";
     } else if (intent === "sell") {
       advice = stockRating < 0 ? "Sell the Stock" : "Hold the Stock";
@@ -355,10 +379,10 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
 
     // Advice
     let advice;
-    if (stockRating >= 25) advice = "Very Good Stock to Buy";
-    else if (stockRating >= 15) advice = "Good Stock to Buy";
-    else if (stockRating >= 5) advice = "Okay Stock to Buy";
-    else if (stockRating >= -5) advice = "Neutral Stock";
+    if (stockRating >= 8) advice = "Very Good Stock to Buy";
+    else if (stockRating >= 5) advice = "Good Stock to Buy";
+    else if (stockRating >= 0) advice = "Okay Stock to Buy";
+    else if (stockRating >= -5) advice = "Bad Stock";
     else advice = "Bad Stock to Buy";
 
     return {
