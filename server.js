@@ -174,14 +174,15 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 2;
     }
 
-    // P/E ratio
+    // P/E ratio scoring
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
       stockRating += 2;
     } else if (metrics.peRatio > 20) {
       stockRating -= 1;
     }
 
-    // Removed: pbRatio and dividendYield scoring.
+    // Removed: scoring based on pbRatio and dividendYield
+
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
@@ -346,7 +347,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (metrics.volume > avgVolume * 1.1) stockRating += 2;
     else if (metrics.volume < avgVolume * 0.9) stockRating -= 2;
 
-    // P/E ratio
+    // P/E ratio scoring
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
     else if (metrics.peRatio > 20) stockRating -= 1;
 
@@ -462,14 +463,26 @@ finderRouter.post("/login", async (req, res) => {
 app.use("/finder", finderRouter);
 
 /******************************************************
- * SECTION D: Dashboard Popular Stocks Endpoint
+ * SECTION D: Dashboard Popular Stocks Endpoint with Caching
  * This endpoint returns the top 10 stocks based on daily performance.
  * It accepts a query parameter "marketState" (either "open" or "closed")
  * to determine whether to filter for intraday positive change (open)
  * or simply return the top gainers (when closed).
+ * 
+ * An in-memory cache is implemented here to avoid making too many API requests.
  ******************************************************/
+let popularStocksCache = null;
+let popularStocksCacheTimestamp = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
+
 app.get("/api/popular-stocks", async (req, res) => {
   const marketState = req.query.marketState || "open"; // default to "open"
+
+  // Check if cached data exists and is fresh
+  if (popularStocksCache && (Date.now() - popularStocksCacheTimestamp) < CACHE_DURATION) {
+    console.log("Returning cached popular stocks data.");
+    return res.json(popularStocksCache);
+  }
   
   try {
     // For this example, we use the NASDAQ symbols from symbols.json.
@@ -519,6 +532,10 @@ app.get("/api/popular-stocks", async (req, res) => {
         previousClose: s.price.regularMarketPreviousClose,
       },
     }));
+    
+    // Update the cache
+    popularStocksCache = topStocks;
+    popularStocksCacheTimestamp = Date.now();
   
     return res.json(topStocks);
   } catch (error) {
