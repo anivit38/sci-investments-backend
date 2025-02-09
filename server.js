@@ -148,12 +148,12 @@ app.post("/api/check-stock", async (req, res) => {
       || stock.price?.regularMarketVolume 
       || 0;
 
+    // Build metrics without using dividendYield or pbRatio.
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      pbRatio: stock.summaryDetail?.priceToBook ?? 0,
-      dividendYield: stock.summaryDetail?.dividendYield ?? 0,
+      // Removed pbRatio and dividendYield
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
@@ -162,29 +162,21 @@ app.post("/api/check-stock", async (req, res) => {
 
     let stockRating = 0;
 
-    // Perform analysis using the computed average volume.
-    // Compare the current volume with the computed average volume.
+    // Analysis using computed average volume.
     if (metrics.volume > computedAvgVolume * 1.1) {
       stockRating += 2;
     } else if (metrics.volume < computedAvgVolume * 0.9) {
       stockRating -= 2;
     }
 
+    // P/E ratio
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
       stockRating += 2;
     } else if (metrics.peRatio > 20) {
       stockRating -= 1;
     }
 
-    if (metrics.pbRatio < 1) {
-      stockRating += 2;
-    } else if (metrics.pbRatio > 3) {
-      stockRating -= 2;
-    }
-
-    if (metrics.dividendYield > 0.05) {
-      stockRating += 2;
-    }
+    // Removed pbRatio and dividendYield scoring.
     
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
@@ -202,7 +194,7 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 2;
     }
 
-    // Determine advice based on the user's intent.
+    // Determine advice based on intent.
     let advice;
     if (intent === "buy") {
       if (stockRating >= 8) advice = "Very Good Stock to Buy";
@@ -330,12 +322,12 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     const summaryData = stock.detailed.summaryDetail || {};
     const financialData = stock.detailed.financialData || {};
 
+    // Build metrics without dividendYield and pbRatio.
     const metrics = {
       volume: priceData.regularMarketVolume ?? 0,
       currentPrice: priceData.regularMarketPrice ?? 0,
       peRatio: summaryData.trailingPE ?? 0,
-      pbRatio: summaryData.priceToBook ?? 0,
-      dividendYield: summaryData.dividendYield ?? 0,
+      // Removed: pbRatio and dividendYield
       earningsGrowth: financialData.earningsGrowth ?? 0,
       debtRatio: financialData.debtToEquity ?? 0,
       avg50Days: priceData.fiftyDayAverage ?? 0,
@@ -352,19 +344,13 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
     else if (metrics.peRatio > 20) stockRating -= 1;
 
-    // P/B ratio
-    if (metrics.pbRatio < 1) stockRating += 2;
-    else if (metrics.pbRatio > 3) stockRating -= 2;
+    // Removed: scoring based on pbRatio and dividendYield
 
-    // Dividend yield + earnings growth
-    if (metrics.dividendYield > 0.05) stockRating += 2;
     if (metrics.earningsGrowth > 0.05) stockRating += 2;
 
-    // Debt-to-equity
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
     else if (metrics.debtRatio > 0.7) stockRating -= 2;
 
-    // Moving averages
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
     } else if (
