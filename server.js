@@ -13,11 +13,6 @@ const mongoose = require("mongoose");
 const path = require("path");
 const fs = require("fs");
 
-// 1.1 Helper function: Delay (in milliseconds)
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
 const yahooFinance = require("yahoo-finance2").default;
@@ -141,7 +136,6 @@ app.post("/api/check-stock", async (req, res) => {
   try {
     const stock = await yahooFinance.quoteSummary(symbol, {
       modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
-      validate: false, // disable schema validation
     });
 
     if (!stock || !stock.price) {
@@ -154,12 +148,12 @@ app.post("/api/check-stock", async (req, res) => {
       || stock.price?.regularMarketVolume 
       || 0;
 
-    // Build metrics without using dividendYield or pbRatio.
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      // Removed: pbRatio and dividendYield
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
@@ -168,21 +162,30 @@ app.post("/api/check-stock", async (req, res) => {
 
     let stockRating = 0;
 
-    // Analysis using computed average volume.
+    // Perform analysis using the computed average volume.
+    // Compare the current volume with the computed average volume.
     if (metrics.volume > computedAvgVolume * 1.1) {
       stockRating += 2;
     } else if (metrics.volume < computedAvgVolume * 0.9) {
       stockRating -= 2;
     }
 
-    // P/E ratio scoring
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
       stockRating += 2;
     } else if (metrics.peRatio > 20) {
       stockRating -= 1;
     }
 
-    // Removed: scoring based on pbRatio and dividendYield
+    if (metrics.pbRatio < 1) {
+      stockRating += 2;
+    } else if (metrics.pbRatio > 3) {
+      stockRating -= 2;
+    }
+
+    if (metrics.dividendYield > 0.05) {
+      stockRating += 2;
+    }
+    
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
@@ -199,7 +202,7 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 2;
     }
 
-    // Determine advice based on intent.
+    // Determine advice based on the user's intent.
     let advice;
     if (intent === "buy") {
       if (stockRating >= 8) advice = "Very Good Stock to Buy";
@@ -250,7 +253,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   if (!symbolsForExchange || symbolsForExchange.length === 0) {
     return res
       .status(404)
-      .json({ message: `No symbols found for the exchange: ${exchange}` });
+      .json({ message: No symbols found for the exchange: ${exchange} });
   }
 
   // 3. Convert each string symbol into { symbol, exchange }
@@ -259,12 +262,10 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     exchange,
   }));
 
-  // 4. Fetch Yahoo Finance data for each symbol with a delay
+  // 4. Fetch Yahoo Finance data for each symbol
   let detailedStocks = await Promise.all(
     filteredSymbols.map(async (symObj) => {
       try {
-        // Add a delay of 200 ms between each request
-        await delay(200);
         const detailed = await yahooFinance.quoteSummary(symObj.symbol, {
           modules: [
             "financialData",
@@ -272,11 +273,10 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
             "summaryDetail",
             "defaultKeyStatistics",
           ],
-          validate: false, // disable schema validation
         });
         return { ...symObj, detailed };
       } catch (error) {
-        console.error(`Error fetching data for ${symObj.symbol}:`, error.message);
+        console.error(Error fetching data for ${symObj.symbol}:, error.message);
         return null;
       }
     })
@@ -289,14 +289,14 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   console.log("🔎 Checking current prices for symbols in exchange:", exchange);
   detailedStocks.forEach((stock) => {
     const currentPrice = stock.detailed?.price?.regularMarketPrice;
-    console.log(`Symbol: ${stock.symbol} - Current Price: ${currentPrice}`);
+    console.log(Symbol: ${stock.symbol} - Current Price: ${currentPrice});
   });
 
   // 5. Filter by maxPrice or relax the filter for debugging
   let priceFilteredStocks = detailedStocks.filter((stock) => {
     const currentPrice = stock.detailed?.price?.regularMarketPrice;
     console.log(
-      `Comparing ${stock.symbol}: Current Price = ${currentPrice}, maxPrice = ${maxPrice}`
+      Comparing ${stock.symbol}: Current Price = ${currentPrice}, maxPrice = ${maxPrice}
     );
     // Return all with a defined currentPrice for debugging:
     return currentPrice !== undefined;
@@ -322,7 +322,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     return sum + vol;
   }, 0);
   const avgVolume = totalVolume / priceFilteredStocks.length;
-  console.log(`Calculated average volume: ${avgVolume}`);
+  console.log(Calculated average volume: ${avgVolume});
 
   // 7. Score & classify
   const evaluatedStocks = priceFilteredStocks.map((stock) => {
@@ -330,12 +330,12 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     const summaryData = stock.detailed.summaryDetail || {};
     const financialData = stock.detailed.financialData || {};
 
-    // Build metrics without dividendYield and pbRatio.
     const metrics = {
       volume: priceData.regularMarketVolume ?? 0,
       currentPrice: priceData.regularMarketPrice ?? 0,
       peRatio: summaryData.trailingPE ?? 0,
-      // Removed: pbRatio and dividendYield
+      pbRatio: summaryData.priceToBook ?? 0,
+      dividendYield: summaryData.dividendYield ?? 0,
       earningsGrowth: financialData.earningsGrowth ?? 0,
       debtRatio: financialData.debtToEquity ?? 0,
       avg50Days: priceData.fiftyDayAverage ?? 0,
@@ -348,17 +348,23 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (metrics.volume > avgVolume * 1.1) stockRating += 2;
     else if (metrics.volume < avgVolume * 0.9) stockRating -= 2;
 
-    // P/E ratio scoring
+    // P/E ratio
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
     else if (metrics.peRatio > 20) stockRating -= 1;
 
-    // Removed: scoring based on pbRatio and dividendYield
+    // P/B ratio
+    if (metrics.pbRatio < 1) stockRating += 2;
+    else if (metrics.pbRatio > 3) stockRating -= 2;
 
+    // Dividend yield + earnings growth
+    if (metrics.dividendYield > 0.05) stockRating += 2;
     if (metrics.earningsGrowth > 0.05) stockRating += 2;
 
+    // Debt-to-equity
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
     else if (metrics.debtRatio > 0.7) stockRating -= 2;
 
+    // Moving averages
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
     } else if (
@@ -398,7 +404,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   const matchingStocks = evaluatedStocks.filter(
     (stock) => stock.classification === stockType
   );
-  console.log(`Found ${matchingStocks.length} matching stocks for type "${stockType}".`);
+  console.log(Found ${matchingStocks.length} matching stocks for type "${stockType}".);
 
   return res.json({ stocks: matchingStocks });
 });
@@ -464,26 +470,14 @@ finderRouter.post("/login", async (req, res) => {
 app.use("/finder", finderRouter);
 
 /******************************************************
- * SECTION D: Dashboard Popular Stocks Endpoint with Caching
+ * SECTION D: Dashboard Popular Stocks Endpoint
  * This endpoint returns the top 10 stocks based on daily performance.
  * It accepts a query parameter "marketState" (either "open" or "closed")
  * to determine whether to filter for intraday positive change (open)
  * or simply return the top gainers (when closed).
- * 
- * An in-memory cache is implemented here to avoid making too many API requests.
  ******************************************************/
-let popularStocksCache = null;
-let popularStocksCacheTimestamp = 0;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
-
 app.get("/api/popular-stocks", async (req, res) => {
   const marketState = req.query.marketState || "open"; // default to "open"
-  
-  // Check if cached data exists and is fresh
-  if (popularStocksCache && (Date.now() - popularStocksCacheTimestamp) < CACHE_DURATION) {
-    console.log("Returning cached popular stocks data.");
-    return res.json(popularStocksCache);
-  }
   
   try {
     // For this example, we use the NASDAQ symbols from symbols.json.
@@ -493,15 +487,14 @@ app.get("/api/popular-stocks", async (req, res) => {
       return res.status(404).json({ message: "No symbols available for NASDAQ." });
     }
   
-    // Fetch price data for each symbol concurrently with a delay
+    // Fetch price data for each symbol concurrently
     let stockData = await Promise.all(
       nasdaqSymbols.map(async (symbol) => {
         try {
-          await delay(200); // Delay 200ms between requests
-          const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"], validate: false });
+          const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
           return { symbol, price: data.price };
         } catch (error) {
-          console.error(`Error fetching data for ${symbol}:`, error.message);
+          console.error(Error fetching data for ${symbol}:, error.message);
           return null;
         }
       })
@@ -533,10 +526,6 @@ app.get("/api/popular-stocks", async (req, res) => {
         previousClose: s.price.regularMarketPreviousClose,
       },
     }));
-    
-    // Update the cache
-    popularStocksCache = topStocks;
-    popularStocksCacheTimestamp = Date.now();
   
     return res.json(topStocks);
   } catch (error) {
@@ -550,5 +539,5 @@ app.get("/api/popular-stocks", async (req, res) => {
  ******************************************************/
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`✅ Combined server running on port ${PORT}`);
+  console.log(✅ Combined server running on port ${PORT});
 });
