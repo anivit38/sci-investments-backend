@@ -176,15 +176,6 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 1;
     }
 
-    if (metrics.pbRatio < 1) {
-      stockRating += 2;
-    } else if (metrics.pbRatio > 3) {
-      stockRating -= 2;
-    }
-
-    if (metrics.dividendYield > 0.05) {
-      stockRating += 2;
-    }
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
@@ -350,14 +341,6 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     // P/E ratio
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
     else if (metrics.peRatio > 20) stockRating -= 1;
-
-    // P/B ratio
-    if (metrics.pbRatio < 1) stockRating += 2;
-    else if (metrics.pbRatio > 3) stockRating -= 2;
-
-    // Dividend yield + earnings growth
-    if (metrics.dividendYield > 0.05) stockRating += 2;
-    if (metrics.earningsGrowth > 0.05) stockRating += 2;
 
     // Debt-to-equity
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
