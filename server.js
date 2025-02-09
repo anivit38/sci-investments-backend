@@ -13,6 +13,11 @@ const mongoose = require("mongoose");
 const path = require("path");
 const fs = require("fs");
 
+// 1.1 Helper function: Delay (in milliseconds)
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
 const yahooFinance = require("yahoo-finance2").default;
@@ -153,7 +158,7 @@ app.post("/api/check-stock", async (req, res) => {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      // Removed pbRatio and dividendYield
+      // Removed: pbRatio and dividendYield
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
@@ -176,8 +181,7 @@ app.post("/api/check-stock", async (req, res) => {
       stockRating -= 1;
     }
 
-    // Removed pbRatio and dividendYield scoring.
-    
+    // Removed: pbRatio and dividendYield scoring.
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
@@ -254,10 +258,12 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     exchange,
   }));
 
-  // 4. Fetch Yahoo Finance data for each symbol
+  // 4. Fetch Yahoo Finance data for each symbol with a delay
   let detailedStocks = await Promise.all(
     filteredSymbols.map(async (symObj) => {
       try {
+        // Add a delay of 200 ms between each request
+        await delay(200);
         const detailed = await yahooFinance.quoteSummary(symObj.symbol, {
           modules: [
             "financialData",
@@ -473,10 +479,11 @@ app.get("/api/popular-stocks", async (req, res) => {
       return res.status(404).json({ message: "No symbols available for NASDAQ." });
     }
   
-    // Fetch price data for each symbol concurrently
+    // Fetch price data for each symbol concurrently with a delay
     let stockData = await Promise.all(
       nasdaqSymbols.map(async (symbol) => {
         try {
+          await delay(200); // Delay 200ms between requests
           const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
           return { symbol, price: data.price };
         } catch (error) {
