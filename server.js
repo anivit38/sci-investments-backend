@@ -141,6 +141,7 @@ app.post("/api/check-stock", async (req, res) => {
   try {
     const stock = await yahooFinance.quoteSummary(symbol, {
       modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
+      validate: false, // disable schema validation
     });
 
     if (!stock || !stock.price) {
@@ -182,7 +183,6 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // Removed: scoring based on pbRatio and dividendYield
-
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
@@ -272,6 +272,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
             "summaryDetail",
             "defaultKeyStatistics",
           ],
+          validate: false, // disable schema validation
         });
         return { ...symObj, detailed };
       } catch (error) {
@@ -477,7 +478,7 @@ const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
 
 app.get("/api/popular-stocks", async (req, res) => {
   const marketState = req.query.marketState || "open"; // default to "open"
-
+  
   // Check if cached data exists and is fresh
   if (popularStocksCache && (Date.now() - popularStocksCacheTimestamp) < CACHE_DURATION) {
     console.log("Returning cached popular stocks data.");
@@ -497,7 +498,7 @@ app.get("/api/popular-stocks", async (req, res) => {
       nasdaqSymbols.map(async (symbol) => {
         try {
           await delay(200); // Delay 200ms between requests
-          const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
+          const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"], validate: false });
           return { symbol, price: data.price };
         } catch (error) {
           console.error(`Error fetching data for ${symbol}:`, error.message);
