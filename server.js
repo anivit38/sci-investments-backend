@@ -127,14 +127,14 @@ app.post("/api/check-stock", async (req, res) => {
     return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
   try {
-    // Request assetProfile along with other modules to get industry info.
+    // Request the "assetProfile" module along with others to get industry info.
     const stock = await yahooFinance.quoteSummary(symbol, {
       modules: [
         "financialData",
         "price",
         "summaryDetail",
         "defaultKeyStatistics",
-        "assetProfile"
+        "assetProfile" // Added to obtain industry information
       ],
       validate: false, // Disable schema validation
     });
@@ -151,8 +151,8 @@ app.post("/api/check-stock", async (req, res) => {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      pbRatio: stock.summaryDetail?.priceToBook ?? 0,         // Can be removed if undesired
-      dividendYield: stock.summaryDetail?.dividendYield ?? 0,   // Can be removed if undesired
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,         // Optional: remove if undesired
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,   // Optional: remove if undesired
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
@@ -190,10 +190,11 @@ app.post("/api/check-stock", async (req, res) => {
     } catch (err) {
       console.error("Error loading industryMetrics.json:", err.message);
     }
-    const stockIndustry = stock.assetProfile?.industry || "Unknown";
+    // Try to obtain the industry from assetProfile.industry; if missing, fallback to assetProfile.sector.
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
-      // Compare P/E Ratio: If stock's P/E is lower than the industry average, add points.
+      // Compare P/E Ratio: If the stock's P/E is lower than the industry average, add points.
       if (metrics.peRatio && indMetrics.peRatio) {
         if (metrics.peRatio < indMetrics.peRatio) {
           stockRating += 2;
@@ -202,7 +203,7 @@ app.post("/api/check-stock", async (req, res) => {
         }
       }
       // Compare Earnings Growth vs. Industry Revenue Growth.
-      // (Assuming earningsGrowth is a fraction; convert to percentage.)
+      // (Assuming earningsGrowth is a fraction; converting to percentage.)
       if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
         if ((metrics.earningsGrowth * 100) > indMetrics.revenueGrowth) {
           stockRating += 2;
@@ -210,7 +211,7 @@ app.post("/api/check-stock", async (req, res) => {
           stockRating -= 2;
         }
       }
-      // Compare Debt-to-Equity: Favorable if lower than industry average.
+      // Compare Debt-to-Equity: Favorable if lower than the industry average.
       if (metrics.debtRatio && indMetrics.debtToEquity) {
         if (metrics.debtRatio < indMetrics.debtToEquity) {
           stockRating += 2;
@@ -349,10 +350,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     else if (metrics.debtRatio > 0.7) stockRating -= 2;
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
-    } else if (
-      metrics.currentPrice < metrics.avg50Days &&
-      metrics.avg50Days < metrics.avg200Days
-    ) {
+    } else if (metrics.currentPrice < metrics.avg50Days && metrics.avg50Days < metrics.avg200Days) {
       stockRating -= 2;
     }
     const classification = stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
@@ -444,7 +442,7 @@ app.use("/finder", finderRouter);
  ******************************************************/
 let popularStocksCache = null;
 let popularStocksCacheTimestamp = 0;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
 app.get("/api/popular-stocks", async (req, res) => {
   const marketState = req.query.marketState || "open"; // default to "open"
