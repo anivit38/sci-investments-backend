@@ -13,9 +13,6 @@ const mongoose = require("mongoose");
 const path = require("path");
 const fs = require("fs");
 
-// Import TensorFlow.js (Node binding)
-const tf = require("@tensorflow/tfjs-node");
-
 // 1.1 Helper function: Delay (in milliseconds)
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,7 +46,6 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret"; // Use a real se
 /******************************************************
  * SECTION A: Auth Endpoints (from auth-server.js)
  ******************************************************/
-
 // Health check route
 app.get("/", (req, res) => {
   res.send("✅ Combined Server is running!");
@@ -144,13 +140,11 @@ app.post("/api/check-stock", async (req, res) => {
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
-
-    // Compute average volume from Yahoo Finance data.
+    // Compute average volume.
     const computedAvgVolume =
       stock.summaryDetail?.averageDailyVolume3Month ||
       stock.price?.regularMarketVolume ||
       0;
-
     // Build base metrics.
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
@@ -165,7 +159,7 @@ app.post("/api/check-stock", async (req, res) => {
     };
 
     let stockRating = 0;
-    // Base scoring using current metrics.
+    // Base scoring.
     if (metrics.volume > computedAvgVolume * 1.1) {
       stockRating += 2;
     } else if (metrics.volume < computedAvgVolume * 0.9) {
@@ -197,7 +191,7 @@ app.post("/api/check-stock", async (req, res) => {
     } catch (err) {
       console.error("Error loading industryMetrics.json:", err.message);
     }
-    // Try to obtain the industry from assetProfile.industry; if missing, fallback to assetProfile.sector.
+    // Try to obtain the industry; if missing, fall back to sector.
     const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
@@ -209,7 +203,8 @@ app.post("/api/check-stock", async (req, res) => {
           stockRating -= 2;
         }
       }
-      // Compare Earnings Growth vs. Industry Revenue Growth.
+      // Compare Earnings Growth versus Industry Revenue Growth.
+      // (Assuming earningsGrowth is a fraction and indMetrics.revenueGrowth is a percentage.)
       if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
         if ((metrics.earningsGrowth * 100) > indMetrics.revenueGrowth) {
           stockRating += 2;
@@ -235,47 +230,19 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // --- Forecasting with Historical Data and Fundamental Projection ---
-    // Fundamental Forecast: use current earnings growth and industry revenue growth.
+    // --- Forecasting ---
+    // If industry revenue growth is available, use it as a baseline for industry growth.
     let industryGrowthFraction = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
-      industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100; // Convert percentage to fraction.
+      industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100; // convert percentage to fraction
     }
+    // Use a simple forecasting model:
+    // Forecasted future price = currentPrice * (1 + (earningsGrowth + industryGrowthFraction)/2 + bonus)
+    // where bonus is +0.02 if the 50-day average is above the 200-day average (bullish), or -0.02 otherwise.
     const bonus = (metrics.avg50Days > metrics.avg200Days) ? 0.02 : -0.02;
-    const fundamentalForecast = metrics.currentPrice * (1 + ((metrics.earningsGrowth + industryGrowthFraction) / 2) + bonus);
-
-    // Historical Forecast: fetch one year of historical data and compute the average daily return.
-    let historicalForecast = fundamentalForecast; // default if historical data is unavailable.
-    try {
-      const historicalData = await yahooFinance.historical(symbol, { period: "1y", interval: "1d" });
-      if (historicalData && historicalData.length > 1) {
-        // Ensure the data is sorted in ascending order by date.
-        historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
-        let totalReturn = 0;
-        let count = 0;
-        for (let i = 1; i < historicalData.length; i++) {
-          const prevClose = historicalData[i - 1].close;
-          const currClose = historicalData[i].close;
-          if (prevClose && currClose) {
-            const dailyReturn = (currClose / prevClose) - 1;
-            totalReturn += dailyReturn;
-            count++;
-          }
-        }
-        const avgDailyReturn = count > 0 ? totalReturn / count : 0;
-        // Forecast for the next 22 trading days (approximately one month).
-        historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
-      }
-    } catch (histErr) {
-      console.error("Historical data fetch error:", histErr.message);
-    }
-
-    // Combine the fundamental and historical forecasts using weighted averaging.
-    const weightFundamental = 0.6;
-    const weightHistorical = 0.4;
-    const combinedForecast = ((fundamentalForecast * weightFundamental) + (historicalForecast * weightHistorical)) /
-                               (weightFundamental + weightHistorical);
-    const projectedGrowthPercent = ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const baseGrowth = (metrics.earningsGrowth + industryGrowthFraction) / 2;
+    const forecastPrice = metrics.currentPrice * (1 + baseGrowth + bonus);
+    const projectedGrowthPercent = ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
 
     // Determine classification and advice.
     const classification = stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
@@ -289,7 +256,6 @@ app.post("/api/check-stock", async (req, res) => {
     } else if (intent === "sell") {
       advice = stockRating < 0 ? "Sell the Stock" : "Hold the Stock";
     }
-
     return res.json({
       symbol,
       industry: stockIndustry,
@@ -298,7 +264,7 @@ app.post("/api/check-stock", async (req, res) => {
       advice,
       metrics,
       forecast: {
-        forecastPrice: combinedForecast.toFixed(2),
+        forecastPrice: forecastPrice.toFixed(2),
         projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%"
       }
     });
@@ -311,8 +277,10 @@ app.post("/api/check-stock", async (req, res) => {
 /******************************************************
  * SECTION C: Stock-Finder Extra Endpoints
  ******************************************************/
+// 1) Declare the router
 const finderRouter = express.Router();
 
+// 2) Finder route: POST /finder/api/find-stocks
 finderRouter.post("/api/find-stocks", async (req, res) => {
   console.log("⏰ Incoming body for find-stocks:", req.body);
   const { stockType, exchange, maxPrice } = req.body;
@@ -538,7 +506,7 @@ app.get("/api/popular-stocks", async (req, res) => {
     }
     const topStocks = stockData.slice(0, 10).map((s) => ({
       symbol: s.symbol,
-      score: s.price.regularMarketChangePercent,
+      score: s.price.regularMarketChangePercent, // using change percent as a "score"
       metrics: {
         currentPrice: s.price.regularMarketPrice,
         changePercent: s.price.regularMarketChangePercent,
@@ -551,47 +519,6 @@ app.get("/api/popular-stocks", async (req, res) => {
   } catch (error) {
     console.error("❌ Error in /api/popular-stocks:", error.message);
     return res.status(500).json({ message: "Error fetching popular stocks." });
-  }
-});
-
-/******************************************************
- * NEW SECTION E: Stock Forecasting Endpoint with Machine Learning
- * This endpoint uses TensorFlow.js to build a simple linear regression
- * model using one year of historical daily closing prices to forecast the next day's price.
- * Note: This is a simplistic model for demonstration purposes.
- ******************************************************/
-app.post("/api/forecast-stock", async (req, res) => {
-  const { symbol } = req.body;
-  if (!symbol) {
-    return res.status(400).json({ message: "Stock symbol is required for forecasting." });
-  }
-  try {
-    // Fetch one year of historical data at daily intervals.
-    const historicalData = await yahooFinance.historical(symbol, { period: "1y", interval: "1d" });
-    if (!historicalData || historicalData.length < 2) {
-      return res.status(400).json({ message: "Not enough historical data available for forecasting." });
-    }
-    // Sort the historical data by date in ascending order.
-    historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
-    // Extract closing prices.
-    const closingPrices = historicalData.map(data => data.close);
-    // Create training data: For a simple linear regression, we'll use the day index as X and the closing price as Y.
-    const xs = tf.tensor1d(closingPrices.map((_, i) => i));
-    const ys = tf.tensor1d(closingPrices);
-    // Build a simple linear regression model.
-    const model = tf.sequential();
-    model.add(tf.layers.dense({ units: 1, inputShape: [1] }));
-    model.compile({ optimizer: tf.train.sgd(0.0001), loss: "meanSquaredError" });
-    // Train the model. (In production, you'd train offline and load a pre-trained model.)
-    await model.fit(xs.reshape([-1, 1]), ys.reshape([-1, 1]), { epochs: 50, verbose: 0 });
-    // Predict for the next day.
-    const nextDayIndex = tf.tensor2d([[closingPrices.length]]);
-    const predictionTensor = model.predict(nextDayIndex);
-    const forecastPrice = predictionTensor.dataSync()[0];
-    return res.json({ symbol, forecastPrice: forecastPrice.toFixed(2) });
-  } catch (error) {
-    console.error("❌ Error forecasting stock price:", error.message);
-    return res.status(500).json({ message: "Error forecasting stock price.", error: error.message });
   }
 });
 
