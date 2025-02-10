@@ -59,17 +59,14 @@ app.post("/signup", async (req, res) => {
   if (!email || !username || !password) {
     return res.status(400).json({ message: "All fields are required." });
   }
-
   try {
     const existingUser = await UserModel.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: "Email already in use." });
     }
-
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = new UserModel({ email, username, password: hashedPassword });
     await user.save();
-
     console.log("✅ User Registered:", username);
     return res.status(201).json({ message: "User registered successfully." });
   } catch (error) {
@@ -81,28 +78,23 @@ app.post("/signup", async (req, res) => {
 // Login w/ JWT
 app.post("/login", async (req, res) => {
   console.log("🔑 Login Attempt:", req.body.username);
-
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ message: "Username and password are required." });
   }
-
   try {
     const user = await UserModel.findOne({ username });
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
     // Generate JWT
     const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, {
       expiresIn: "24h",
     });
-
     console.log("✅ Login Successful:", username);
     return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
@@ -117,7 +109,6 @@ app.get("/protected", (req, res) => {
   if (!token) {
     return res.status(401).json({ message: "Unauthorized. Token required." });
   }
-
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     return res.status(200).json({ message: "Protected data accessed.", user: decoded });
@@ -127,84 +118,118 @@ app.get("/protected", (req, res) => {
 });
 
 /******************************************************
- * SECTION B: Stock Checker (from stock-checker-server.js)
+ * SECTION B: Stock Checker Endpoint with Industry Comparison
  ******************************************************/
 app.post("/api/check-stock", async (req, res) => {
-  // Remove avgVolume from the required fields.
+  // Expect symbol and intent in the body.
   const { symbol, intent } = req.body;
   if (!symbol || !intent) {
-    return res
-      .status(400)
-      .json({ message: "Stock symbol and intent (buy/sell) are required." });
+    return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
-
   try {
+    // Request assetProfile along with other modules to get industry info.
     const stock = await yahooFinance.quoteSummary(symbol, {
-      modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
-      validate: false, // Disable schema validation to avoid token errors
+      modules: [
+        "financialData",
+        "price",
+        "summaryDetail",
+        "defaultKeyStatistics",
+        "assetProfile"
+      ],
+      validate: false, // Disable schema validation
     });
-
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
-
-    // Compute average volume from Yahoo Finance data:
-    // Try to get the average daily volume for the past 3 months.
+    // Compute average volume from Yahoo Finance data.
     const computedAvgVolume =
       stock.summaryDetail?.averageDailyVolume3Month ||
       stock.price?.regularMarketVolume ||
       0;
-
-    // Build metrics and remove dividendYield and pbRatio from our metrics
+    // Build base metrics.
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      // Removed: pbRatio and dividendYield
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,         // Can be removed if undesired
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,   // Can be removed if undesired
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
       avg200Days: stock.price?.twoHundredDayAverage ?? 0,
     };
-
     let stockRating = 0;
-
-    // Analysis using computed average volume.
+    // Base scoring using current metrics.
     if (metrics.volume > computedAvgVolume * 1.1) {
       stockRating += 2;
     } else if (metrics.volume < computedAvgVolume * 0.9) {
       stockRating -= 2;
     }
-
-    // P/E ratio scoring
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
       stockRating += 2;
     } else if (metrics.peRatio > 20) {
       stockRating -= 1;
     }
-
-    // Removed: scoring based on pbRatio and dividendYield
-
     if (metrics.earningsGrowth > 0.05) {
       stockRating += 2;
     }
-
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) {
       stockRating += 2;
     } else if (metrics.debtRatio > 0.7) {
       stockRating -= 2;
     }
-
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
-    } else if (
-      metrics.currentPrice < metrics.avg50Days &&
-      metrics.avg50Days < metrics.avg200Days
-    ) {
+    } else if (metrics.currentPrice < metrics.avg50Days && metrics.avg50Days < metrics.avg200Days) {
       stockRating -= 2;
     }
-
-    // Determine advice based on the user's intent.
+    // --- Industry Comparison ---
+    let industryMetrics = {};
+    try {
+      industryMetrics = require("./industryMetrics.json");
+    } catch (err) {
+      console.error("Error loading industryMetrics.json:", err.message);
+    }
+    const stockIndustry = stock.assetProfile?.industry || "Unknown";
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+      const indMetrics = industryMetrics[stockIndustry];
+      // Compare P/E Ratio: If stock's P/E is lower than the industry average, add points.
+      if (metrics.peRatio && indMetrics.peRatio) {
+        if (metrics.peRatio < indMetrics.peRatio) {
+          stockRating += 2;
+        } else {
+          stockRating -= 2;
+        }
+      }
+      // Compare Earnings Growth vs. Industry Revenue Growth.
+      // (Assuming earningsGrowth is a fraction; convert to percentage.)
+      if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
+        if ((metrics.earningsGrowth * 100) > indMetrics.revenueGrowth) {
+          stockRating += 2;
+        } else {
+          stockRating -= 2;
+        }
+      }
+      // Compare Debt-to-Equity: Favorable if lower than industry average.
+      if (metrics.debtRatio && indMetrics.debtToEquity) {
+        if (metrics.debtRatio < indMetrics.debtToEquity) {
+          stockRating += 2;
+        } else {
+          stockRating -= 2;
+        }
+      }
+      // Compare Dividend Yield if available.
+      if (metrics.dividendYield !== undefined && indMetrics.dividendYield !== undefined) {
+        // Convert dividend yield from fraction to percentage.
+        if ((metrics.dividendYield * 100) > indMetrics.dividendYield) {
+          stockRating += 2;
+        } else {
+          stockRating -= 2;
+        }
+      }
+    }
+    // Determine classification and advice.
+    const classification = stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
     let advice;
     if (intent === "buy") {
       if (stockRating >= 8) advice = "Very Good Stock to Buy";
@@ -215,8 +240,14 @@ app.post("/api/check-stock", async (req, res) => {
     } else if (intent === "sell") {
       advice = stockRating < 0 ? "Sell the Stock" : "Hold the Stock";
     }
-
-    return res.json({ symbol, stockRating, advice, metrics });
+    return res.json({
+      symbol,
+      industry: stockIndustry,
+      stockRating,
+      classification,
+      advice,
+      metrics,
+    });
   } catch (error) {
     console.error("❌ Error fetching stock data:", error);
     return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
@@ -225,7 +256,6 @@ app.post("/api/check-stock", async (req, res) => {
 
 /******************************************************
  * SECTION C: Stock-Finder Extra Endpoints
- * These endpoints use unique routes under the "/finder" prefix.
  ******************************************************/
 // 1) Declare the router
 const finderRouter = express.Router();
@@ -233,49 +263,32 @@ const finderRouter = express.Router();
 // 2) Finder route: POST /finder/api/find-stocks
 finderRouter.post("/api/find-stocks", async (req, res) => {
   console.log("⏰ Incoming body for find-stocks:", req.body);
-
   const { stockType, exchange, maxPrice } = req.body;
   if (!stockType || !exchange || maxPrice == null) {
     console.log("❌ Validation failed. Body was:", req.body);
-    return res
-      .status(400)
-      .json({ message: "stockType, exchange, and maxPrice are required." });
+    return res.status(400).json({ message: "stockType, exchange, and maxPrice are required." });
   }
   if (stockType !== "growth" && stockType !== "stable") {
     console.log("❌ Unknown stockType:", stockType);
     return res.status(400).json({ message: "stockType must be either 'growth' or 'stable'." });
   }
-
-  // 1. Load the entire JSON object: { NASDAQ: [...], NYSE: [...], TSX: [...] }
   const symbolGroups = require(path.join(__dirname, "symbols.json"));
   console.log("Loaded symbolGroups:", symbolGroups);
-
-  // 2. Access array of strings for user's chosen exchange
   const symbolsForExchange = symbolGroups[exchange.toUpperCase()];
   if (!symbolsForExchange || symbolsForExchange.length === 0) {
     return res.status(404).json({ message: `No symbols found for the exchange: ${exchange}` });
   }
-
-  // 3. Convert each string symbol into { symbol, exchange }
   let filteredSymbols = symbolsForExchange.map((symbolStr) => ({
     symbol: symbolStr,
     exchange,
   }));
-
-  // 4. Fetch Yahoo Finance data for each symbol with a delay
   let detailedStocks = await Promise.all(
     filteredSymbols.map(async (symObj) => {
       try {
-        // Add a delay of 200 ms between each request
         await delay(200);
         const detailed = await yahooFinance.quoteSummary(symObj.symbol, {
-          modules: [
-            "financialData",
-            "price",
-            "summaryDetail",
-            "defaultKeyStatistics",
-          ],
-          validate: false, // disable schema validation
+          modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics"],
+          validate: false,
         });
         return { ...symObj, detailed };
       } catch (error) {
@@ -284,29 +297,17 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       }
     })
   );
-
-  // Filter out nulls (failed lookups)
   detailedStocks = detailedStocks.filter((stock) => stock !== null);
-
-  // Debug: Log current prices
   console.log("🔎 Checking current prices for symbols in exchange:", exchange);
   detailedStocks.forEach((stock) => {
     const currentPrice = stock.detailed?.price?.regularMarketPrice;
     console.log(`Symbol: ${stock.symbol} - Current Price: ${currentPrice}`);
   });
-
-  // 5. Filter by maxPrice or relax the filter for debugging
   let priceFilteredStocks = detailedStocks.filter((stock) => {
     const currentPrice = stock.detailed?.price?.regularMarketPrice;
-    console.log(
-      `Comparing ${stock.symbol}: Current Price = ${currentPrice}, maxPrice = ${maxPrice}`
-    );
-    // Return all with a defined currentPrice for debugging:
+    console.log(`Comparing ${stock.symbol}: Current Price = ${currentPrice}, maxPrice = ${maxPrice}`);
     return currentPrice !== undefined;
-    // For strict filter: 
-    // return currentPrice !== undefined && currentPrice <= maxPrice;
   });
-
   if (priceFilteredStocks.length === 0) {
     let prices = detailedStocks.map((stock) => ({
       symbol: stock.symbol,
@@ -318,22 +319,16 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         "No stocks found with a price at or below the specified maxPrice. Please adjust your maxPrice.",
     });
   }
-
-  // 6. Calculate average volume
   const totalVolume = priceFilteredStocks.reduce((sum, stock) => {
     const vol = stock.detailed?.price?.regularMarketVolume ?? 0;
     return sum + vol;
   }, 0);
   const avgVolume = totalVolume / priceFilteredStocks.length;
   console.log(`Calculated average volume: ${avgVolume}`);
-
-  // 7. Score & classify
   const evaluatedStocks = priceFilteredStocks.map((stock) => {
     const priceData = stock.detailed.price || {};
     const summaryData = stock.detailed.summaryDetail || {};
     const financialData = stock.detailed.financialData || {};
-
-    // Build metrics without dividendYield and pbRatio.
     const metrics = {
       volume: priceData.regularMarketVolume ?? 0,
       currentPrice: priceData.regularMarketPrice ?? 0,
@@ -344,24 +339,14 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       avg50Days: priceData.fiftyDayAverage ?? 0,
       avg200Days: priceData.twoHundredDayAverage ?? 0,
     };
-
     let stockRating = 0;
-
-    // Scoring based on volume relative to avgVolume
     if (metrics.volume > avgVolume * 1.1) stockRating += 2;
     else if (metrics.volume < avgVolume * 0.9) stockRating -= 2;
-
-    // P/E ratio scoring
     if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
     else if (metrics.peRatio > 20) stockRating -= 1;
-
-    // Removed: scoring based on pbRatio and dividendYield
-
     if (metrics.earningsGrowth > 0.05) stockRating += 2;
-
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
     else if (metrics.debtRatio > 0.7) stockRating -= 2;
-
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
     } else if (
@@ -370,19 +355,13 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     ) {
       stockRating -= 2;
     }
-
-    // Classification
-    const classification =
-      stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
-
-    // Advice
+    const classification = stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
     let advice;
     if (stockRating >= 8) advice = "Very Good Stock to Buy";
     else if (stockRating >= 5) advice = "Good Stock to Buy";
     else if (stockRating >= 0) advice = "Okay Stock to Buy";
     else if (stockRating >= -5) advice = "Bad Stock";
     else advice = "Bad Stock to Buy";
-
     return {
       symbol: stock.symbol,
       exchange: stock.exchange,
@@ -393,16 +372,11 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       advice,
     };
   });
-
-  // Log all evaluated stocks
   console.log("Evaluated Stocks:", evaluatedStocks);
-
-  // 8. Filter by user's desired stockType
   const matchingStocks = evaluatedStocks.filter(
     (stock) => stock.classification === stockType
   );
   console.log(`Found ${matchingStocks.length} matching stocks for type "${stockType}".`);
-
   return res.json({ stocks: matchingStocks });
 });
 
@@ -414,7 +388,6 @@ finderRouter.post("/signup", async (req, res) => {
     console.error("Missing required fields!");
     return res.status(400).json({ message: "All fields are required." });
   }
-
   try {
     console.log("Stock Finder - Checking if user exists...");
     const existingUser = await UserModel.findOne({ email });
@@ -422,14 +395,11 @@ finderRouter.post("/signup", async (req, res) => {
       console.error("Stock Finder - User already exists!");
       return res.status(400).json({ message: "Email already in use." });
     }
-
     console.log("Stock Finder - Hashing password...");
     const hashedPassword = await bcrypt.hash(password, 10);
-
     console.log("Stock Finder - Saving new user...");
     const user = new UserModel({ email, username, password: hashedPassword });
     await user.save();
-
     console.log("Stock Finder - User saved successfully!");
     return res.status(201).json({ message: "User registered successfully." });
   } catch (error) {
@@ -444,18 +414,15 @@ finderRouter.post("/login", async (req, res) => {
   if (!username || !password) {
     return res.status(400).json({ message: "Username and password are required." });
   }
-
   try {
     const user = await UserModel.findOne({ username });
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-
     return res.status(200).json({ message: "Login successful." });
   } catch (error) {
     console.error("Stock Finder - Login Error:", error);
@@ -493,18 +460,15 @@ app.get("/api/popular-stocks", async (req, res) => {
   }
   
   try {
-    // For this example, we use the NASDAQ symbols from symbols.json.
     const symbolGroups = require(path.join(__dirname, "symbols.json"));
     const nasdaqSymbols = symbolGroups["NASDAQ"] || [];
     if (nasdaqSymbols.length === 0) {
       return res.status(404).json({ message: "No symbols available for NASDAQ." });
     }
-  
-    // Fetch price data for each symbol concurrently
     let stockData = await Promise.all(
       nasdaqSymbols.map(async (symbol) => {
         try {
-          await delay(200); // Delay 200ms between requests
+          await delay(200);
           const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"], validate: false });
           return { symbol, price: data.price };
         } catch (error) {
@@ -513,38 +477,27 @@ app.get("/api/popular-stocks", async (req, res) => {
         }
       })
     );
-  
-    // Filter out failed lookups and ensure required fields are present
     stockData = stockData.filter(
       (s) => s !== null && s.price && s.price.regularMarketChangePercent !== undefined
     );
-  
-    // Sort descending by change percent
     stockData.sort(
       (a, b) =>
         b.price.regularMarketChangePercent - a.price.regularMarketChangePercent
     );
-  
-    // If the market is open, return only stocks with positive change
     if (marketState === "open") {
       stockData = stockData.filter((s) => s.price.regularMarketChangePercent > 0);
     }
-  
-    // Limit to top 10 stocks
     const topStocks = stockData.slice(0, 10).map((s) => ({
       symbol: s.symbol,
-      score: s.price.regularMarketChangePercent, // using change percent as a "score"
+      score: s.price.regularMarketChangePercent,
       metrics: {
         currentPrice: s.price.regularMarketPrice,
         changePercent: s.price.regularMarketChangePercent,
         previousClose: s.price.regularMarketPreviousClose,
       },
     }));
-    
-    // Update the cache
     popularStocksCache = topStocks;
     popularStocksCacheTimestamp = Date.now();
-  
     return res.json(topStocks);
   } catch (error) {
     console.error("❌ Error in /api/popular-stocks:", error.message);
