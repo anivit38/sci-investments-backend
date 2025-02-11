@@ -1,5 +1,6 @@
 /*******************************************
- * COMBINED SERVER FOR AUTH + STOCK CHECKER
+ * COMBINED SERVER FOR AUTH, STOCK CHECKER,
+ * FINDER, DASHBOARD, AND FORECASTING
  *******************************************/
 
 // 1. Load Environment & Libraries
@@ -13,7 +14,10 @@ const mongoose = require("mongoose");
 const path = require("path");
 const fs = require("fs");
 
-// 1.1 Helper function: Delay (in milliseconds)
+// TensorFlow.js for Node (for forecasting)
+const tf = require("@tensorflow/tfjs-node");
+
+// Helper: Delay (in milliseconds)
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -22,12 +26,20 @@ function delay(ms) {
 const UserModel = require(path.join(__dirname, "models", "User"));
 const yahooFinance = require("yahoo-finance2").default;
 
-// 3. Create a Single Express App
+// 2.1 Load industry metrics from JSON
+let industryMetrics = {};
+try {
+  industryMetrics = require("./industryMetrics.json");
+} catch (err) {
+  console.error("Error loading industryMetrics.json:", err.message);
+}
+
+// 3. Create Express App
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 4. Connect to MongoDB (only once)
+// 4. Connect to MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
 mongoose
   .connect(MONGODB_URI, {
@@ -38,20 +50,37 @@ mongoose
   })
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch((err) => console.error("❌ MongoDB Connection Error:", err.message));
-
 mongoose.set("debug", true);
 
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret"; // Use a real secret in production!
+const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
+
+// --- Forecast Model Resources ---
+// Global variables for forecasting model and normalization parameters
+let forecastModel = null;
+let normalizationParams = null;
+
+// Load forecasting model and normalization parameters at startup
+async function loadForecastResources() {
+  try {
+    forecastModel = await tf.loadLayersModel("file://model/forecast_model/model.json");
+    console.log("✅ Forecast model loaded successfully.");
+    const normPath = path.join(__dirname, "model", "forecast_model", "normalization.json");
+    const normData = fs.readFileSync(normPath);
+    normalizationParams = JSON.parse(normData);
+    console.log("✅ Normalization parameters loaded:", normalizationParams);
+  } catch (error) {
+    console.error("❌ Error loading forecast resources:", error.message);
+  }
+}
+loadForecastResources();
 
 /******************************************************
- * SECTION A: Auth Endpoints (from auth-server.js)
+ * SECTION A: Auth Endpoints
  ******************************************************/
-// Health check route
 app.get("/", (req, res) => {
   res.send("✅ Combined Server is running!");
 });
 
-// Signup
 app.post("/signup", async (req, res) => {
   console.log("📩 Signup Request Received:", req.body);
   const { email, username, password } = req.body;
@@ -74,7 +103,6 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-// Login w/ JWT
 app.post("/login", async (req, res) => {
   console.log("🔑 Login Attempt:", req.body.username);
   const { username, password } = req.body;
@@ -90,10 +118,7 @@ app.post("/login", async (req, res) => {
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-    // Generate JWT
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, {
-      expiresIn: "24h",
-    });
+    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: "24h" });
     console.log("✅ Login Successful:", username);
     return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
@@ -102,7 +127,6 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Example Protected route
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) {
@@ -120,38 +144,29 @@ app.get("/protected", (req, res) => {
  * SECTION B: Stock Checker Endpoint with Industry Comparison and Forecasting
  ******************************************************/
 app.post("/api/check-stock", async (req, res) => {
-  // Expect symbol and intent in the body.
   const { symbol, intent } = req.body;
   if (!symbol || !intent) {
     return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
   try {
-    // Request assetProfile along with other modules to obtain industry info.
+    // Retrieve multiple modules including assetProfile for industry info.
     const stock = await yahooFinance.quoteSummary(symbol, {
-      modules: [
-        "financialData",
-        "price",
-        "summaryDetail",
-        "defaultKeyStatistics",
-        "assetProfile"
-      ],
-      validate: false, // Disable schema validation
+      modules: ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"],
+      validate: false,
     });
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
-    // Compute average volume.
     const computedAvgVolume =
       stock.summaryDetail?.averageDailyVolume3Month ||
       stock.price?.regularMarketVolume ||
       0;
-    // Build base metrics.
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
       peRatio: stock.summaryDetail?.trailingPE ?? 0,
-      pbRatio: stock.summaryDetail?.priceToBook ?? 0,         // Optional: remove if undesired
-      dividendYield: stock.summaryDetail?.dividendYield ?? 0,   // Optional: remove if undesired
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,
       earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
       debtRatio: stock.financialData?.debtToEquity ?? 0,
       avg50Days: stock.price?.fiftyDayAverage ?? 0,
@@ -159,25 +174,14 @@ app.post("/api/check-stock", async (req, res) => {
     };
 
     let stockRating = 0;
-    // Base scoring.
-    if (metrics.volume > computedAvgVolume * 1.1) {
-      stockRating += 2;
-    } else if (metrics.volume < computedAvgVolume * 0.9) {
-      stockRating -= 2;
-    }
-    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) {
-      stockRating += 2;
-    } else if (metrics.peRatio > 20) {
-      stockRating -= 1;
-    }
-    if (metrics.earningsGrowth > 0.05) {
-      stockRating += 2;
-    }
-    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) {
-      stockRating += 2;
-    } else if (metrics.debtRatio > 0.7) {
-      stockRating -= 2;
-    }
+    // Base scoring from current metrics.
+    if (metrics.volume > computedAvgVolume * 1.1) stockRating += 2;
+    else if (metrics.volume < computedAvgVolume * 0.9) stockRating -= 2;
+    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockRating += 2;
+    else if (metrics.peRatio > 20) stockRating -= 1;
+    if (metrics.earningsGrowth > 0.05) stockRating += 2;
+    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockRating += 2;
+    else if (metrics.debtRatio > 0.7) stockRating -= 2;
     if (metrics.currentPrice > metrics.avg50Days && metrics.avg50Days > metrics.avg200Days) {
       stockRating += 2;
     } else if (metrics.currentPrice < metrics.avg50Days && metrics.avg50Days < metrics.avg200Days) {
@@ -185,66 +189,64 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // --- Industry Comparison ---
-    let industryMetrics = {};
-    try {
-      industryMetrics = require("./industryMetrics.json");
-    } catch (err) {
-      console.error("Error loading industryMetrics.json:", err.message);
-    }
-    // Try to obtain the industry; if missing, fall back to sector.
+    // Use assetProfile.industry (or fallback to sector)
     const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
-      // Compare P/E Ratio.
       if (metrics.peRatio && indMetrics.peRatio) {
-        if (metrics.peRatio < indMetrics.peRatio) {
-          stockRating += 2;
-        } else {
-          stockRating -= 2;
-        }
+        stockRating += (metrics.peRatio < indMetrics.peRatio) ? 2 : -2;
       }
-      // Compare Earnings Growth versus Industry Revenue Growth.
-      // (Assuming earningsGrowth is a fraction and indMetrics.revenueGrowth is a percentage.)
       if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
-        if ((metrics.earningsGrowth * 100) > indMetrics.revenueGrowth) {
-          stockRating += 2;
-        } else {
-          stockRating -= 2;
-        }
+        stockRating += ((metrics.earningsGrowth * 100) > indMetrics.revenueGrowth) ? 2 : -2;
       }
-      // Compare Debt-to-Equity.
       if (metrics.debtRatio && indMetrics.debtToEquity) {
-        if (metrics.debtRatio < indMetrics.debtToEquity) {
-          stockRating += 2;
-        } else {
-          stockRating -= 2;
-        }
+        stockRating += (metrics.debtRatio < indMetrics.debtToEquity) ? 2 : -2;
       }
-      // Compare Dividend Yield if available.
       if (metrics.dividendYield !== undefined && indMetrics.dividendYield !== undefined) {
-        if ((metrics.dividendYield * 100) > indMetrics.dividendYield) {
-          stockRating += 2;
-        } else {
-          stockRating -= 2;
-        }
+        stockRating += ((metrics.dividendYield * 100) > indMetrics.dividendYield) ? 2 : -2;
       }
     }
 
     // --- Forecasting ---
-    // If industry revenue growth is available, use it as a baseline for industry growth.
+    // Fundamental Forecast: Use industry revenue growth (if available) as a baseline.
     let industryGrowthFraction = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
-      industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100; // convert percentage to fraction
+      industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100;
     }
-    // Use a simple forecasting model:
-    // Forecasted future price = currentPrice * (1 + (earningsGrowth + industryGrowthFraction)/2 + bonus)
-    // where bonus is +0.02 if the 50-day average is above the 200-day average (bullish), or -0.02 otherwise.
     const bonus = (metrics.avg50Days > metrics.avg200Days) ? 0.02 : -0.02;
-    const baseGrowth = (metrics.earningsGrowth + industryGrowthFraction) / 2;
-    const forecastPrice = metrics.currentPrice * (1 + baseGrowth + bonus);
-    const projectedGrowthPercent = ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const fundamentalForecast = metrics.currentPrice * (1 + ((metrics.earningsGrowth + industryGrowthFraction) / 2) + bonus);
 
-    // Determine classification and advice.
+    // Historical Forecast: Fetch 1 year of historical data and compute average daily return.
+    let historicalForecast = fundamentalForecast;
+    try {
+      const historicalData = await yahooFinance.historical(symbol, { period: "1y", interval: "1d" });
+      if (historicalData && historicalData.length > 1) {
+        historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+        let totalReturn = 0;
+        let count = 0;
+        for (let i = 1; i < historicalData.length; i++) {
+          const prevClose = historicalData[i - 1].close;
+          const currClose = historicalData[i].close;
+          if (prevClose && currClose) {
+            totalReturn += (currClose / prevClose) - 1;
+            count++;
+          }
+        }
+        const avgDailyReturn = count > 0 ? totalReturn / count : 0;
+        // Assume 22 trading days in a month.
+        historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
+      }
+    } catch (histErr) {
+      console.error("Historical data fetch error:", histErr.message);
+    }
+    // Blend forecasts: 60% fundamental, 40% historical.
+    const weightFundamental = 0.6;
+    const weightHistorical = 0.4;
+    const combinedForecast = ((fundamentalForecast * weightFundamental) + (historicalForecast * weightHistorical)) /
+                              (weightFundamental + weightHistorical);
+    const projectedGrowthPercent = ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
+
+    // --- Classification & Advice ---
     const classification = stockRating > 7 ? "growth" : stockRating >= 0 ? "stable" : "unstable";
     let advice;
     if (intent === "buy") {
@@ -256,6 +258,7 @@ app.post("/api/check-stock", async (req, res) => {
     } else if (intent === "sell") {
       advice = stockRating < 0 ? "Sell the Stock" : "Hold the Stock";
     }
+
     return res.json({
       symbol,
       industry: stockIndustry,
@@ -264,7 +267,7 @@ app.post("/api/check-stock", async (req, res) => {
       advice,
       metrics,
       forecast: {
-        forecastPrice: forecastPrice.toFixed(2),
+        forecastPrice: combinedForecast.toFixed(2),
         projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%"
       }
     });
@@ -277,10 +280,8 @@ app.post("/api/check-stock", async (req, res) => {
 /******************************************************
  * SECTION C: Stock-Finder Extra Endpoints
  ******************************************************/
-// 1) Declare the router
 const finderRouter = express.Router();
 
-// 2) Finder route: POST /finder/api/find-stocks
 finderRouter.post("/api/find-stocks", async (req, res) => {
   console.log("⏰ Incoming body for find-stocks:", req.body);
   const { stockType, exchange, maxPrice } = req.body;
@@ -335,8 +336,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     }));
     console.warn("No stocks passed the maxPrice filter. Available prices:", prices);
     return res.status(404).json({
-      message:
-        "No stocks found with a price at or below the specified maxPrice. Please adjust your maxPrice.",
+      message: "No stocks found with a price at or below the specified maxPrice. Please adjust your maxPrice.",
     });
   }
   const totalVolume = priceFilteredStocks.reduce((sum, stock) => {
@@ -397,7 +397,6 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   return res.json({ stocks: matchingStocks });
 });
 
-// 3) Finder Signup Endpoint
 finderRouter.post("/signup", async (req, res) => {
   console.log("Stock Finder - Incoming Request Body:", req.body);
   const { email, username, password } = req.body;
@@ -425,7 +424,6 @@ finderRouter.post("/signup", async (req, res) => {
   }
 });
 
-// 4) Finder Login Endpoint
 finderRouter.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -447,26 +445,17 @@ finderRouter.post("/login", async (req, res) => {
   }
 });
 
-// 5) Attach the Finder Router to the main app
 app.use("/finder", finderRouter);
 
 /******************************************************
  * SECTION D: Dashboard Popular Stocks Endpoint with Caching
- * This endpoint returns the top 10 stocks based on daily performance.
- * It accepts a query parameter "marketState" (either "open" or "closed")
- * to determine whether to filter for intraday positive change (open)
- * or simply return the top gainers (when closed).
- * 
- * An in-memory cache is implemented here to avoid making too many API requests.
  ******************************************************/
 let popularStocksCache = null;
 let popularStocksCacheTimestamp = 0;
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
 app.get("/api/popular-stocks", async (req, res) => {
-  const marketState = req.query.marketState || "open"; // default to "open"
-  
-  // Check if cached data exists and is fresh
+  const marketState = req.query.marketState || "open";
   if (
     popularStocksCache &&
     (Date.now() - popularStocksCacheTimestamp) < CACHE_DURATION &&
@@ -475,7 +464,6 @@ app.get("/api/popular-stocks", async (req, res) => {
     console.log("Returning cached popular stocks data.");
     return res.json(popularStocksCache);
   }
-  
   try {
     const symbolGroups = require(path.join(__dirname, "symbols.json"));
     const nasdaqSymbols = symbolGroups["NASDAQ"] || [];
@@ -497,16 +485,13 @@ app.get("/api/popular-stocks", async (req, res) => {
     stockData = stockData.filter(
       (s) => s !== null && s.price && s.price.regularMarketChangePercent !== undefined
     );
-    stockData.sort(
-      (a, b) =>
-        b.price.regularMarketChangePercent - a.price.regularMarketChangePercent
-    );
+    stockData.sort((a, b) => b.price.regularMarketChangePercent - a.price.regularMarketChangePercent);
     if (marketState === "open") {
       stockData = stockData.filter((s) => s.price.regularMarketChangePercent > 0);
     }
     const topStocks = stockData.slice(0, 10).map((s) => ({
       symbol: s.symbol,
-      score: s.price.regularMarketChangePercent, // using change percent as a "score"
+      score: s.price.regularMarketChangePercent,
       metrics: {
         currentPrice: s.price.regularMarketPrice,
         changePercent: s.price.regularMarketChangePercent,
@@ -519,6 +504,53 @@ app.get("/api/popular-stocks", async (req, res) => {
   } catch (error) {
     console.error("❌ Error in /api/popular-stocks:", error.message);
     return res.status(500).json({ message: "Error fetching popular stocks." });
+  }
+});
+
+/******************************************************
+ * SECTION E: Stock Forecasting Endpoint with Pre-Trained Model
+ ******************************************************/
+app.post("/api/forecast-stock", async (req, res) => {
+  const { symbol } = req.body;
+  if (!symbol) {
+    return res.status(400).json({ message: "Stock symbol is required for forecasting." });
+  }
+  try {
+    // Fetch historical data for the last 60 days using chart()
+    const endTime = Math.floor(Date.now() / 1000);
+    const startTime = endTime - (60 * 24 * 60 * 60); // 60 days ago
+    const historicalData = await yahooFinance.chart(symbol, {
+      period1: startTime,
+      period2: endTime,
+      interval: "1d"
+    });
+    if (!historicalData || !historicalData.quotes || historicalData.quotes.length < 2) {
+      return res.status(400).json({ message: "Not enough historical data available for forecasting." });
+    }
+    // Sort data by date ascending and extract closing prices.
+    const sortedData = historicalData.quotes.sort((a, b) => new Date(a.date) - new Date(b.date));
+    const closingPrices = sortedData.map(item => item.close);
+    // Use the saved normalization parameters
+    if (!normalizationParams) {
+      return res.status(500).json({ message: "Normalization parameters not available." });
+    }
+    const { minPrice, maxPrice } = normalizationParams;
+    const normalizedPrices = closingPrices.map(price => (price - minPrice) / (maxPrice - minPrice));
+    // Prepare input tensor with shape [1, sequence_length, 1]
+    const inputTensor = tf.tensor2d(normalizedPrices, [normalizedPrices.length, 1])
+                          .reshape([1, normalizedPrices.length, 1]);
+    let forecastPriceNormalized;
+    if (forecastModel) {
+      const predictionTensor = forecastModel.predict(inputTensor);
+      forecastPriceNormalized = predictionTensor.dataSync()[0];
+    } else {
+      forecastPriceNormalized = normalizedPrices[normalizedPrices.length - 1];
+    }
+    const forecastPrice = forecastPriceNormalized * (maxPrice - minPrice) + minPrice;
+    return res.json({ symbol, forecastPrice: forecastPrice.toFixed(2) });
+  } catch (error) {
+    console.error("❌ Error forecasting stock price:", error.message);
+    return res.status(500).json({ message: "Error forecasting stock price.", error: error.message });
   }
 });
 
