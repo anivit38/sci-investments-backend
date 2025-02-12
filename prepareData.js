@@ -3,8 +3,8 @@ const yahooFinance = require('yahoo-finance2').default;
 const fs = require('fs');
 
 // Define time range for one year.
-const endTime = Math.floor(Date.now() / 1000); // current time in seconds
-const startTime = endTime - (365 * 24 * 60 * 60); // one year ago
+const endDate = new Date(); // current date and time
+const startDate = new Date(endDate.getTime() - (365 * 24 * 60 * 60 * 1000)); // one year ago
 
 (async () => {
   try {
