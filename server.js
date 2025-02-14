@@ -21,7 +21,25 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Custom request options to allow following Yahoo Finance redirects
+// Helper: Check if the market is open (assuming NYSE hours: M–F, 9:30–16:00 ET)
+function isMarketOpen() {
+  const now = new Date();
+  const options = { timeZone: "America/New_York", hour12: false };
+  const estString = now.toLocaleString("en-US", options);
+  const est = new Date(estString);
+
+  const day = est.getDay(); // 0: Sunday, 6: Saturday
+  if (day === 0 || day === 6) return false; // weekend
+
+  const hour = est.getHours();
+  const minute = est.getMinutes();
+  // Market opens at 9:30 and closes at 16:00
+  if (hour < 9 || (hour === 9 && minute < 30)) return false;
+  if (hour > 16 || (hour === 16 && minute > 0)) return false;
+  return true;
+}
+
+// Custom request options for Yahoo Finance
 const requestOptions = {
   headers: {
     "User-Agent":
@@ -87,12 +105,22 @@ const CACHE_TTL = 15 * 60 * 1000; // 15 minutes TTL
 
 async function fetchStockData(symbol) {
   const now = Date.now();
+  const marketOpen = isMarketOpen();
+
+  // If market is closed and cached data exists, return it
+  if (!marketOpen && stockDataCache[symbol]) {
+    console.log(`Market closed, using cached data for ${symbol}`);
+    return stockDataCache[symbol].data;
+  }
+
+  // Otherwise, if market is open or no cache, check TTL
   if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
+
   console.log(`Fetching fresh data for ${symbol}`);
-  // Remove "assetProfile" to reduce errors from missing data/rate-limits
+  // We omit "assetProfile" to reduce rate-limit errors
   const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics"];
   try {
     const data = await yahooFinance.quoteSummary(symbol, {
@@ -243,7 +271,6 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // Industry Comparison
-    // Note: assetProfile is not fetched now, so industry might be "Unknown"
     const stockIndustry =
       stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     let industryScore = 0;
@@ -293,6 +320,7 @@ app.post("/api/check-stock", async (req, res) => {
           }
         }
         const avgDailyReturn = count > 0 ? totalReturn / count : 0;
+        // ~22 trading days in a month
         historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
       }
     } catch (histErr) {
@@ -404,6 +432,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   let detailedStocks = await Promise.all(
     filteredSymbols.map(async (symObj) => {
       try {
+        // Throttle requests to avoid rate limits
         await delay(200);
         const detailed = await fetchStockData(symObj.symbol);
         return { ...symObj, detailed };
@@ -475,7 +504,8 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockScore += 2;
     else if (metrics.debtRatio > 0.7) stockScore -= 2;
 
-    const classification = stockScore > 7 ? "growth" : stockScore >= 0 ? "stable" : "unstable";
+    const classification =
+      stockScore > 7 ? "growth" : stockScore >= 0 ? "stable" : "unstable";
 
     let advice;
     if (stockScore >= 8) advice = "Very Good Stock to Buy";
@@ -626,6 +656,7 @@ app.post("/api/forecast-stock", async (req, res) => {
     return res.status(400).json({ message: "Stock symbol is required for forecasting." });
   }
   try {
+    // 60-day historical range
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - 60 * 24 * 60 * 60 * 1000);
 
@@ -643,20 +674,27 @@ app.post("/api/forecast-stock", async (req, res) => {
     }
 
     if (!historicalData || !historicalData.quotes || historicalData.quotes.length < 2) {
-      return res.status(400).json({ message: "Not enough historical data available for forecasting." });
+      return res
+        .status(400)
+        .json({ message: "Not enough historical data available for forecasting." });
     }
 
+    // Sort ascending by date
     const sortedData = historicalData.quotes.sort((a, b) => new Date(a.date) - new Date(b.date));
     const closingPrices = sortedData.map((item) => item.close);
 
     if (!normalizationParams) {
-      return res.status(500).json({ message: "Normalization parameters not available on the server." });
+      return res
+        .status(500)
+        .json({ message: "Normalization parameters not available on the server." });
     }
 
     const { minPrice, maxPrice } = normalizationParams;
     const normalizedPrices = closingPrices.map(
       (price) => (price - minPrice) / (maxPrice - minPrice)
     );
+
+    // shape = [1, sequence_length, 1]
     const inputTensor = tf
       .tensor2d(normalizedPrices, [normalizedPrices.length, 1])
       .reshape([1, normalizedPrices.length, 1]);
@@ -666,6 +704,7 @@ app.post("/api/forecast-stock", async (req, res) => {
       const predictionTensor = forecastModel.predict(inputTensor);
       forecastPriceNormalized = predictionTensor.dataSync()[0];
     } else {
+      // fallback if model not loaded
       forecastPriceNormalized = normalizedPrices[normalizedPrices.length - 1];
     }
 
@@ -685,7 +724,9 @@ app.post("/api/forecast-stock", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error forecasting stock price:", error.message);
-    return res.status(500).json({ message: "Error forecasting stock price.", error: error.message });
+    return res
+      .status(500)
+      .json({ message: "Error forecasting stock price.", error: error.message });
   }
 });
 
