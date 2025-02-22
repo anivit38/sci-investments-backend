@@ -15,7 +15,8 @@ const path = require("path");
 const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
-const fetch = require("node-fetch"); // New dependency for web searching
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 // Helper: Delay (in milliseconds)
 function delay(ms) {
