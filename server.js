@@ -1,6 +1,6 @@
 /*******************************************
  * COMBINED SERVER FOR AUTH, STOCK CHECKER,
- * FINDER, DASHBOARD, FORECASTING
+ * FINDER, DASHBOARD, FORECASTING & COMMUNITY
  *******************************************/
 
 // 1. Load Environment & Libraries
@@ -15,6 +15,7 @@ const path = require("path");
 const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
+const fetch = require("node-fetch"); // New dependency for web searching
 
 // Helper: Delay (in milliseconds)
 function delay(ms) {
@@ -45,8 +46,49 @@ const requestOptions = {
   redirect: "follow",
 };
 
+// New: Helper function to fetch stock-related news and do a basic sentiment analysis
+async function fetchStockNews(query) {
+  const apiKey = process.env.NEWS_API_KEY;
+  if (!apiKey) {
+    console.warn("No NEWS_API_KEY provided. Skipping news sentiment analysis.");
+    return 0; // neutral sentiment if no API key
+  }
+  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&apiKey=${apiKey}&language=en`;
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.articles) return 0;
+    let sentimentScore = 0;
+    // Very basic sentiment analysis based on keywords in article titles
+    const positiveWords = ["growth", "profit", "record", "surge", "gain", "positive", "upgrade", "bullish"];
+    const negativeWords = ["crash", "loss", "decline", "drop", "warn", "bearish", "cut", "scandal"];
+    data.articles.forEach(article => {
+      const title = article.title.toLowerCase();
+      positiveWords.forEach(word => {
+        if (title.includes(word)) sentimentScore += 1;
+      });
+      negativeWords.forEach(word => {
+        if (title.includes(word)) sentimentScore -= 1;
+      });
+    });
+    console.log(`News sentiment score for "${query}":`, sentimentScore);
+    return sentimentScore;
+  } catch (error) {
+    console.error("Error fetching stock news:", error.message);
+    return 0;
+  }
+}
+
 // 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
+
+// New: CommunityPost Model for the community page
+const communityPostSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  message: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+const CommunityPost = mongoose.model("CommunityPost", communityPostSchema);
 
 // 2.1 Load industry metrics from JSON
 let industryMetrics = {};
@@ -110,7 +152,7 @@ async function fetchStockData(symbol) {
     return stockDataCache[symbol].data;
   }
   console.log(`Fetching fresh data for ${symbol}`);
-  const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics"];
+  const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
     const data = await yahooFinance.quoteSummary(symbol, {
       modules,
@@ -179,7 +221,7 @@ app.get("/protected", (req, res) => {
   }
 });
 
-// --- Stock Checker Endpoint with Industry Comparison and Forecasting ---
+// --- Stock Checker Endpoint with Industry Comparison, Forecasting, and News Sentiment ---
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
   if (!symbol || !intent) return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
@@ -220,7 +262,7 @@ app.post("/api/check-stock", async (req, res) => {
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
     else if (metrics.debtRatio > 0.7) baseScore -= 2;
 
-    // Day range
+    // Day range scoring
     const dayRange = metrics.dayHigh - metrics.dayLow;
     let dayScore = 0;
     if (dayRange > 0) {
@@ -228,7 +270,7 @@ app.post("/api/check-stock", async (req, res) => {
       dayScore = dayPosition < 0.3 ? 1 : -1;
     }
 
-    // 52-week range
+    // 52-week range scoring
     const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     let weekScore = 0;
     if (weekRange > 0) {
@@ -252,7 +294,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // Forecasting
+    // Forecasting (using historical data)
     let industryGrowthFraction = 0;
     if (
       stockIndustry !== "Unknown" &&
@@ -291,11 +333,19 @@ app.post("/api/check-stock", async (req, res) => {
       console.error("Historical data fetch error:", histErr.message);
     }
 
+    // Combine forecasts
     const weightFundamental = 0.6;
     const weightHistorical = 0.4;
-    const combinedForecast =
+    let combinedForecast =
       (fundamentalForecast * weightFundamental + historicalForecast * weightHistorical) /
       (weightFundamental + weightHistorical);
+
+    // New: Adjust forecast based on recent news sentiment
+    const newsSentiment = await fetchStockNews(symbol);
+    // Adjust forecast by 0.5% of currentPrice per sentiment point (can be tuned)
+    const sentimentAdjustment = newsSentiment * 0.005 * metrics.currentPrice;
+    combinedForecast += sentimentAdjustment;
+    
     const projectedGrowthPercent =
       ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
 
@@ -583,7 +633,7 @@ app.get("/api/popular-stocks", async (req, res) => {
   }
 });
 
-// --- Stock Forecasting Endpoint ---
+// --- Stock Forecasting Endpoint with News Sentiment Adjustment ---
 app.post("/api/forecast-stock", async (req, res) => {
   const { symbol } = req.body;
   if (!symbol) {
@@ -631,8 +681,14 @@ app.post("/api/forecast-stock", async (req, res) => {
     } else {
       forecastPriceNormalized = normalizedPrices[normalizedPrices.length - 1];
     }
-    const forecastPrice = forecastPriceNormalized * (maxPrice - minPrice) + minPrice;
+    let forecastPrice = forecastPriceNormalized * (maxPrice - minPrice) + minPrice;
     const lastClose = closingPrices[closingPrices.length - 1];
+
+    // New: Adjust forecast using news sentiment
+    const newsSentiment = await fetchStockNews(symbol);
+    const sentimentAdjustment = newsSentiment * 0.005 * lastClose;
+    forecastPrice += sentimentAdjustment;
+
     const projectedGrowthPercent = ((forecastPrice - lastClose) / lastClose) * 100;
     const forecastPeriodDays = 22;
     const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
@@ -648,6 +704,34 @@ app.post("/api/forecast-stock", async (req, res) => {
     return res
       .status(500)
       .json({ message: "Error forecasting stock price.", error: error.message });
+  }
+});
+
+// --- Community Endpoints ---
+// GET all community posts
+app.get("/api/community-posts", async (req, res) => {
+  try {
+    const posts = await CommunityPost.find().sort({ createdAt: -1 });
+    return res.json({ posts });
+  } catch (error) {
+    console.error("Error fetching community posts:", error.message);
+    return res.status(500).json({ message: "Error fetching posts." });
+  }
+});
+
+// POST a new community post
+app.post("/api/community-posts", async (req, res) => {
+  const { username, message } = req.body;
+  if (!username || !message) {
+    return res.status(400).json({ message: "Username and message are required." });
+  }
+  try {
+    const newPost = new CommunityPost({ username, message });
+    await newPost.save();
+    return res.status(201).json({ message: "Post created successfully.", post: newPost });
+  } catch (error) {
+    console.error("Error creating community post:", error.message);
+    return res.status(500).json({ message: "Error creating post." });
   }
 });
 
