@@ -15,6 +15,7 @@ const path = require("path");
 const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
+
 // Use dynamic import for node-fetch (ESM in CommonJS)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -457,6 +458,17 @@ app.post("/api/check-stock", async (req, res) => {
       Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
     );
 
+    // 1) Determine the stock's or industry's revenue growth
+    let stockRevenueGrowth = 0;
+    if (
+      stockIndustry !== "Unknown" &&
+      industryMetrics[stockIndustry] &&
+      industryMetrics[stockIndustry].revenueGrowth
+    ) {
+      stockRevenueGrowth = industryMetrics[stockIndustry].revenueGrowth;
+    }
+
+    // 2) Include "revenueGrowth" in the final JSON
     return res.json({
       symbol,
       industry: stockIndustry,
@@ -475,6 +487,8 @@ app.post("/api/check-stock", async (req, res) => {
         forecastPeriod: "1 month",
         forecastEndDate: forecastEndDate.toISOString(),
       },
+      // NEW: field to show up in the dashboard
+      revenueGrowth: stockRevenueGrowth,
     });
   } catch (error) {
     console.error("❌ Error in /api/check-stock:", error.message);
@@ -668,7 +682,6 @@ app.get("/api/popular-stocks", async (req, res) => {
   // (Optional) parse sort parameter from query: e.g., ?sort=volume
   const sortParam = req.query.sort || "gainers";
 
-  // Check if we have cached data and it's still valid
   if (
     popularStocksCache &&
     Date.now() - popularStocksCacheTimestamp < POPULAR_CACHE_DURATION &&
@@ -677,14 +690,12 @@ app.get("/api/popular-stocks", async (req, res) => {
     console.log("Returning cached popular stocks data.");
     return res.json(popularStocksCache);
   }
-
   try {
     const symbolGroups = require(path.join(__dirname, "symbols.json"));
     const nasdaqSymbols = symbolGroups["NASDAQ"] || [];
     if (nasdaqSymbols.length === 0) {
       return res.status(404).json({ message: "No symbols available for NASDAQ." });
     }
-
     let stockData = await Promise.all(
       nasdaqSymbols.map(async (symbol) => {
         try {
@@ -697,8 +708,6 @@ app.get("/api/popular-stocks", async (req, res) => {
         }
       })
     );
-
-    // Filter out null or incomplete data
     stockData = stockData.filter(
       (s) =>
         s !== null && s.price && s.price.regularMarketChangePercent !== undefined
@@ -719,12 +728,11 @@ app.get("/api/popular-stocks", async (req, res) => {
       );
     }
 
-    // If marketState is "open", optionally filter out negative or zero changes
     if (marketState === "open") {
+      // filter out negative or zero changes
       stockData = stockData.filter((s) => s.price.regularMarketChangePercent > 0);
     }
 
-    // Pick the top 10
     const topStocks = stockData.slice(0, 10).map((s) => ({
       symbol: s.symbol,
       score:
@@ -737,11 +745,8 @@ app.get("/api/popular-stocks", async (req, res) => {
         previousClose: s.price.regularMarketPreviousClose,
       },
     }));
-
-    // Cache results
     popularStocksCache = topStocks;
     popularStocksCacheTimestamp = Date.now();
-
     return res.json(topStocks);
   } catch (error) {
     console.error("❌ Error in /api/popular-stocks:", error.message);
@@ -777,26 +782,19 @@ app.post("/api/forecast-stock", async (req, res) => {
         .status(400)
         .json({ message: "Not enough historical data available for forecasting." });
     }
-
-    // Sort data by date ascending
     const sortedData = historicalData.quotes.sort(
       (a, b) => new Date(a.date) - new Date(b.date)
     );
     const closingPrices = sortedData.map((item) => item.close);
-
-    // Make sure we have normalization params
     if (!normalizationParams) {
       return res
         .status(500)
         .json({ message: "Normalization parameters not available on the server." });
     }
-
     const { minPrice, maxPrice } = normalizationParams;
     const normalizedPrices = closingPrices.map(
       (price) => (price - minPrice) / (maxPrice - minPrice)
     );
-
-    // Prepare input tensor
     const inputTensor = tf
       .tensor2d(normalizedPrices, [normalizedPrices.length, 1])
       .reshape([1, normalizedPrices.length, 1]);
@@ -806,11 +804,8 @@ app.post("/api/forecast-stock", async (req, res) => {
       const predictionTensor = forecastModel.predict(inputTensor);
       forecastPriceNormalized = predictionTensor.dataSync()[0];
     } else {
-      // If no model, fallback to last known
       forecastPriceNormalized = normalizedPrices[normalizedPrices.length - 1];
     }
-
-    // Convert back to actual price
     let forecastPrice = forecastPriceNormalized * (maxPrice - minPrice) + minPrice;
     const lastClose = closingPrices[closingPrices.length - 1];
 
@@ -824,7 +819,6 @@ app.post("/api/forecast-stock", async (req, res) => {
     const forecastEndDate = new Date(
       Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
     );
-
     return res.json({
       symbol,
       forecastPrice: forecastPrice.toFixed(2),
