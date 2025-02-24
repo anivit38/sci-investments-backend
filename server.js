@@ -422,10 +422,9 @@ app.post("/api/check-stock", async (req, res) => {
     const projectedGrowthPercent =
       ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
 
-      const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
-      const numericCombinedScore = +rawCombinedScore.toFixed(2); // number
-     
-      
+    const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+    const combinedScore = fundamentalRating + projectedGrowthPercent;
+
     let finalClassification, finalAdvice;
     if (intent === "buy") {
       if (combinedScore >= 40) {
