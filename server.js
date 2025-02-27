@@ -1,6 +1,6 @@
 /*******************************************
  * COMBINED SERVER FOR AUTH, STOCK CHECKER,
- * FINDER, DASHBOARD, FORECASTING & COMMUNITY
+ * FINDER, DASHBOARD, FORECASTING, COMMUNITY
  *******************************************/
 
 // 1. Load Environment & Libraries
@@ -56,7 +56,9 @@ async function fetchStockNews(query) {
     console.warn("No NEWS_API_KEY provided. Skipping news sentiment analysis.");
     return 0;
   }
-  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&apiKey=${apiKey}&language=en`;
+  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(
+    query
+  )}&apiKey=${apiKey}&language=en`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -158,6 +160,59 @@ async function fetchStockData(symbol) {
     throw err;
   }
 }
+
+// --- New Endpoint: Historical Data for Charting ---
+// This endpoint returns historical daily data for a given symbol over a specified range.
+// Accepts a POST with { symbol, range } where range is a string like "1m", "3m", "1y".
+// You can adjust the mapping as needed.
+app.post("/api/stock-history", async (req, res) => {
+  const { symbol, range } = req.body;
+  if (!symbol) {
+    return res.status(400).json({ message: "Stock symbol is required." });
+  }
+
+  // Determine the number of days based on range; default to 1 month (30 days)
+  let days = 30;
+  if (range === "3m") {
+    days = 90;
+  } else if (range === "1y") {
+    days = 365;
+  } // add more ranges as needed
+
+  try {
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const historicalData = await yahooFinance.historical(symbol, {
+      period1: startDate,
+      period2: endDate,
+      interval: "1d",
+      requestOptions,
+    });
+
+    if (!historicalData || historicalData.length === 0) {
+      return res.status(404).json({ message: "No historical data found for this symbol." });
+    }
+
+    // Sort ascending by date
+    historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // Map to a simplified format
+    const chartData = historicalData.map((item) => ({
+      date: item.date,
+      open: item.open,
+      high: item.high,
+      low: item.low,
+      close: item.close,
+      volume: item.volume,
+    }));
+
+    return res.json({ symbol, range: range || "1m", data: chartData });
+  } catch (error) {
+    console.error("Error fetching historical data:", error.message);
+    return res.status(500).json({ message: "Error fetching historical data." });
+  }
+});
 
 // --- Auth Endpoints ---
 app.get("/", (req, res) => {
@@ -405,7 +460,6 @@ app.post("/api/check-stock", async (req, res) => {
 });
 
 // --- Finder Endpoints ---
-// Modified Finder endpoint now requires minPrice along with maxPrice.
 const finderRouter = express.Router();
 finderRouter.post("/api/find-stocks", async (req, res) => {
   console.log("⏰ Incoming body for find-stocks:", req.body);
