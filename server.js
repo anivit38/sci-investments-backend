@@ -61,19 +61,13 @@ async function fetchStockNews(query) {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.articles) return 0;
-
     let sentimentScore = 0;
     const positiveWords = ["growth", "profit", "record", "surge", "gain", "positive", "upgrade", "bullish"];
     const negativeWords = ["crash", "loss", "decline", "drop", "warn", "bearish", "cut", "scandal"];
-
     data.articles.forEach((article) => {
       const title = article.title.toLowerCase();
-      positiveWords.forEach((word) => {
-        if (title.includes(word)) sentimentScore += 1;
-      });
-      negativeWords.forEach((word) => {
-        if (title.includes(word)) sentimentScore -= 1;
-      });
+      positiveWords.forEach((word) => { if (title.includes(word)) sentimentScore += 1; });
+      negativeWords.forEach((word) => { if (title.includes(word)) sentimentScore -= 1; });
     });
     console.log(`News sentiment score for "${query}":`, sentimentScore);
     return sentimentScore;
@@ -105,13 +99,8 @@ try {
 // 3. Create Express App
 const app = express();
 
-// 3.1 CORS Configuration
-// Replace "https://sci-investments.web.app" with your actual domain if needed.
-// Or use origin: "*" for all origins.
-app.use(cors({
-  origin: "https://sci-investments.web.app"
-}));
-
+// Enable CORS for your front-end domain
+app.use(cors({ origin: "https://sci-investments.web.app" }));
 app.use(bodyParser.json());
 
 // 4. Connect to MongoDB
@@ -173,31 +162,59 @@ async function fetchStockData(symbol) {
 }
 
 // --- New Endpoint: Historical Data for Charting ---
+// Accepts a POST with { symbol, range } where range is one of: "1d", "5d", "1w", "1m", "6m", "1y", "MAX".
 app.post("/api/stock-history", async (req, res) => {
   const { symbol, range } = req.body;
   if (!symbol) {
     return res.status(400).json({ message: "Stock symbol is required." });
   }
-  // Default range: 1 month (30 days)
-  let days = 30;
-  if (range === "3m") {
-    days = 90;
-  } else if (range === "1y") {
-    days = 365;
+  // Map range string to number of days:
+  let days;
+  switch (range) {
+    case "1d":
+      days = 1;
+      break;
+    case "5d":
+      days = 5;
+      break;
+    case "1w":
+      days = 7;
+      break;
+    case "1m":
+      days = 30;
+      break;
+    case "6m":
+      days = 180;
+      break;
+    case "1y":
+      days = 365;
+      break;
+    case "MAX":
+      days = 5 * 365; // 5 years
+      break;
+    default:
+      days = 30; // Default to 1m if unknown
   }
+
   try {
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
+
     const historicalData = await yahooFinance.historical(symbol, {
       period1: startDate,
       period2: endDate,
       interval: "1d",
       requestOptions,
     });
+
     if (!historicalData || historicalData.length === 0) {
       return res.status(404).json({ message: "No historical data found for this symbol." });
     }
+
+    // Sort ascending by date
     historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // Map to a simplified format for charting
     const chartData = historicalData.map((item) => ({
       date: item.date,
       open: item.open,
@@ -206,6 +223,7 @@ app.post("/api/stock-history", async (req, res) => {
       close: item.close,
       volume: item.volume,
     }));
+
     return res.json({ symbol, range: range || "1m", data: chartData });
   } catch (error) {
     console.error("Error fetching historical data:", error.message);
@@ -287,11 +305,8 @@ app.post("/api/check-stock", async (req, res) => {
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
-
     const computedAvgVolume =
-      stock.summaryDetail?.averageDailyVolume3Month ||
-      stock.price?.regularMarketVolume ||
-      0;
+      stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
@@ -333,38 +348,28 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // Industry comparison
-    const stockIndustry =
-      stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     let industryScore = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
       if (metrics.peRatio && indMetrics.peRatio) {
-        industryScore +=
-          metrics.peRatio < indMetrics.peRatio ? 2 : -2;
+        industryScore += metrics.peRatio < indMetrics.peRatio ? 2 : -2;
       }
       if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
-        industryScore +=
-          metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
+        industryScore += metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
       }
       if (metrics.debtRatio && indMetrics.debtToEquity) {
-        industryScore +=
-          metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
+        industryScore += metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
       }
     }
 
     // Forecasting (using historical data)
     let industryGrowthFraction = 0;
-    if (
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
-    ) {
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
       industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100;
     }
     const bonus = dayScore > 0 ? 0.02 : -0.02;
-    const fundamentalForecast =
-      metrics.currentPrice *
-      (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
+    const fundamentalForecast = metrics.currentPrice * (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
 
     let historicalForecast = fundamentalForecast;
     try {
@@ -404,8 +409,7 @@ app.post("/api/check-stock", async (req, res) => {
     const sentimentAdjustment = newsSentiment * 0.005 * metrics.currentPrice;
     combinedForecast += sentimentAdjustment;
 
-    const projectedGrowthPercent =
-      ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const projectedGrowthPercent = ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
     const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
     const numericCombinedScore = +rawCombinedScore.toFixed(2);
@@ -428,8 +432,7 @@ app.post("/api/check-stock", async (req, res) => {
     } else if (intent === "sell") {
       if (projectedGrowthPercent > 7) {
         finalClassification = "stable";
-        finalAdvice =
-          "Hold the Stock (Forecast indicates significant growth; further analysis recommended)";
+        finalAdvice = "Hold the Stock (Forecast indicates significant growth; further analysis recommended)";
       } else {
         finalClassification = "unstable";
         finalAdvice = "Sell the Stock";
@@ -440,11 +443,7 @@ app.post("/api/check-stock", async (req, res) => {
     const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
 
     let stockRevenueGrowth = 0;
-    if (
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
-    ) {
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
       stockRevenueGrowth = industryMetrics[stockIndustry].revenueGrowth;
     }
 
@@ -480,13 +479,150 @@ app.post("/api/check-stock", async (req, res) => {
 // --- Finder Endpoints ---
 const finderRouter = express.Router();
 finderRouter.post("/api/find-stocks", async (req, res) => {
-  // ... unchanged logic ...
+  console.log("⏰ Incoming body for find-stocks:", req.body);
+  const { stockType, exchange, minPrice, maxPrice } = req.body;
+  if (!stockType || !exchange || minPrice == null || maxPrice == null) {
+    console.log("❌ Validation failed. Body was:", req.body);
+    return res.status(400).json({ message: "stockType, exchange, minPrice and maxPrice are required." });
+  }
+  if (stockType !== "growth" && stockType !== "stable") {
+    console.log("❌ Unknown stockType:", stockType);
+    return res.status(400).json({ message: "stockType must be either 'growth' or 'stable'." });
+  }
+  const symbolGroups = require(path.join(__dirname, "symbols.json"));
+  console.log("Loaded symbolGroups:", symbolGroups);
+  const symbolsForExchange = symbolGroups[exchange.toUpperCase()];
+  if (!symbolsForExchange || symbolsForExchange.length === 0) {
+    return res.status(404).json({ message: `No symbols found for the exchange: ${exchange}` });
+  }
+  let filteredSymbols = symbolsForExchange.map((symbolStr) => ({ symbol: symbolStr, exchange }));
+  let detailedStocks = await Promise.all(
+    filteredSymbols.map(async (symObj) => {
+      try {
+        await delay(200);
+        const detailed = await fetchStockData(symObj.symbol);
+        return { ...symObj, detailed };
+      } catch (error) {
+        console.error(`Error fetching data for ${symObj.symbol}:`, error.message);
+        return null;
+      }
+    })
+  );
+  detailedStocks = detailedStocks.filter((stock) => stock !== null);
+  console.log("🔎 Checking current prices for symbols in exchange:", exchange);
+  detailedStocks.forEach((stock) => {
+    const currentPrice = stock.detailed?.price?.regularMarketPrice;
+    console.log(`Symbol: ${stock.symbol} - Current Price: ${currentPrice}`);
+  });
+  let priceFilteredStocks = detailedStocks.filter((stock) => {
+    const currentPrice = stock.detailed?.price?.regularMarketPrice;
+    console.log(
+      `Comparing ${stock.symbol}: Current Price = ${currentPrice}, minPrice = ${minPrice}, maxPrice = ${maxPrice}`
+    );
+    return currentPrice !== undefined && currentPrice <= maxPrice && currentPrice >= minPrice;
+  });
+  if (priceFilteredStocks.length === 0) {
+    let prices = detailedStocks.map((stock) => ({
+      symbol: stock.symbol,
+      currentPrice: stock.detailed?.price?.regularMarketPrice,
+    }));
+    console.warn("No stocks passed the price filter. Available prices:", prices);
+    return res.status(404).json({
+      message: "No stocks found with a price between the specified minPrice and maxPrice. Please adjust your filters.",
+    });
+  }
+  const totalVolume = priceFilteredStocks.reduce((sum, stock) => {
+    const vol = stock.detailed?.price?.regularMarketVolume ?? 0;
+    return sum + vol;
+  }, 0);
+  const avgVolume = totalVolume / priceFilteredStocks.length;
+  console.log(`Calculated average volume: ${avgVolume}`);
+  const evaluatedStocks = priceFilteredStocks.map((stock) => {
+    const priceData = stock.detailed.price || {};
+    const summaryData = stock.detailed.summaryDetail || {};
+    const financialData = stock.detailed.financialData || {};
+    const metrics = {
+      volume: priceData.regularMarketVolume ?? 0,
+      currentPrice: priceData.regularMarketPrice ?? 0,
+      peRatio: summaryData.trailingPE ?? 0,
+      earningsGrowth: financialData.earningsGrowth ?? 0,
+      debtRatio: financialData.debtToEquity ?? 0,
+      avg50Days: priceData.fiftyDayAverage ?? 0,
+      avg200Days: priceData.twoHundredDayAverage ?? 0,
+    };
+    let stockScore = 0;
+    if (metrics.volume > avgVolume * 1.1) stockScore += 2;
+    else if (metrics.volume < avgVolume * 0.9) stockScore -= 2;
+    if (metrics.peRatio >= 10 && metrics.peRatio <= 20) stockScore += 2;
+    else if (metrics.peRatio > 20) stockScore -= 1;
+    if (metrics.earningsGrowth > 0.05) stockScore += 2;
+    if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) stockScore += 2;
+    else if (metrics.debtRatio > 0.7) stockScore -= 2;
+    const classification = stockScore > 7 ? "growth" : stockScore >= 0 ? "stable" : "unstable";
+    let advice;
+    if (stockScore >= 8) advice = "Very Good Stock to Buy";
+    else if (stockScore >= 5) advice = "Good Stock to Buy";
+    else if (stockScore >= 0) advice = "Okay Stock to Buy";
+    else if (stockScore >= -5) advice = "Bad Stock";
+    else advice = "Bad Stock to Buy";
+    return {
+      symbol: stock.symbol,
+      exchange: stock.exchange,
+      currentPrice: metrics.currentPrice,
+      metrics,
+      combinedScore: stockScore.toFixed(2),
+      classification,
+      advice,
+    };
+  });
+  console.log("Evaluated Stocks:", evaluatedStocks);
+  const matchingStocks = evaluatedStocks.filter((stock) => stock.classification === stockType);
+  console.log(`Found ${matchingStocks.length} matching stocks for type "${stockType}".`);
+  return res.json({ stocks: matchingStocks });
 });
+
 finderRouter.post("/signup", async (req, res) => {
-  // ... unchanged logic ...
+  console.log("Stock Finder - Incoming Request Body:", req.body);
+  const { email, username, password } = req.body;
+  if (!email || !username || !password) {
+    console.error("Missing required fields!");
+    return res.status(400).json({ message: "All fields are required." });
+  }
+  try {
+    console.log("Stock Finder - Checking if user exists...");
+    const existingUser = await UserModel.findOne({ email });
+    if (existingUser) {
+      console.error("Stock Finder - User already exists!");
+      return res.status(400).json({ message: "Email already in use." });
+    }
+    console.log("Stock Finder - Hashing password...");
+    const hashedPassword = await bcrypt.hash(password, 10);
+    console.log("Stock Finder - Saving new user...");
+    const user = new UserModel({ email, username, password: hashedPassword });
+    await user.save();
+    console.log("Stock Finder - User saved successfully!");
+    return res.status(201).json({ message: "User registered successfully." });
+  } catch (error) {
+    console.error("Stock Finder - Signup Error:", error);
+    return res.status(500).json({ message: "Error during signup." });
+  }
 });
+
 finderRouter.post("/login", async (req, res) => {
-  // ... unchanged logic ...
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: "Username and password are required." });
+  }
+  try {
+    const user = await UserModel.findOne({ username });
+    if (!user) return res.status(401).json({ message: "Invalid credentials." });
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) return res.status(401).json({ message: "Invalid credentials." });
+    return res.status(200).json({ message: "Login successful." });
+  } catch (error) {
+    console.error("Stock Finder - Login Error:", error);
+    return res.status(500).json({ message: "Error during login." });
+  }
 });
 app.use("/finder", finderRouter);
 
@@ -495,26 +631,162 @@ let popularStocksCache = null;
 let popularStocksCacheTimestamp = 0;
 const POPULAR_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 app.get("/api/popular-stocks", async (req, res) => {
-  // ... unchanged logic ...
+  const marketState = req.query.marketState || "open";
+  const sortParam = req.query.sort || "gainers";
+  if (
+    popularStocksCache &&
+    Date.now() - popularStocksCacheTimestamp < POPULAR_CACHE_DURATION &&
+    popularStocksCache.length > 0
+  ) {
+    console.log("Returning cached popular stocks data.");
+    return res.json(popularStocksCache);
+  }
+  try {
+    const symbolGroups = require(path.join(__dirname, "symbols.json"));
+    const nasdaqSymbols = symbolGroups["NASDAQ"] || [];
+    if (nasdaqSymbols.length === 0) {
+      return res.status(404).json({ message: "No symbols available for NASDAQ." });
+    }
+    let stockData = await Promise.all(
+      nasdaqSymbols.map(async (symbol) => {
+        try {
+          await delay(200);
+          const data = await fetchStockData(symbol);
+          return { symbol, price: data.price };
+        } catch (error) {
+          console.error(`Error fetching data for ${symbol}:`, error.message);
+          return null;
+        }
+      })
+    );
+    stockData = stockData.filter((s) => s !== null && s.price && s.price.regularMarketChangePercent !== undefined);
+    if (sortParam === "volume") {
+      stockData.sort((a, b) => (b.price.regularMarketVolume || 0) - (a.price.regularMarketVolume || 0));
+    } else {
+      stockData.sort((a, b) => b.price.regularMarketChangePercent - a.price.regularMarketChangePercent);
+    }
+    if (marketState === "open") {
+      stockData = stockData.filter((s) => s.price.regularMarketChangePercent > 0);
+    }
+    const topStocks = stockData.slice(0, 10).map((s) => ({
+      symbol: s.symbol,
+      score: sortParam === "volume" ? s.price.regularMarketVolume : s.price.regularMarketChangePercent,
+      metrics: {
+        currentPrice: s.price.regularMarketPrice,
+        changePercent: s.price.regularMarketChangePercent,
+        previousClose: s.price.regularMarketPreviousClose,
+      },
+    }));
+    popularStocksCache = topStocks;
+    popularStocksCacheTimestamp = Date.now();
+    return res.json(topStocks);
+  } catch (error) {
+    console.error("❌ Error in /api/popular-stocks:", error.message);
+    return res.status(500).json({ message: "Error fetching popular stocks." });
+  }
 });
 
 // --- Stock Forecasting Endpoint with News Sentiment Adjustment ---
 app.post("/api/forecast-stock", async (req, res) => {
-  // ... unchanged logic ...
+  const { symbol } = req.body;
+  if (!symbol) {
+    return res.status(400).json({ message: "Stock symbol is required for forecasting." });
+  }
+  try {
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - 60 * 24 * 60 * 60 * 1000);
+    let historicalData;
+    try {
+      historicalData = await yahooFinance.chart(symbol, {
+        period1: startDate,
+        period2: endDate,
+        interval: "1d",
+        requestOptions,
+      });
+    } catch (innerErr) {
+      console.error(`❌ yahooFinance.chart error for symbol "${symbol}":`, innerErr);
+      return res.status(500).json({ message: "Error fetching historical data." });
+    }
+    if (!historicalData || !historicalData.quotes || historicalData.quotes.length < 2) {
+      return res.status(400).json({ message: "Not enough historical data available for forecasting." });
+    }
+    const sortedData = historicalData.quotes.sort((a, b) => new Date(a.date) - new Date(b.date));
+    const closingPrices = sortedData.map((item) => item.close);
+    if (!normalizationParams) {
+      return res.status(500).json({ message: "Normalization parameters not available on the server." });
+    }
+    const { minPrice, maxPrice } = normalizationParams;
+    const normalizedPrices = closingPrices.map((price) => (price - minPrice) / (maxPrice - minPrice));
+    const inputTensor = tf.tensor2d(normalizedPrices, [normalizedPrices.length, 1]).reshape([1, normalizedPrices.length, 1]);
+    let forecastPriceNormalized;
+    if (forecastModel) {
+      const predictionTensor = forecastModel.predict(inputTensor);
+      forecastPriceNormalized = predictionTensor.dataSync()[0];
+    } else {
+      forecastPriceNormalized = normalizedPrices[normalizedPrices.length - 1];
+    }
+    let forecastPrice = forecastPriceNormalized * (maxPrice - minPrice) + minPrice;
+    const lastClose = closingPrices[closingPrices.length - 1];
+    const newsSentiment = await fetchStockNews(symbol);
+    const sentimentAdjustment = newsSentiment * 0.005 * lastClose;
+    forecastPrice += sentimentAdjustment;
+    const projectedGrowthPercent = ((forecastPrice - lastClose) / lastClose) * 100;
+    const forecastPeriodDays = 22;
+    const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
+    return res.json({
+      symbol,
+      forecastPrice: forecastPrice.toFixed(2),
+      projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
+      forecastPeriod: "1 month",
+      forecastEndDate: forecastEndDate.toISOString(),
+    });
+  } catch (error) {
+    console.error("❌ Error forecasting stock price:", error.message);
+    return res.status(500).json({ message: "Error forecasting stock price.", error: error.message });
+  }
 });
 
 // --- Community Endpoints ---
 app.get("/api/community-posts", async (req, res) => {
-  // ... unchanged logic ...
+  try {
+    const posts = await CommunityPost.find().sort({ createdAt: -1 });
+    return res.json({ posts });
+  } catch (error) {
+    console.error("Error fetching community posts:", error.message);
+    return res.status(500).json({ message: "Error fetching posts." });
+  }
 });
 
 app.post("/api/community-posts", async (req, res) => {
-  // ... unchanged logic ...
+  const { username, message } = req.body;
+  if (!username || !message) {
+    return res.status(400).json({ message: "Username and message are required." });
+  }
+  try {
+    const newPost = new CommunityPost({ username, message });
+    await newPost.save();
+    return res.status(201).json({ message: "Post created successfully.", post: newPost });
+  } catch (error) {
+    console.error("Error creating community post:", error.message);
+    return res.status(500).json({ message: "Error creating post." });
+  }
 });
 
 // --- Notifications Endpoint ---
 app.get("/api/notifications", (req, res) => {
-  // ... unchanged logic ...
+  const sampleNotifications = [
+    {
+      title: "Market Alert: High Volatility in Tech",
+      message: "Tech stocks are experiencing high volatility due to earnings season.",
+      createdAt: new Date().toISOString(),
+    },
+    {
+      title: "Portfolio Update",
+      message: "Your watchlist stocks have changed by an average of +2% this week.",
+      createdAt: new Date().toISOString(),
+    },
+  ];
+  return res.json({ notifications: sampleNotifications });
 });
 
 // --- Start the Server ---
