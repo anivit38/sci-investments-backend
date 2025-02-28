@@ -56,7 +56,9 @@ async function fetchStockNews(query) {
     console.warn("No NEWS_API_KEY provided. Skipping news sentiment analysis.");
     return 0;
   }
-  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&apiKey=${apiKey}&language=en`;
+  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(
+    query
+  )}&apiKey=${apiKey}&language=en`;
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -193,27 +195,22 @@ app.post("/api/stock-history", async (req, res) => {
       days = 5 * 365; // 5 years
       break;
     default:
-      days = 30; // Default to 1m if unknown
+      days = 30;
   }
-
   try {
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
-
     const historicalData = await yahooFinance.historical(symbol, {
       period1: startDate,
       period2: endDate,
       interval: "1d",
       requestOptions,
     });
-
     if (!historicalData || historicalData.length === 0) {
       return res.status(404).json({ message: "No historical data found for this symbol." });
     }
-
     // Sort ascending by date
     historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
-
     // Map to a simplified format for charting
     const chartData = historicalData.map((item) => ({
       date: item.date,
@@ -223,7 +220,6 @@ app.post("/api/stock-history", async (req, res) => {
       close: item.close,
       volume: item.volume,
     }));
-
     return res.json({ symbol, range: range || "1m", data: chartData });
   } catch (error) {
     console.error("Error fetching historical data:", error.message);
@@ -370,7 +366,6 @@ app.post("/api/check-stock", async (req, res) => {
     }
     const bonus = dayScore > 0 ? 0.02 : -0.02;
     const fundamentalForecast = metrics.currentPrice * (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
-
     let historicalForecast = fundamentalForecast;
     try {
       const historicalData = await yahooFinance.historical(symbol, {
@@ -403,12 +398,10 @@ app.post("/api/check-stock", async (req, res) => {
     let combinedForecast =
       (fundamentalForecast * weightFundamental + historicalForecast * weightHistorical) /
       (weightFundamental + weightHistorical);
-
     // Adjust forecast using news sentiment
     const newsSentiment = await fetchStockNews(symbol);
     const sentimentAdjustment = newsSentiment * 0.005 * metrics.currentPrice;
     combinedForecast += sentimentAdjustment;
-
     const projectedGrowthPercent = ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
     const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
@@ -441,14 +434,11 @@ app.post("/api/check-stock", async (req, res) => {
 
     const forecastPeriodDays = 22;
     const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
-
     let stockRevenueGrowth = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
       stockRevenueGrowth = industryMetrics[stockIndustry].revenueGrowth;
     }
-
     const stockName = stock.price?.longName || symbol;
-
     return res.json({
       symbol,
       name: stockName,
