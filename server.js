@@ -552,16 +552,16 @@ app.get("/api/notifications", (req, res) => {
  *******************************************/
 
 // File paths for stocks and portfolio data
-const STOCKS_JSON = path.join(__dirname, "stocks.json");
+const STOCKS_JSON = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
 
 // Load stock list
 let stockList = [];
 if (fs.existsSync(STOCKS_JSON)) {
   stockList = JSON.parse(fs.readFileSync(STOCKS_JSON, "utf-8"));
-  console.log(`✅ Loaded ${stockList.length} stocks from stocks.json`);
+  console.log(`✅ Loaded ${stockList.length} stocks from symbols.json`);
 } else {
-  console.warn("⚠️  No stocks.json found. Automated investor will skip buying.");
+  console.warn("⚠️  No symbols.json found. Automated investor will skip buying.");
 }
 
 // Read or initialize portfolio. Note: we now store a "maxPrice" for each holding.
