@@ -16,38 +16,6 @@ const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
 
-
-const nodemailer = require("nodemailer");
-
-// Set up the transporter using your email service (this example uses Gmail)
-const transporter = nodemailer.createTransport({
-  service: "Gmail",
-  auth: {
-    user: process.env.NOTIFY_EMAIL,
-    pass: process.env.NOTIFY_PASSWORD,
-  },
-});
-
-// Helper function to send a sell notification email
-function sendSellNotification(symbol, currentPrice, reasons) {
-  const message = `[AutoSell] Selling ${symbol} at $${currentPrice}. Reasons: ${reasons.join(", ")}`;
-  const mailOptions = {
-    from: process.env.NOTIFY_EMAIL,
-    to: process.env.NOTIFY_RECIPIENT,
-    subject: `Sell Alert: ${symbol}`,
-    text: message,
-  };
-
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.error("Error sending notification email:", error);
-    } else {
-      console.log("Notification email sent:", info.response);
-    }
-  });
-}
-
-
 // Use dynamic import for node-fetch (ESM in CommonJS)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -1220,33 +1188,6 @@ app.get("/api/simulate-trades", async (req, res) => {
       .json({ message: "Simulation error.", error: error.message });
   }
 });
-
-async function autoSellStocks() {
-  if (!isMarketOpen()) {
-    return;
-  }
-
-  for (let i = 0; i < portfolio.length; i++) {
-    const holding = portfolio[i];
-    const currentPrice = await getStockPrice(holding.symbol);
-    if (!currentPrice) continue;
-
-    const { sell, reasons } = await evaluateSellSignal(holding, currentPrice);
-    if (sell) {
-      const message = `[AutoSell] Selling ${holding.symbol} at $${currentPrice}. Reasons: ${reasons.join(", ")}`;
-      console.log(message);
-      
-      // Send email notification
-      sendSellNotification(holding.symbol, currentPrice, reasons);
-      
-      // Remove holding from portfolio and save
-      portfolio.splice(i, 1);
-      i--;
-      savePortfolio();
-    }
-  }
-}
-
 
 /*******************************************
  * 7. START THE SERVER
