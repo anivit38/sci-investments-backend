@@ -175,6 +175,7 @@ loadForecastResources();
 // 5. Implement Caching for Yahoo Finance Stock Data
 const stockDataCache = {};
 const CACHE_TTL = 15 * 60 * 1000; // 15 minutes TTL
+
 async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
@@ -198,9 +199,10 @@ async function fetchStockData(symbol) {
     "assetProfile",
   ];
   try {
+    // Use validateResult: false to disable strict schema validation.
     const data = await yahooFinance.quoteSummary(
       symbol,
-      { modules, validate: false },
+      { modules, validateResult: false },
       { fetchOptions: requestOptions }
     );
     stockDataCache[symbol] = { data, timestamp: now };
@@ -588,8 +590,7 @@ app.post("/api/check-stock", async (req, res) => {
       },
       forecast: {
         forecastPrice: +combinedForecast.toFixed(2),
-        projectedGrowthPercent:
-          projectedGrowthPercent.toFixed(2) + "%",
+        projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
         forecastPeriod: "1 month",
         forecastEndDate: forecastEndDate.toISOString(),
       },
@@ -653,8 +654,14 @@ const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
 // Load stock list
 let stockList = [];
 if (fs.existsSync(STOCKS_JSON)) {
-  stockList = JSON.parse(fs.readFileSync(STOCKS_JSON, "utf-8"));
-  console.log(`✅ Loaded ${stockList.length} stocks from symbols.json`);
+  try {
+    const rawContent = fs.readFileSync(STOCKS_JSON, "utf-8");
+    stockList = JSON.parse(rawContent);
+    console.log(`✅ Loaded ${stockList.length} stocks from symbols.json`);
+  } catch (err) {
+    console.error("Error parsing symbols.json:", err);
+    stockList = [];
+  }
 } else {
   console.warn("⚠️  No symbols.json found. Automated investor will skip buying.");
 }
@@ -674,7 +681,7 @@ async function getStockPrice(symbol) {
   try {
     const data = await yahooFinance.quoteSummary(
       symbol,
-      { modules: ["price"] },
+      { modules: ["price"], validateResult: false },
       { fetchOptions: requestOptions }
     );
     return data.price?.regularMarketPrice || null;
@@ -1026,135 +1033,146 @@ app.get("/api/simulate-trades", async (req, res) => {
 
     // Simulate Buy Trades using enhanced buy logic
     for (const stock of stockList) {
-      const data = await fetchStockData(stock.symbol);
-      if (!data || !data.price) continue;
+      try {
+        console.log(`Simulating buy for symbol: ${stock.symbol}`);
+        const data = await fetchStockData(stock.symbol);
+        if (!data || !data.price) continue;
 
-      // Compute similar metrics as in /api/check-stock
-      const computedAvgVolume =
-        data.summaryDetail?.averageDailyVolume3Month ||
-        data.price?.regularMarketVolume ||
-        0;
-      const metrics = {
-        volume: data.price?.regularMarketVolume ?? 0,
-        currentPrice: data.price?.regularMarketPrice ?? 0,
-        peRatio: data.summaryDetail?.trailingPE ?? 0,
-        pbRatio: data.summaryDetail?.priceToBook ?? 0,
-        dividendYield: data.summaryDetail?.dividendYield ?? 0,
-        earningsGrowth: data.financialData?.earningsGrowth ?? 0,
-        debtRatio: data.financialData?.debtToEquity ?? 0,
-        dayHigh: data.price?.regularMarketDayHigh ?? 0,
-        dayLow: data.price?.regularMarketDayLow ?? 0,
-        fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
-        fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
-      };
+        // Compute similar metrics as in /api/check-stock
+        const computedAvgVolume =
+          data.summaryDetail?.averageDailyVolume3Month ||
+          data.price?.regularMarketVolume ||
+          0;
+        const metrics = {
+          volume: data.price?.regularMarketVolume ?? 0,
+          currentPrice: data.price?.regularMarketPrice ?? 0,
+          peRatio: data.summaryDetail?.trailingPE ?? 0,
+          pbRatio: data.summaryDetail?.priceToBook ?? 0,
+          dividendYield: data.summaryDetail?.dividendYield ?? 0,
+          earningsGrowth: data.financialData?.earningsGrowth ?? 0,
+          debtRatio: data.financialData?.debtToEquity ?? 0,
+          dayHigh: data.price?.regularMarketDayHigh ?? 0,
+          dayLow: data.price?.regularMarketDayLow ?? 0,
+          fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+          fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
+        };
 
-      let baseScore = 0;
-      if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
-      else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
-      if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
-      else if (metrics.peRatio > 20) baseScore -= 1;
-      if (metrics.earningsGrowth > 0.05) baseScore += 2;
-      if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
-      else if (metrics.debtRatio > 0.7) baseScore -= 2;
+        let baseScore = 0;
+        if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
+        else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
+        if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
+        else if (metrics.peRatio > 20) baseScore -= 1;
+        if (metrics.earningsGrowth > 0.05) baseScore += 2;
+        if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
+        else if (metrics.debtRatio > 0.7) baseScore -= 2;
 
-      // Day range scoring
-      const dayRange = metrics.dayHigh - metrics.dayLow;
-      let dayScore = 0;
-      if (dayRange > 0) {
-        const dayPosition =
-          (metrics.currentPrice - metrics.dayLow) / dayRange;
-        dayScore = dayPosition < 0.3 ? 1 : -1;
-      }
-      // 52-week range scoring
-      const weekRange =
-        metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
-      let weekScore = 0;
-      if (weekRange > 0) {
-        const weekPosition =
-          (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-        weekScore = weekPosition < 0.5 ? 2 : -2;
-      }
-      let fundamentalRating = baseScore + dayScore + weekScore;
+        // Day range scoring
+        const dayRange = metrics.dayHigh - metrics.dayLow;
+        let dayScore = 0;
+        if (dayRange > 0) {
+          const dayPosition =
+            (metrics.currentPrice - metrics.dayLow) / dayRange;
+          dayScore = dayPosition < 0.3 ? 1 : -1;
+        }
+        // 52-week range scoring
+        const weekRange =
+          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+        let weekScore = 0;
+        if (weekRange > 0) {
+          const weekPosition =
+            (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+          weekScore = weekPosition < 0.5 ? 2 : -2;
+        }
+        let fundamentalRating = baseScore + dayScore + weekScore;
 
-      // For simulation, let’s simulate a buy if the fundamentalRating is at least 2 and the price is below a threshold (e.g., $100)
-      if (fundamentalRating >= 2 && metrics.currentPrice < 100) {
-        simulationLog.push(
-          `Simulated Buy: ${stock.symbol} at $${metrics.currentPrice} (Rating: ${fundamentalRating})`
-        );
-        simulatedPortfolio.push({
-          symbol: stock.symbol,
-          buyPrice: metrics.currentPrice,
-          quantity: 10,
-          buyDate: new Date().toISOString(),
-        });
+        // For simulation, let’s simulate a buy if the fundamentalRating is at least 2 and the price is below a threshold (e.g., $100)
+        if (fundamentalRating >= 2 && metrics.currentPrice < 100) {
+          simulationLog.push(
+            `Simulated Buy: ${stock.symbol} at $${metrics.currentPrice} (Rating: ${fundamentalRating})`
+          );
+          simulatedPortfolio.push({
+            symbol: stock.symbol,
+            buyPrice: metrics.currentPrice,
+            quantity: 10,
+            buyDate: new Date().toISOString(),
+          });
+        }
+      } catch (err) {
+        console.error(`Simulation: Skipping ${stock.symbol} due to error: ${err.message}`);
+        continue;
       }
     }
 
     // Simulate Sell Trades using enhanced sell signals
     for (let i = 0; i < simulatedPortfolio.length; i++) {
-      const holding = simulatedPortfolio[i];
-      const data = await fetchStockData(holding.symbol);
-      if (!data || !data.price) continue;
-      const currentPrice = data.price?.regularMarketPrice || 0;
+      try {
+        const holding = simulatedPortfolio[i];
+        const data = await fetchStockData(holding.symbol);
+        if (!data || !data.price) continue;
+        const currentPrice = data.price?.regularMarketPrice || 0;
 
-      // Basic stop-loss and take-profit thresholds
-      const stopLoss = holding.buyPrice * 0.95;
-      const takeProfit = holding.buyPrice * 1.10;
+        // Basic stop-loss and take-profit thresholds
+        const stopLoss = holding.buyPrice * 0.95;
+        const takeProfit = holding.buyPrice * 1.10;
 
-      // Recompute metrics for enhanced sell signal analysis
-      const computedAvgVolume =
-        data.summaryDetail?.averageDailyVolume3Month ||
-        data.price?.regularMarketVolume ||
-        0;
-      const metrics = {
-        volume: data.price?.regularMarketVolume ?? 0,
-        currentPrice: data.price?.regularMarketPrice ?? 0,
-        peRatio: data.summaryDetail?.trailingPE ?? 0,
-        pbRatio: data.summaryDetail?.priceToBook ?? 0,
-        dividendYield: data.summaryDetail?.dividendYield ?? 0,
-        earningsGrowth: data.financialData?.earningsGrowth ?? 0,
-        debtRatio: data.financialData?.debtToEquity ?? 0,
-        dayHigh: data.price?.regularMarketDayHigh ?? 0,
-        dayLow: data.price?.regularMarketDayLow ?? 0,
-        fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
-        fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
-      };
-      let baseScore = 0;
-      if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
-      else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
-      if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
-      else if (metrics.peRatio > 20) baseScore -= 1;
-      if (metrics.earningsGrowth > 0.05) baseScore += 2;
-      if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
-      else if (metrics.debtRatio > 0.7) baseScore -= 2;
-      const dayRange = metrics.dayHigh - metrics.dayLow;
-      let dayScore = 0;
-      if (dayRange > 0) {
-        const dayPosition =
-          (metrics.currentPrice - metrics.dayLow) / dayRange;
-        dayScore = dayPosition < 0.3 ? 1 : -1;
-      }
-      const weekRange =
-        metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
-      let weekScore = 0;
-      if (weekRange > 0) {
-        const weekPosition =
-          (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-        weekScore = weekPosition < 0.5 ? 2 : -2;
-      }
-      let fundamentalRating = baseScore + dayScore + weekScore;
+        // Recompute metrics for enhanced sell signal analysis
+        const computedAvgVolume =
+          data.summaryDetail?.averageDailyVolume3Month ||
+          data.price?.regularMarketVolume ||
+          0;
+        const metrics = {
+          volume: data.price?.regularMarketVolume ?? 0,
+          currentPrice: data.price?.regularMarketPrice ?? 0,
+          peRatio: data.summaryDetail?.trailingPE ?? 0,
+          pbRatio: data.summaryDetail?.priceToBook ?? 0,
+          dividendYield: data.summaryDetail?.dividendYield ?? 0,
+          earningsGrowth: data.financialData?.earningsGrowth ?? 0,
+          debtRatio: data.financialData?.debtToEquity ?? 0,
+          dayHigh: data.price?.regularMarketDayHigh ?? 0,
+          dayLow: data.price?.regularMarketDayLow ?? 0,
+          fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+          fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
+        };
+        let baseScore = 0;
+        if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
+        else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
+        if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
+        else if (metrics.peRatio > 20) baseScore -= 1;
+        if (metrics.earningsGrowth > 0.05) baseScore += 2;
+        if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
+        else if (metrics.debtRatio > 0.7) baseScore -= 2;
+        const dayRange = metrics.dayHigh - metrics.dayLow;
+        let dayScore = 0;
+        if (dayRange > 0) {
+          const dayPosition =
+            (metrics.currentPrice - metrics.dayLow) / dayRange;
+          dayScore = dayPosition < 0.3 ? 1 : -1;
+        }
+        const weekRange =
+          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+        let weekScore = 0;
+        if (weekRange > 0) {
+          const weekPosition =
+            (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+          weekScore = weekPosition < 0.5 ? 2 : -2;
+        }
+        let fundamentalRating = baseScore + dayScore + weekScore;
 
-      // Sell if the price hits stop-loss/take-profit OR if the fundamental rating is very low (e.g., <= -2)
-      if (
-        currentPrice <= stopLoss ||
-        currentPrice >= takeProfit ||
-        fundamentalRating <= -2
-      ) {
-        simulationLog.push(
-          `Simulated Sell: ${holding.symbol} at $${currentPrice} (Buy Price: $${holding.buyPrice}, Rating: ${fundamentalRating})`
-        );
-        simulatedPortfolio.splice(i, 1);
-        i--;
+        // Sell if the price hits stop-loss/take-profit OR if the fundamental rating is very low (e.g., <= -2)
+        if (
+          currentPrice <= stopLoss ||
+          currentPrice >= takeProfit ||
+          fundamentalRating <= -2
+        ) {
+          simulationLog.push(
+            `Simulated Sell: ${holding.symbol} at $${currentPrice} (Buy Price: $${holding.buyPrice}, Rating: ${fundamentalRating})`
+          );
+          simulatedPortfolio.splice(i, 1);
+          i--;
+        }
+      } catch (err) {
+        console.error(`Simulation sell: Skipping ${simulatedPortfolio[i].symbol} due to error: ${err.message}`);
+        continue;
       }
     }
 
