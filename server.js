@@ -106,14 +106,17 @@ try {
 const app = express();
 
 // 3.1 CORS Configuration – only allow your front-end domain
-app.use(cors({
-  origin: "https://sci-investments.web.app"
-}));
+app.use(
+  cors({
+    origin: "https://sci-investments.web.app",
+  })
+);
 
 app.use(bodyParser.json());
 
 // 4. Connect to MongoDB
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
+const MONGODB_URI =
+  process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
 mongoose
   .connect(MONGODB_URI, {
     useNewUrlParser: true,
@@ -161,7 +164,11 @@ async function fetchStockData(symbol) {
   console.log(`Fetching fresh data for ${symbol}`);
   const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
-    const data = await yahooFinance.quoteSummary(symbol, { modules, validate: false, requestOptions });
+    const data = await yahooFinance.quoteSummary(symbol, {
+      modules,
+      validate: false,
+      requestOptions,
+    });
     stockDataCache[symbol] = { data, timestamp: now };
     return data;
   } catch (err) {
@@ -179,14 +186,30 @@ app.post("/api/stock-history", async (req, res) => {
   }
   let days;
   switch (range) {
-    case "1d": days = 1; break;
-    case "5d": days = 5; break;
-    case "1w": days = 7; break;
-    case "1m": days = 30; break;
-    case "6m": days = 180; break;
-    case "1y": days = 365; break;
-    case "MAX": days = 1825; break; // ~5 years
-    default: days = 30; break;
+    case "1d":
+      days = 1;
+      break;
+    case "5d":
+      days = 5;
+      break;
+    case "1w":
+      days = 7;
+      break;
+    case "1m":
+      days = 30;
+      break;
+    case "6m":
+      days = 180;
+      break;
+    case "1y":
+      days = 365;
+      break;
+    case "MAX":
+      days = 1825;
+      break; // ~5 years
+    default:
+      days = 30;
+      break;
   }
   try {
     const endDate = new Date();
@@ -253,7 +276,9 @@ app.post("/login", async (req, res) => {
     if (!user) return res.status(401).json({ message: "Invalid credentials." });
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) return res.status(401).json({ message: "Invalid credentials." });
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: "24h" });
+    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, {
+      expiresIn: "24h",
+    });
     console.log("✅ Login Successful:", username);
     return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
@@ -264,8 +289,7 @@ app.post("/login", async (req, res) => {
 
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
-  if (!token)
-    return res.status(401).json({ message: "Unauthorized. Token required." });
+  if (!token) return res.status(401).json({ message: "Unauthorized. Token required." });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     return res.status(200).json({ message: "Protected data accessed.", user: decoded });
@@ -337,7 +361,8 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // Industry comparison
-    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+    const stockIndustry =
+      stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     let industryScore = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
@@ -386,6 +411,7 @@ app.post("/api/check-stock", async (req, res) => {
           }
         }
         const avgDailyReturn = count > 0 ? totalReturn / count : 0;
+        // Approx. 22 trading days in a month
         historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
       }
     } catch (histErr) {
@@ -396,7 +422,8 @@ app.post("/api/check-stock", async (req, res) => {
     const weightFundamental = 0.6;
     const weightHistorical = 0.4;
     let combinedForecast =
-      (fundamentalForecast * weightFundamental + historicalForecast * weightHistorical) /
+      (fundamentalForecast * weightFundamental +
+        historicalForecast * weightHistorical) /
       (weightFundamental + weightHistorical);
 
     // Adjust forecast using news sentiment
@@ -428,7 +455,8 @@ app.post("/api/check-stock", async (req, res) => {
     } else if (intent === "sell") {
       if (projectedGrowthPercent > 7) {
         finalClassification = "stable";
-        finalAdvice = "Hold the Stock (Forecast indicates significant growth; further analysis recommended)";
+        finalAdvice =
+          "Hold the Stock (Forecast indicates significant growth; further analysis recommended)";
       } else {
         finalClassification = "unstable";
         finalAdvice = "Sell the Stock";
@@ -436,7 +464,9 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     const forecastPeriodDays = 22;
-    const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
+    const forecastEndDate = new Date(
+      Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
+    );
 
     let stockRevenueGrowth = 0;
     if (
@@ -472,7 +502,9 @@ app.post("/api/check-stock", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error in /api/check-stock:", error.message);
-    return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
+    return res
+      .status(500)
+      .json({ message: "Error fetching stock data.", error: error.message });
   }
 });
 
@@ -515,7 +547,134 @@ app.get("/api/notifications", (req, res) => {
   // ... unchanged ...
 });
 
-// --- Start the Server ---
+/*******************************************
+ * 6. AUTOMATED INVESTOR SECTION
+ *******************************************/
+// If you want to store all exchange stocks in a JSON file, place them in "stocks.json" like so:
+//   [ { \"symbol\": \"AAPL\" }, { \"symbol\": \"TSLA\" }, { \"symbol\": \"AMZN\" }, ... ]
+// For a large file with thousands of symbols, ensure 'stocks.json' exists in the same directory.
+
+const STOCKS_JSON = path.join(__dirname, "stocks.json");
+const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
+
+// Read stock list from JSON (symbol, etc.)
+let stockList = [];
+if (fs.existsSync(STOCKS_JSON)) {
+  stockList = JSON.parse(fs.readFileSync(STOCKS_JSON, "utf-8"));
+  console.log(`✅ Loaded ${stockList.length} stocks from stocks.json`);
+} else {
+  console.warn("⚠️  No stocks.json found. Automated investor will skip buying.");
+}
+
+// Read or initialize portfolio
+let portfolio = fs.existsSync(PORTFOLIO_JSON)
+  ? JSON.parse(fs.readFileSync(PORTFOLIO_JSON, "utf-8"))
+  : [];
+
+// Save portfolio to file
+function savePortfolio() {
+  fs.writeFileSync(PORTFOLIO_JSON, JSON.stringify(portfolio, null, 2));
+}
+
+// Helper to fetch real-time price (re-usable if you want to skip full fetchStockData)
+async function getStockPrice(symbol) {
+  try {
+    const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
+    return data.price?.regularMarketPrice || null;
+  } catch (error) {
+    console.error(`Error fetching price for ${symbol}:`, error.message);
+    return null;
+  }
+}
+
+// Automated Buying Logic
+// You can replace this with your own logic from /api/check-stock
+// E.g., calling the "check-stock" logic for each symbol with an intent of "buy"
+// For demonstration, let's do a simple rule-based approach
+async function autoBuyStocks() {
+  // Only run if the market is open
+  if (!isMarketOpen()) {
+    // console.log("Market closed, skipping autoBuyStocks");
+    return;
+  }
+
+  for (const stock of stockList) {
+    const price = await getStockPrice(stock.symbol);
+    if (!price) continue;
+
+    // Example: Buy if price < $50
+    // You could also incorporate advanced logic:
+    //   - call your /api/check-stock endpoint with { symbol, intent: 'buy' }
+    //   - parse the JSON response to see if it's recommended to buy
+    //   - etc.
+    const shouldBuy = price < 50;
+
+    if (shouldBuy) {
+      console.log(`[AutoBuy] Buying ${stock.symbol} at $${price}`);
+      // For demonstration, buy 10 shares
+      portfolio.push({
+        symbol: stock.symbol,
+        buyPrice: price,
+        quantity: 10,
+        buyDate: new Date().toISOString(),
+      });
+      savePortfolio();
+    }
+  }
+}
+
+// Automated Selling Logic
+// We incorporate basic stop-loss and take-profit triggers
+// For a more advanced approach, you could also call your /api/check-stock with intent='sell'
+async function autoSellStocks() {
+  // Only run if the market is open
+  if (!isMarketOpen()) {
+    // console.log("Market closed, skipping autoSellStocks");
+    return;
+  }
+
+  for (let i = 0; i < portfolio.length; i++) {
+    const holding = portfolio[i];
+    const price = await getStockPrice(holding.symbol);
+    if (!price) continue;
+
+    // Example triggers:
+    const stopLoss = holding.buyPrice * 0.95; // -5%
+    const takeProfit = holding.buyPrice * 1.10; // +10%
+
+    // Also time-based exit example: sell after 30 days
+    const daysHeld =
+      (new Date().getTime() - new Date(holding.buyDate).getTime()) /
+      (1000 * 3600 * 24);
+    const timeBasedExit = daysHeld >= 30;
+
+    if (price <= stopLoss || price >= takeProfit || timeBasedExit) {
+      console.log(`[AutoSell] Selling ${holding.symbol} at $${price}`);
+      portfolio.splice(i, 1);
+      i--;
+      savePortfolio();
+    }
+  }
+}
+
+// Periodic task to check for buy/sell conditions
+setInterval(async () => {
+  try {
+    await autoBuyStocks();
+    await autoSellStocks();
+  } catch (err) {
+    console.error("Error running automated investor tasks:", err.message);
+  }
+}, 60_000); // Check every minute
+
+// Optional: Provide an endpoint to view the portfolio
+app.get("/api/portfolio", (req, res) => {
+  res.json({ portfolio });
+});
+
+/*******************************************
+ * 7. START THE SERVER
+ *******************************************/
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Combined server running on port ${PORT}`);
