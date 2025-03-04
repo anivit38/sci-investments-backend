@@ -548,16 +548,14 @@ app.get("/api/notifications", (req, res) => {
 });
 
 /*******************************************
- * 6. AUTOMATED INVESTOR SECTION
+ * 6. AUTOMATED INVESTOR SECTION (UPDATED)
  *******************************************/
-// If you want to store all exchange stocks in a JSON file, place them in "stocks.json" like so:
-//   [ { \"symbol\": \"AAPL\" }, { \"symbol\": \"TSLA\" }, { \"symbol\": \"AMZN\" }, ... ]
-// For a large file with thousands of symbols, ensure 'stocks.json' exists in the same directory.
 
+// File paths for stocks and portfolio data
 const STOCKS_JSON = path.join(__dirname, "stocks.json");
 const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
 
-// Read stock list from JSON (symbol, etc.)
+// Load stock list
 let stockList = [];
 if (fs.existsSync(STOCKS_JSON)) {
   stockList = JSON.parse(fs.readFileSync(STOCKS_JSON, "utf-8"));
@@ -566,7 +564,7 @@ if (fs.existsSync(STOCKS_JSON)) {
   console.warn("⚠️  No stocks.json found. Automated investor will skip buying.");
 }
 
-// Read or initialize portfolio
+// Read or initialize portfolio. Note: we now store a "maxPrice" for each holding.
 let portfolio = fs.existsSync(PORTFOLIO_JSON)
   ? JSON.parse(fs.readFileSync(PORTFOLIO_JSON, "utf-8"))
   : [];
@@ -576,7 +574,7 @@ function savePortfolio() {
   fs.writeFileSync(PORTFOLIO_JSON, JSON.stringify(portfolio, null, 2));
 }
 
-// Helper to fetch real-time price (re-usable if you want to skip full fetchStockData)
+// Helper to fetch real-time price (simpler than full fetchStockData)
 async function getStockPrice(symbol) {
   try {
     const data = await yahooFinance.quoteSummary(symbol, { modules: ["price"] });
@@ -587,69 +585,298 @@ async function getStockPrice(symbol) {
   }
 }
 
-// Automated Buying Logic
-// You can replace this with your own logic from /api/check-stock
-// E.g., calling the "check-stock" logic for each symbol with an intent of "buy"
-// For demonstration, let's do a simple rule-based approach
+/**
+ * Helper: Analyze stock for buying using logic from your stock-checker.
+ * This function replicates your /api/check-stock “buy” logic and returns an analysis object.
+ */
+async function analyzeStock(symbol) {
+  // Fetch full stock data (including price, summaryDetail, financialData, etc.)
+  const stock = await fetchStockData(symbol);
+  if (!stock || !stock.price) {
+    throw new Error("Stock data not available");
+  }
+
+  const computedAvgVolume =
+    stock.summaryDetail?.averageDailyVolume3Month ||
+    stock.price?.regularMarketVolume ||
+    0;
+
+  const metrics = {
+    volume: stock.price?.regularMarketVolume ?? 0,
+    currentPrice: stock.price?.regularMarketPrice ?? 0,
+    peRatio: stock.summaryDetail?.trailingPE ?? 0,
+    pbRatio: stock.summaryDetail?.priceToBook ?? 0,
+    dividendYield: stock.summaryDetail?.dividendYield ?? 0,
+    earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
+    debtRatio: stock.financialData?.debtToEquity ?? 0,
+    dayHigh: stock.price?.regularMarketDayHigh ?? 0,
+    dayLow: stock.price?.regularMarketDayLow ?? 0,
+    fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+    fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
+  };
+
+  // Base scoring
+  let baseScore = 0;
+  if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
+  else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
+  if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
+  else if (metrics.peRatio > 20) baseScore -= 1;
+  if (metrics.earningsGrowth > 0.05) baseScore += 2;
+  if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
+  else if (metrics.debtRatio > 0.7) baseScore -= 2;
+
+  // Day range scoring
+  const dayRange = metrics.dayHigh - metrics.dayLow;
+  let dayScore = 0;
+  if (dayRange > 0) {
+    const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
+    dayScore = dayPosition < 0.3 ? 1 : -1;
+  }
+
+  // 52-week range scoring
+  const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+  let weekScore = 0;
+  if (weekRange > 0) {
+    const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+    weekScore = weekPosition < 0.5 ? 2 : -2;
+  }
+
+  // Industry comparison
+  const stockIndustry =
+    stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+  let industryScore = 0;
+  if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+    const indMetrics = industryMetrics[stockIndustry];
+    if (metrics.peRatio && indMetrics.peRatio) {
+      industryScore += metrics.peRatio < indMetrics.peRatio ? 2 : -2;
+    }
+    if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
+      industryScore += metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
+    }
+    if (metrics.debtRatio && indMetrics.debtToEquity) {
+      industryScore += metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
+    }
+  }
+
+  // Forecasting (using historical data)
+  let industryGrowthFraction = 0;
+  if (
+    stockIndustry !== "Unknown" &&
+    industryMetrics[stockIndustry] &&
+    industryMetrics[stockIndustry].revenueGrowth
+  ) {
+    industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100;
+  }
+  const bonus = dayScore > 0 ? 0.02 : -0.02;
+  const fundamentalForecast =
+    metrics.currentPrice *
+    (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
+
+  let historicalForecast = fundamentalForecast;
+  try {
+    const historicalData = await yahooFinance.historical(symbol, {
+      period: "1y",
+      interval: "1d",
+      requestOptions,
+    });
+    if (historicalData && historicalData.length > 1) {
+      historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+      let totalReturn = 0;
+      let count = 0;
+      for (let i = 1; i < historicalData.length; i++) {
+        const prevClose = historicalData[i - 1].close;
+        const currClose = historicalData[i].close;
+        if (prevClose && currClose) {
+          totalReturn += currClose / prevClose - 1;
+          count++;
+        }
+      }
+      const avgDailyReturn = count > 0 ? totalReturn / count : 0;
+      // Approx. 22 trading days in a month
+      historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
+    }
+  } catch (histErr) {
+    console.error("Historical data fetch error:", histErr.message);
+  }
+
+  // Combine forecasts with fixed weights
+  const weightFundamental = 0.6;
+  const weightHistorical = 0.4;
+  let combinedForecast =
+    (fundamentalForecast * weightFundamental +
+      historicalForecast * weightHistorical) /
+    (weightFundamental + weightHistorical);
+
+  // Adjust forecast using news sentiment
+  const newsSentiment = await fetchStockNews(symbol);
+  const sentimentAdjustment = newsSentiment * 0.005 * metrics.currentPrice;
+  combinedForecast += sentimentAdjustment;
+
+  const projectedGrowthPercent =
+    ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
+  const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+  const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
+  const numericCombinedScore = +rawCombinedScore.toFixed(2);
+
+  // Use the buy classification logic
+  let finalClassification, finalAdvice;
+  if (numericCombinedScore >= 40) {
+    finalClassification = "growth";
+    finalAdvice = "Very Good Stock to Buy";
+  } else if (numericCombinedScore >= 20) {
+    finalClassification = "growth";
+    finalAdvice = "Good Stock to Buy";
+  } else if (numericCombinedScore >= 0) {
+    finalClassification = "stable";
+    finalAdvice = "Okay Stock to Buy";
+  } else {
+    finalClassification = "unstable";
+    finalAdvice = "Bad Stock to Buy";
+  }
+
+  const forecastPeriodDays = 22;
+  const forecastEndDate = new Date(
+    Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
+  );
+  const stockRevenueGrowth =
+    stockIndustry !== "Unknown" &&
+    industryMetrics[stockIndustry] &&
+    industryMetrics[stockIndustry].revenueGrowth
+      ? industryMetrics[stockIndustry].revenueGrowth
+      : 0;
+  const stockName = stock.price?.longName || symbol;
+
+  return {
+    symbol,
+    name: stockName,
+    industry: stockIndustry,
+    fundamentalRating: +fundamentalRating.toFixed(2),
+    combinedScore: numericCombinedScore,
+    classification: finalClassification,
+    advice: finalAdvice,
+    metrics: {
+      ...metrics,
+      dayRange: metrics.dayHigh - metrics.dayLow,
+      fiftyTwoWeekRange: metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow,
+    },
+    forecast: {
+      forecastPrice: +combinedForecast.toFixed(2),
+      projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
+      forecastPeriod: "1 month",
+      forecastEndDate: forecastEndDate.toISOString(),
+    },
+    revenueGrowth: stockRevenueGrowth,
+  };
+}
+
+/**
+ * Helper: Evaluate sell signal for a given holding.
+ * Tracks a static stop-loss, a dynamic trailing stop (based on the maximum price seen so far),
+ * time-based exit, and negative news sentiment.
+ */
+async function evaluateSellSignal(holding, currentPrice) {
+  const reasons = [];
+  let sell = false;
+
+  // Static stop-loss trigger: sell if current price falls below 95% of buy price.
+  const stopLoss = holding.buyPrice * 0.95;
+  if (currentPrice <= stopLoss) {
+    sell = true;
+    reasons.push("Price dropped below stop-loss threshold");
+  }
+
+  // Trailing stop: track the highest price seen since purchase.
+  if (!holding.maxPrice) {
+    holding.maxPrice = holding.buyPrice;
+  }
+  if (currentPrice > holding.maxPrice) {
+    holding.maxPrice = currentPrice;
+  } else {
+    // Sell if current price falls more than 5% from the peak.
+    if (currentPrice < holding.maxPrice * 0.95) {
+      sell = true;
+      reasons.push("Price dropped more than 5% from peak");
+    }
+  }
+
+  // Time-based exit: if held for more than 60 days and gain is modest (<5%), trigger exit.
+  const daysHeld =
+    (Date.now() - new Date(holding.buyDate).getTime()) / (1000 * 3600 * 24);
+  if (daysHeld >= 60 && currentPrice < holding.buyPrice * 1.05) {
+    sell = true;
+    reasons.push("Held for over 60 days with insufficient gains");
+  }
+
+  // News sentiment check: if strong negative sentiment, trigger sell.
+  const sentiment = await fetchStockNews(holding.symbol);
+  if (sentiment < -3) {
+    sell = true;
+    reasons.push("Strong negative news sentiment");
+  }
+
+  return { sell, reasons };
+}
+
+/**
+ * Automated Buying Logic.
+ * Instead of a simple price threshold, we now analyze each stock with our comprehensive
+ * scoring algorithm (via analyzeStock). If the combined score is strong enough (e.g., >=20),
+ * and the stock is not already held, then buy.
+ */
 async function autoBuyStocks() {
-  // Only run if the market is open
   if (!isMarketOpen()) {
-    // console.log("Market closed, skipping autoBuyStocks");
     return;
   }
 
   for (const stock of stockList) {
-    const price = await getStockPrice(stock.symbol);
-    if (!price) continue;
-
-    // Example: Buy if price < $50
-    // You could also incorporate advanced logic:
-    //   - call your /api/check-stock endpoint with { symbol, intent: 'buy' }
-    //   - parse the JSON response to see if it's recommended to buy
-    //   - etc.
-    const shouldBuy = price < 50;
-
-    if (shouldBuy) {
-      console.log(`[AutoBuy] Buying ${stock.symbol} at $${price}`);
-      // For demonstration, buy 10 shares
-      portfolio.push({
-        symbol: stock.symbol,
-        buyPrice: price,
-        quantity: 10,
-        buyDate: new Date().toISOString(),
-      });
-      savePortfolio();
+    try {
+      const analysis = await analyzeStock(stock.symbol);
+      // Set a threshold – for example, only buy if combinedScore is at least 20
+      if (analysis.combinedScore >= 20) {
+        // Avoid buying duplicates (optional)
+        if (!portfolio.find((holding) => holding.symbol === stock.symbol)) {
+          console.log(
+            `[AutoBuy] Buying ${stock.symbol} at $${analysis.metrics.currentPrice}. Combined Score: ${analysis.combinedScore}`
+          );
+          portfolio.push({
+            symbol: stock.symbol,
+            buyPrice: analysis.metrics.currentPrice,
+            quantity: 10, // or use a dynamic quantity based on your strategy
+            buyDate: new Date().toISOString(),
+            maxPrice: analysis.metrics.currentPrice, // initialize for trailing stop
+          });
+          savePortfolio();
+        }
+      }
+    } catch (error) {
+      console.error(`Error analyzing stock ${stock.symbol}:`, error.message);
     }
   }
 }
 
-// Automated Selling Logic
-// We incorporate basic stop-loss and take-profit triggers
-// For a more advanced approach, you could also call your /api/check-stock with intent='sell'
+/**
+ * Automated Selling Logic.
+ * Uses the evaluateSellSignal helper to check multiple sell conditions:
+ * static stop-loss, trailing stop, time-based exit, and news sentiment.
+ */
 async function autoSellStocks() {
-  // Only run if the market is open
   if (!isMarketOpen()) {
-    // console.log("Market closed, skipping autoSellStocks");
     return;
   }
 
+  // Iterate over portfolio (using a standard loop so that we can remove items safely)
   for (let i = 0; i < portfolio.length; i++) {
     const holding = portfolio[i];
-    const price = await getStockPrice(holding.symbol);
-    if (!price) continue;
+    const currentPrice = await getStockPrice(holding.symbol);
+    if (!currentPrice) continue;
 
-    // Example triggers:
-    const stopLoss = holding.buyPrice * 0.95; // -5%
-    const takeProfit = holding.buyPrice * 1.10; // +10%
-
-    // Also time-based exit example: sell after 30 days
-    const daysHeld =
-      (new Date().getTime() - new Date(holding.buyDate).getTime()) /
-      (1000 * 3600 * 24);
-    const timeBasedExit = daysHeld >= 30;
-
-    if (price <= stopLoss || price >= takeProfit || timeBasedExit) {
-      console.log(`[AutoSell] Selling ${holding.symbol} at $${price}`);
+    const { sell, reasons } = await evaluateSellSignal(holding, currentPrice);
+    if (sell) {
+      console.log(
+        `[AutoSell] Selling ${holding.symbol} at $${currentPrice}. Reasons: ${reasons.join(
+          ", "
+        )}`
+      );
       portfolio.splice(i, 1);
       i--;
       savePortfolio();
@@ -657,7 +884,7 @@ async function autoSellStocks() {
   }
 }
 
-// Periodic task to check for buy/sell conditions
+// Periodic task to check for buy/sell conditions (runs every minute)
 setInterval(async () => {
   try {
     await autoBuyStocks();
@@ -665,12 +892,151 @@ setInterval(async () => {
   } catch (err) {
     console.error("Error running automated investor tasks:", err.message);
   }
-}, 60_000); // Check every minute
+}, 60_000);
 
 // Optional: Provide an endpoint to view the portfolio
 app.get("/api/portfolio", (req, res) => {
   res.json({ portfolio });
 });
+
+// --- Simulation Endpoint for Automated Investor Trades (Secret) ---
+app.get("/api/simulate-trades", async (req, res) => {
+  try {
+    // Clone current portfolio to avoid modifying production data
+    let simulatedPortfolio = JSON.parse(JSON.stringify(portfolio));
+    let simulationLog = [];
+
+    // Simulate Buy Trades using enhanced buy logic
+    for (const stock of stockList) {
+      const data = await fetchStockData(stock.symbol);
+      if (!data || !data.price) continue;
+
+      // Compute similar metrics as in /api/check-stock
+      const computedAvgVolume =
+        data.summaryDetail?.averageDailyVolume3Month ||
+        data.price?.regularMarketVolume ||
+        0;
+      const metrics = {
+        volume: data.price?.regularMarketVolume ?? 0,
+        currentPrice: data.price?.regularMarketPrice ?? 0,
+        peRatio: data.summaryDetail?.trailingPE ?? 0,
+        pbRatio: data.summaryDetail?.priceToBook ?? 0,
+        dividendYield: data.summaryDetail?.dividendYield ?? 0,
+        earningsGrowth: data.financialData?.earningsGrowth ?? 0,
+        debtRatio: data.financialData?.debtToEquity ?? 0,
+        dayHigh: data.price?.regularMarketDayHigh ?? 0,
+        dayLow: data.price?.regularMarketDayLow ?? 0,
+        fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+        fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
+      };
+
+      let baseScore = 0;
+      if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
+      else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
+      if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
+      else if (metrics.peRatio > 20) baseScore -= 1;
+      if (metrics.earningsGrowth > 0.05) baseScore += 2;
+      if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
+      else if (metrics.debtRatio > 0.7) baseScore -= 2;
+
+      // Day range scoring
+      const dayRange = metrics.dayHigh - metrics.dayLow;
+      let dayScore = 0;
+      if (dayRange > 0) {
+        const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
+        dayScore = dayPosition < 0.3 ? 1 : -1;
+      }
+      // 52-week range scoring
+      const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+      let weekScore = 0;
+      if (weekRange > 0) {
+        const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+        weekScore = weekPosition < 0.5 ? 2 : -2;
+      }
+      let fundamentalRating = baseScore + dayScore + weekScore;
+
+      // For simulation, let’s simulate a buy if the fundamentalRating is at least 2 and the price is below a threshold (e.g., $100)
+      if (fundamentalRating >= 2 && metrics.currentPrice < 100) {
+        simulationLog.push(`Simulated Buy: ${stock.symbol} at $${metrics.currentPrice} (Rating: ${fundamentalRating})`);
+        simulatedPortfolio.push({
+          symbol: stock.symbol,
+          buyPrice: metrics.currentPrice,
+          quantity: 10,
+          buyDate: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Simulate Sell Trades using enhanced sell signals
+    for (let i = 0; i < simulatedPortfolio.length; i++) {
+      const holding = simulatedPortfolio[i];
+      const data = await fetchStockData(holding.symbol);
+      if (!data || !data.price) continue;
+      const currentPrice = data.price?.regularMarketPrice || 0;
+
+      // Basic stop-loss and take-profit thresholds
+      const stopLoss = holding.buyPrice * 0.95;
+      const takeProfit = holding.buyPrice * 1.10;
+
+      // Recompute metrics for enhanced sell signal analysis
+      const computedAvgVolume =
+        data.summaryDetail?.averageDailyVolume3Month ||
+        data.price?.regularMarketVolume ||
+        0;
+      const metrics = {
+        volume: data.price?.regularMarketVolume ?? 0,
+        currentPrice: data.price?.regularMarketPrice ?? 0,
+        peRatio: data.summaryDetail?.trailingPE ?? 0,
+        pbRatio: data.summaryDetail?.priceToBook ?? 0,
+        dividendYield: data.summaryDetail?.dividendYield ?? 0,
+        earningsGrowth: data.financialData?.earningsGrowth ?? 0,
+        debtRatio: data.financialData?.debtToEquity ?? 0,
+        dayHigh: data.price?.regularMarketDayHigh ?? 0,
+        dayLow: data.price?.regularMarketDayLow ?? 0,
+        fiftyTwoWeekHigh: data.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+        fiftyTwoWeekLow: data.summaryDetail?.fiftyTwoWeekLow ?? 0,
+      };
+      let baseScore = 0;
+      if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
+      else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
+      if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
+      else if (metrics.peRatio > 20) baseScore -= 1;
+      if (metrics.earningsGrowth > 0.05) baseScore += 2;
+      if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
+      else if (metrics.debtRatio > 0.7) baseScore -= 2;
+      const dayRange = metrics.dayHigh - metrics.dayLow;
+      let dayScore = 0;
+      if (dayRange > 0) {
+        const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
+        dayScore = dayPosition < 0.3 ? 1 : -1;
+      }
+      const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+      let weekScore = 0;
+      if (weekRange > 0) {
+        const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+        weekScore = weekPosition < 0.5 ? 2 : -2;
+      }
+      let fundamentalRating = baseScore + dayScore + weekScore;
+
+      // Sell if the price hits stop-loss/take-profit OR if the fundamental rating is very low (e.g., <= -2)
+      if (currentPrice <= stopLoss || currentPrice >= takeProfit || fundamentalRating <= -2) {
+        simulationLog.push(`Simulated Sell: ${holding.symbol} at $${currentPrice} (Buy Price: $${holding.buyPrice}, Rating: ${fundamentalRating})`);
+        simulatedPortfolio.splice(i, 1);
+        i--;
+      }
+    }
+
+    return res.json({
+      message: "Simulation complete.",
+      simulationLog,
+      simulatedPortfolio,
+    });
+  } catch (error) {
+    console.error("Simulation error:", error.message);
+    return res.status(500).json({ message: "Simulation error.", error: error.message });
+  }
+});
+
 
 /*******************************************
  * 7. START THE SERVER
