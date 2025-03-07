@@ -15,6 +15,35 @@ const path = require("path");
 const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
+const nodemailer = require("nodemailer");
+
+// Set up Nodemailer transporter (using Gmail as example)
+const transporter = nodemailer.createTransport({
+  service: "Gmail",
+  auth: {
+    user: process.env.NOTIFY_EMAIL,
+    pass: process.env.NOTIFY_PASSWORD,
+  },
+});
+
+// Helper function to send a sell notification email
+function sendSellNotification(symbol, currentPrice, reasons) {
+  const message = `[AutoSell] Selling ${symbol} at $${currentPrice}. Reasons: ${reasons.join(", ")}`;
+  const mailOptions = {
+    from: process.env.NOTIFY_EMAIL,
+    to: process.env.NOTIFY_RECIPIENT,
+    subject: `Sell Alert: ${symbol}`,
+    text: message,
+  };
+
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      console.error("Error sending notification email:", error);
+    } else {
+      console.log("Notification email sent:", info.response);
+    }
+  });
+}
 
 // Use dynamic import for node-fetch (ESM in CommonJS)
 const fetch = (...args) =>
@@ -64,26 +93,8 @@ async function fetchStockNews(query) {
     const data = await response.json();
     if (!data.articles) return 0;
     let sentimentScore = 0;
-    const positiveWords = [
-      "growth",
-      "profit",
-      "record",
-      "surge",
-      "gain",
-      "positive",
-      "upgrade",
-      "bullish",
-    ];
-    const negativeWords = [
-      "crash",
-      "loss",
-      "decline",
-      "drop",
-      "warn",
-      "bearish",
-      "cut",
-      "scandal",
-    ];
+    const positiveWords = ["growth", "profit", "record", "surge", "gain", "positive", "upgrade", "bullish"];
+    const negativeWords = ["crash", "loss", "decline", "drop", "warn", "bearish", "cut", "scandal"];
     data.articles.forEach((article) => {
       const title = article.title.toLowerCase();
       positiveWords.forEach((word) => {
@@ -122,14 +133,11 @@ try {
 
 // 3. Create Express App
 const app = express();
-
-// 3.1 CORS Configuration – only allow your front-end domain
 app.use(
   cors({
     origin: "https://sci-investments.web.app",
   })
 );
-
 app.use(bodyParser.json());
 
 // 4. Connect to MongoDB
@@ -145,7 +153,6 @@ mongoose
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch((err) => console.error("❌ MongoDB Connection Error:", err.message));
 mongoose.set("debug", true);
-
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
 
 // --- Forecast Model Resources ---
@@ -153,16 +160,9 @@ let forecastModel = null;
 let normalizationParams = null;
 async function loadForecastResources() {
   try {
-    forecastModel = await tf.loadLayersModel(
-      "file://model/forecast_model/model.json"
-    );
+    forecastModel = await tf.loadLayersModel("file://model/forecast_model/model.json");
     console.log("✅ Forecast model loaded successfully.");
-    const normPath = path.join(
-      __dirname,
-      "model",
-      "forecast_model",
-      "normalization.json"
-    );
+    const normPath = path.join(__dirname, "model", "forecast_model", "normalization.json");
     const normData = fs.readFileSync(normPath);
     normalizationParams = JSON.parse(normData);
     console.log("✅ Normalization parameters loaded:", normalizationParams);
@@ -175,7 +175,6 @@ loadForecastResources();
 // 5. Implement Caching for Yahoo Finance Stock Data
 const stockDataCache = {};
 const CACHE_TTL = 15 * 60 * 1000; // 15 minutes TTL
-
 async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
@@ -183,23 +182,13 @@ async function fetchStockData(symbol) {
     console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-  if (
-    stockDataCache[symbol] &&
-    now - stockDataCache[symbol].timestamp < CACHE_TTL
-  ) {
+  if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
   console.log(`Fetching fresh data for ${symbol}`);
-  const modules = [
-    "financialData",
-    "price",
-    "summaryDetail",
-    "defaultKeyStatistics",
-    "assetProfile",
-  ];
+  const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
-    // Use validateResult: false to disable strict schema validation.
     const data = await yahooFinance.quoteSummary(
       symbol,
       { modules, validateResult: false },
@@ -214,62 +203,31 @@ async function fetchStockData(symbol) {
 }
 
 // --- Historical Data for Charting ---
-// Supports range: "1d", "5d", "1w", "1m", "6m", "1y", "MAX"
 app.post("/api/stock-history", async (req, res) => {
   const { symbol, range } = req.body;
-  if (!symbol) {
-    return res.status(400).json({ message: "Stock symbol is required." });
-  }
+  if (!symbol) return res.status(400).json({ message: "Stock symbol is required." });
   let days;
   switch (range) {
-    case "1d":
-      days = 1;
-      break;
-    case "5d":
-      days = 5;
-      break;
-    case "1w":
-      days = 7;
-      break;
-    case "1m":
-      days = 30;
-      break;
-    case "6m":
-      days = 180;
-      break;
-    case "1y":
-      days = 365;
-      break;
-    case "MAX":
-      days = 1825;
-      break; // ~5 years
-    default:
-      days = 30;
-      break;
+    case "1d": days = 1; break;
+    case "5d": days = 5; break;
+    case "1w": days = 7; break;
+    case "1m": days = 30; break;
+    case "6m": days = 180; break;
+    case "1y": days = 365; break;
+    case "MAX": days = 1825; break;
+    default: days = 30; break;
   }
   try {
     const endDate = new Date();
-    const startDate = new Date(
-      endDate.getTime() - days * 24 * 60 * 60 * 1000
-    );
+    const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
     const historicalData = await yahooFinance.historical(
       symbol,
-      {
-        period1: startDate,
-        period2: endDate,
-        interval: "1d",
-      },
+      { period1: startDate, period2: endDate, interval: "1d" },
       { fetchOptions: requestOptions }
     );
-    if (!historicalData || historicalData.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No historical data found for this symbol." });
-    }
-    // Sort ascending
-    historicalData.sort(
-      (a, b) => new Date(a.date) - new Date(b.date)
-    );
+    if (!historicalData || historicalData.length === 0)
+      return res.status(404).json({ message: "No historical data found for this symbol." });
+    historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
     const chartData = historicalData.map((item) => ({
       date: item.date,
       open: item.open,
@@ -281,84 +239,52 @@ app.post("/api/stock-history", async (req, res) => {
     return res.json({ symbol, range: range || "1m", data: chartData });
   } catch (error) {
     console.error("Error fetching historical data:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Error fetching historical data." });
+    return res.status(500).json({ message: "Error fetching historical data." });
   }
 });
 
 // --- Auth Endpoints ---
-app.get("/", (req, res) => {
-  res.send("✅ Combined Server is running!");
-});
-
+app.get("/", (req, res) => res.send("✅ Combined Server is running!"));
 app.post("/signup", async (req, res) => {
   console.log("📩 Signup Request Received:", req.body);
   const { email, username, password } = req.body;
-  if (!email || !username || !password) {
-    return res.status(400).json({ message: "All fields are required." });
-  }
+  if (!email || !username || !password) return res.status(400).json({ message: "All fields are required." });
   try {
     const existingUser = await UserModel.findOne({ email });
-    if (existingUser)
-      return res.status(400).json({ message: "Email already in use." });
+    if (existingUser) return res.status(400).json({ message: "Email already in use." });
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = new UserModel({ email, username, password: hashedPassword });
     await user.save();
     console.log("✅ User Registered:", username);
-    return res
-      .status(201)
-      .json({ message: "User registered successfully." });
+    return res.status(201).json({ message: "User registered successfully." });
   } catch (error) {
     console.error("❌ Signup Error:", error.message);
     return res.status(500).json({ message: "Error during signup." });
   }
 });
-
 app.post("/login", async (req, res) => {
   console.log("🔑 Login Attempt:", req.body.username);
   const { username, password } = req.body;
-  if (!username || !password) {
-    return res
-      .status(400)
-      .json({ message: "Username and password are required." });
-  }
+  if (!username || !password) return res.status(400).json({ message: "Username and password are required." });
   try {
     const user = await UserModel.findOne({ username });
-    if (!user)
-      return res.status(401).json({ message: "Invalid credentials." });
+    if (!user) return res.status(401).json({ message: "Invalid credentials." });
     const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid)
-      return res.status(401).json({ message: "Invalid credentials." });
-    const token = jwt.sign(
-      { userId: user._id, username: user.username },
-      JWT_SECRET,
-      {
-        expiresIn: "24h",
-      }
-    );
+    if (!isPasswordValid) return res.status(401).json({ message: "Invalid credentials." });
+    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: "24h" });
     console.log("✅ Login Successful:", username);
-    return res
-      .status(200)
-      .json({ message: "Login successful.", token });
+    return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
     console.error("❌ Login Error:", error.message);
     return res.status(500).json({ message: "Error during login." });
   }
 });
-
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
-  if (!token)
-    return res
-      .status(401)
-      .json({ message: "Unauthorized. Token required." });
+  if (!token) return res.status(401).json({ message: "Unauthorized. Token required." });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    return res.status(200).json({
-      message: "Protected data accessed.",
-      user: decoded,
-    });
+    return res.status(200).json({ message: "Protected data accessed.", user: decoded });
   } catch (error) {
     return res.status(401).json({ message: "Invalid or expired token." });
   }
@@ -367,34 +293,17 @@ app.get("/protected", (req, res) => {
 // --- Stock Checker Endpoint (Industry, Forecasting, News Sentiment) ---
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
-  if (!symbol || !intent) {
-    return res
-      .status(400)
-      .json({ message: "Stock symbol and intent (buy/sell) are required." });
-  }
+  if (!symbol || !intent) return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   try {
     let stock;
     try {
       stock = await fetchStockData(symbol);
     } catch (innerErr) {
-      console.error(
-        `❌ Error fetching stock data for symbol "${symbol}":`,
-        innerErr.message
-      );
-      return res
-        .status(500)
-        .json({ message: "Error fetching stock data." });
+      console.error(`❌ Error fetching stock data for symbol "${symbol}":`, innerErr.message);
+      return res.status(500).json({ message: "Error fetching stock data." });
     }
-    if (!stock || !stock.price) {
-      return res
-        .status(404)
-        .json({ message: "Stock not found or data unavailable." });
-    }
-
-    const computedAvgVolume =
-      stock.summaryDetail?.averageDailyVolume3Month ||
-      stock.price?.regularMarketVolume ||
-      0;
+    if (!stock || !stock.price) return res.status(404).json({ message: "Stock not found or data unavailable." });
+    const computedAvgVolume = stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
@@ -409,7 +318,6 @@ app.post("/api/check-stock", async (req, res) => {
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // Base scoring
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
     else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
@@ -419,239 +327,126 @@ app.post("/api/check-stock", async (req, res) => {
     if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
     else if (metrics.debtRatio > 0.7) baseScore -= 2;
 
-    // Day range scoring
     const dayRange = metrics.dayHigh - metrics.dayLow;
     let dayScore = 0;
     if (dayRange > 0) {
-      const dayPosition =
-        (metrics.currentPrice - metrics.dayLow) / dayRange;
+      const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
       dayScore = dayPosition < 0.3 ? 1 : -1;
     }
-
-    // 52-week range scoring
-    const weekRange =
-      metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+    const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     let weekScore = 0;
     if (weekRange > 0) {
-      const weekPosition =
-        (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+      const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
       weekScore = weekPosition < 0.5 ? 2 : -2;
     }
-
-    // Industry comparison
-    const stockIndustry =
-      stock.assetProfile?.industry ||
-      stock.assetProfile?.sector ||
-      "Unknown";
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     let industryScore = 0;
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const indMetrics = industryMetrics[stockIndustry];
-      if (metrics.peRatio && indMetrics.peRatio) {
-        industryScore += metrics.peRatio < indMetrics.peRatio ? 2 : -2;
-      }
-      if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
-        industryScore +=
-          metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
-      }
-      if (metrics.debtRatio && indMetrics.debtToEquity) {
-        industryScore +=
-          metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
-      }
+      if (metrics.peRatio && indMetrics.peRatio) industryScore += metrics.peRatio < indMetrics.peRatio ? 2 : -2;
+      if (metrics.earningsGrowth && indMetrics.revenueGrowth) industryScore += metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
+      if (metrics.debtRatio && indMetrics.debtToEquity) industryScore += metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
     }
 
-    // Forecasting (using historical data)
     let industryGrowthFraction = 0;
-    if (
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
-    ) {
-      industryGrowthFraction =
-        industryMetrics[stockIndustry].revenueGrowth / 100;
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
+      industryGrowthFraction = industryMetrics[stockIndustry].revenueGrowth / 100;
     }
     const bonus = dayScore > 0 ? 0.02 : -0.02;
-    const fundamentalForecast =
-      metrics.currentPrice *
-      (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
-
+    const fundamentalForecast = metrics.currentPrice * (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
     let historicalForecast = fundamentalForecast;
     try {
       const historicalData = await yahooFinance.historical(
         symbol,
-        {
-          period: "1y",
-          interval: "1d",
-        },
+        { period: "1y", interval: "1d" },
         { fetchOptions: requestOptions }
       );
       if (historicalData && historicalData.length > 1) {
-        historicalData.sort(
-          (a, b) => new Date(a.date) - new Date(b.date)
-        );
-        let totalReturn = 0;
-        let count = 0;
+        historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+        let totalReturn = 0, count = 0;
         for (let i = 1; i < historicalData.length; i++) {
           const prevClose = historicalData[i - 1].close;
           const currClose = historicalData[i].close;
-          if (prevClose && currClose) {
-            totalReturn += currClose / prevClose - 1;
-            count++;
-          }
+          if (prevClose && currClose) { totalReturn += currClose / prevClose - 1; count++; }
         }
         const avgDailyReturn = count > 0 ? totalReturn / count : 0;
-        // Approx. 22 trading days in a month
-        historicalForecast =
-          metrics.currentPrice * (1 + avgDailyReturn * 22);
+        historicalForecast = metrics.currentPrice * (1 + avgDailyReturn * 22);
       }
     } catch (histErr) {
-      console.error(
-        "Historical data fetch error:",
-        histErr.message
-      );
+      console.error("Historical data fetch error:", histErr.message);
     }
-
-    // Combine forecasts
-    const weightFundamental = 0.6;
-    const weightHistorical = 0.4;
-    let combinedForecast =
-      (fundamentalForecast * weightFundamental +
-        historicalForecast * weightHistorical) /
-      (weightFundamental + weightHistorical);
-
-    // Adjust forecast using news sentiment
+    const weightFundamental = 0.6, weightHistorical = 0.4;
+    let combinedForecast = (fundamentalForecast * weightFundamental + historicalForecast * weightHistorical) / (weightFundamental + weightHistorical);
     const newsSentiment = await fetchStockNews(symbol);
-    const sentimentAdjustment =
-      newsSentiment * 0.005 * metrics.currentPrice;
+    const sentimentAdjustment = newsSentiment * 0.005 * metrics.currentPrice;
     combinedForecast += sentimentAdjustment;
-
-    const projectedGrowthPercent =
-      ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) *
-      100;
-    const fundamentalRating =
-      baseScore + dayScore + weekScore + industryScore;
+    const projectedGrowthPercent = ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
     const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
     const numericCombinedScore = +rawCombinedScore.toFixed(2);
-
     let finalClassification, finalAdvice;
     if (intent === "buy") {
-      if (numericCombinedScore >= 40) {
-        finalClassification = "growth";
-        finalAdvice = "Very Good Stock to Buy";
-      } else if (numericCombinedScore >= 20) {
-        finalClassification = "growth";
-        finalAdvice = "Good Stock to Buy";
-      } else if (numericCombinedScore >= 0) {
-        finalClassification = "stable";
-        finalAdvice = "Okay Stock to Buy";
-      } else {
-        finalClassification = "unstable";
-        finalAdvice = "Bad Stock to Buy";
-      }
+      if (numericCombinedScore >= 40) { finalClassification = "growth"; finalAdvice = "Very Good Stock to Buy"; }
+      else if (numericCombinedScore >= 20) { finalClassification = "growth"; finalAdvice = "Good Stock to Buy"; }
+      else if (numericCombinedScore >= 0) { finalClassification = "stable"; finalAdvice = "Okay Stock to Buy"; }
+      else { finalClassification = "unstable"; finalAdvice = "Bad Stock to Buy"; }
     } else if (intent === "sell") {
-      if (projectedGrowthPercent > 7) {
-        finalClassification = "stable";
-        finalAdvice =
-          "Hold the Stock (Forecast indicates significant growth; further analysis recommended)";
-      } else {
-        finalClassification = "unstable";
-        finalAdvice = "Sell the Stock";
-      }
+      if (projectedGrowthPercent > 7) { finalClassification = "stable"; finalAdvice = "Hold the Stock (Forecast indicates significant growth; further analysis recommended)"; }
+      else { finalClassification = "unstable"; finalAdvice = "Sell the Stock"; }
     }
-
     const forecastPeriodDays = 22;
-    const forecastEndDate = new Date(
-      Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
-    );
-
+    const forecastEndDate = new Date(Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000);
     let stockRevenueGrowth = 0;
-    if (
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
-    ) {
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth) {
       stockRevenueGrowth = industryMetrics[stockIndustry].revenueGrowth;
     }
-
     const stockName = stock.price?.longName || symbol;
-
     return res.json({
-      symbol,
-      name: stockName,
-      industry: stockIndustry,
+      symbol, name: stockName, industry: stockIndustry,
       fundamentalRating: +fundamentalRating.toFixed(2),
-      combinedScore: numericCombinedScore,
-      classification: finalClassification,
-      advice: finalAdvice,
-      metrics: {
-        ...metrics,
-        dayRange: metrics.dayHigh - metrics.dayLow,
-        fiftyTwoWeekRange:
-          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow,
-      },
-      forecast: {
-        forecastPrice: +combinedForecast.toFixed(2),
-        projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
-        forecastPeriod: "1 month",
-        forecastEndDate: forecastEndDate.toISOString(),
-      },
+      combinedScore: numericCombinedScore, classification: finalClassification, advice: finalAdvice,
+      metrics: { ...metrics, dayRange: metrics.dayHigh - metrics.dayLow, fiftyTwoWeekRange: metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow },
+      forecast: { forecastPrice: +combinedForecast.toFixed(2), projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%", forecastPeriod: "1 month", forecastEndDate: forecastEndDate.toISOString() },
       revenueGrowth: stockRevenueGrowth,
     });
   } catch (error) {
     console.error("❌ Error in /api/check-stock:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Error fetching stock data.", error: error.message });
+    return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
   }
 });
 
 // --- Finder Endpoints ---
 const finderRouter = express.Router();
-finderRouter.post("/api/find-stocks", async (req, res) => {
-  // ... unchanged ...
-});
-finderRouter.post("/signup", async (req, res) => {
-  // ... unchanged ...
-});
-finderRouter.post("/login", async (req, res) => {
-  // ... unchanged ...
-});
+finderRouter.post("/api/find-stocks", async (req, res) => { /* ... unchanged ... */ });
+finderRouter.post("/signup", async (req, res) => { /* ... unchanged ... */ });
+finderRouter.post("/login", async (req, res) => { /* ... unchanged ... */ });
 app.use("/finder", finderRouter);
 
 // --- Popular Stocks Endpoint with Caching ---
 let popularStocksCache = null;
 let popularStocksCacheTimestamp = 0;
 const POPULAR_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-app.get("/api/popular-stocks", async (req, res) => {
-  // ... unchanged ...
-});
+app.get("/api/popular-stocks", async (req, res) => { /* ... unchanged ... */ });
 
 // --- Stock Forecasting Endpoint with News Sentiment Adjustment ---
-app.post("/api/forecast-stock", async (req, res) => {
-  // ... unchanged ...
-});
+app.post("/api/forecast-stock", async (req, res) => { /* ... unchanged ... */ });
 
 // --- Community Endpoints ---
-app.get("/api/community-posts", async (req, res) => {
-  // ... unchanged ...
-});
-app.post("/api/community-posts", async (req, res) => {
-  // ... unchanged ...
-});
+app.get("/api/community-posts", async (req, res) => { /* ... unchanged ... */ });
+app.post("/api/community-posts", async (req, res) => { /* ... unchanged ... */ });
 
 // --- Notifications Endpoint ---
-app.get("/api/notifications", (req, res) => {
-  // ... unchanged ...
-});
+app.get("/api/notifications", (req, res) => { /* ... unchanged ... */ });
 
 /*******************************************
- * 6. AUTOMATED INVESTOR SECTION (UPDATED)
+ * 6. AUTOMATED INVESTOR SECTION (UPDATED WITH FILTERS)
  *******************************************/
 
 // File paths for stocks and portfolio data
 const STOCKS_JSON = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
 
-// Load stock list
+// Load stock list (assumed to be a flattened array, e.g. [ { "symbol": "AAPL", "exchange": "NASDAQ" }, ... ])
 let stockList = [];
 if (fs.existsSync(STOCKS_JSON)) {
   try {
@@ -666,7 +461,7 @@ if (fs.existsSync(STOCKS_JSON)) {
   console.warn("⚠️  No symbols.json found. Automated investor will skip buying.");
 }
 
-// Read or initialize portfolio. Note: we now store a "maxPrice" for each holding.
+// Read or initialize portfolio.
 let portfolio = fs.existsSync(PORTFOLIO_JSON)
   ? JSON.parse(fs.readFileSync(PORTFOLIO_JSON, "utf-8"))
   : [];
@@ -676,332 +471,93 @@ function savePortfolio() {
   fs.writeFileSync(PORTFOLIO_JSON, JSON.stringify(portfolio, null, 2));
 }
 
-// Helper to fetch real-time price (simpler than full fetchStockData)
-async function getStockPrice(symbol) {
-  try {
-    const data = await yahooFinance.quoteSummary(
-      symbol,
-      { modules: ["price"], validateResult: false },
-      { fetchOptions: requestOptions }
-    );
-    return data.price?.regularMarketPrice || null;
-  } catch (error) {
-    console.error(`Error fetching price for ${symbol}:`, error.message);
-    return null;
-  }
-}
-
 /**
- * Helper: Analyze stock for buying using logic from your stock-checker.
- * This function replicates your /api/check-stock “buy” logic and returns an analysis object.
+ * Filter the stock list by exchange and price range.
+ * You can also add a filter by stockType (e.g., "growth" or "stable") if desired.
+ * Here we assume each stock in stockList has an optional "exchange" field.
  */
-async function analyzeStock(symbol) {
-  // Fetch full stock data (including price, summaryDetail, financialData, etc.)
-  const stock = await fetchStockData(symbol);
-  if (!stock || !stock.price) {
-    throw new Error("Stock data not available");
-  }
+async function getFilteredSymbols(stockType, exchange, minPrice, maxPrice) {
+  const filteredSymbols = [];
+  const batchSize = 10;
 
-  const computedAvgVolume =
-    stock.summaryDetail?.averageDailyVolume3Month ||
-    stock.price?.regularMarketVolume ||
-    0;
+  // Process in batches to avoid rate limits
+  for (let i = 0; i < stockList.length; i += batchSize) {
+    const batch = stockList.slice(i, i + batchSize);
+    for (const s of batch) {
+      // If the stock object contains an "exchange" field, filter by it.
+      if (s.exchange && s.exchange !== exchange) continue;
+      try {
+        // Fetch current price; you might consider caching if this is too many calls.
+        const data = await fetchStockData(s.symbol);
+        const currentPrice = data?.price?.regularMarketPrice;
+        if (!currentPrice) continue;
+        if (currentPrice < minPrice || currentPrice > maxPrice) continue;
 
-  const metrics = {
-    volume: stock.price?.regularMarketVolume ?? 0,
-    currentPrice: stock.price?.regularMarketPrice ?? 0,
-    peRatio: stock.summaryDetail?.trailingPE ?? 0,
-    pbRatio: stock.summaryDetail?.priceToBook ?? 0,
-    dividendYield: stock.summaryDetail?.dividendYield ?? 0,
-    earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
-    debtRatio: stock.financialData?.debtToEquity ?? 0,
-    dayHigh: stock.price?.regularMarketDayHigh ?? 0,
-    dayLow: stock.price?.regularMarketDayLow ?? 0,
-    fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
-    fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
-  };
-
-  // Base scoring
-  let baseScore = 0;
-  if (metrics.volume > computedAvgVolume * 1.1) baseScore += 2;
-  else if (metrics.volume < computedAvgVolume * 0.9) baseScore -= 2;
-  if (metrics.peRatio >= 10 && metrics.peRatio <= 20) baseScore += 2;
-  else if (metrics.peRatio > 20) baseScore -= 1;
-  if (metrics.earningsGrowth > 0.05) baseScore += 2;
-  if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
-  else if (metrics.debtRatio > 0.7) baseScore -= 2;
-
-  // Day range scoring
-  const dayRange = metrics.dayHigh - metrics.dayLow;
-  let dayScore = 0;
-  if (dayRange > 0) {
-    const dayPosition =
-      (metrics.currentPrice - metrics.dayLow) / dayRange;
-    dayScore = dayPosition < 0.3 ? 1 : -1;
-  }
-
-  // 52-week range scoring
-  const weekRange =
-    metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
-  let weekScore = 0;
-  if (weekRange > 0) {
-    const weekPosition =
-      (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-    weekScore = weekPosition < 0.5 ? 2 : -2;
-  }
-
-  // Industry comparison
-  const stockIndustry =
-    stock.assetProfile?.industry ||
-    stock.assetProfile?.sector ||
-    "Unknown";
-  let industryScore = 0;
-  if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
-    const indMetrics = industryMetrics[stockIndustry];
-    if (metrics.peRatio && indMetrics.peRatio) {
-      industryScore += metrics.peRatio < indMetrics.peRatio ? 2 : -2;
-    }
-    if (metrics.earningsGrowth && indMetrics.revenueGrowth) {
-      industryScore +=
-        metrics.earningsGrowth * 100 > indMetrics.revenueGrowth ? 2 : -2;
-    }
-    if (metrics.debtRatio && indMetrics.debtToEquity) {
-      industryScore +=
-        metrics.debtRatio < indMetrics.debtToEquity ? 2 : -2;
-    }
-  }
-
-  // Forecasting (using historical data)
-  let industryGrowthFraction = 0;
-  if (
-    stockIndustry !== "Unknown" &&
-    industryMetrics[stockIndustry] &&
-    industryMetrics[stockIndustry].revenueGrowth
-  ) {
-    industryGrowthFraction =
-      industryMetrics[stockIndustry].revenueGrowth / 100;
-  }
-  const bonus = dayScore > 0 ? 0.02 : -0.02;
-  const fundamentalForecast =
-    metrics.currentPrice *
-    (1 + (metrics.earningsGrowth + industryGrowthFraction) / 2 + bonus);
-
-  let historicalForecast = fundamentalForecast;
-  try {
-    const historicalData = await yahooFinance.historical(
-      symbol,
-      {
-        period: "1y",
-        interval: "1d",
-      },
-      { fetchOptions: requestOptions }
-    );
-    if (historicalData && historicalData.length > 1) {
-      historicalData.sort(
-        (a, b) => new Date(a.date) - new Date(b.date)
-      );
-      let totalReturn = 0;
-      let count = 0;
-      for (let i = 1; i < historicalData.length; i++) {
-        const prevClose = historicalData[i - 1].close;
-        const currClose = historicalData[i].close;
-        if (prevClose && currClose) {
-          totalReturn += currClose / prevClose - 1;
-          count++;
-        }
+        // Optionally, you could check for stockType here using a quick analysis.
+        // For now, we'll simply add the symbol if it passes the price filter.
+        filteredSymbols.push(s.symbol);
+      } catch (err) {
+        console.error(`Filtering: Skipping ${s.symbol} due to error:`, err.message);
+        continue;
       }
-      const avgDailyReturn = count > 0 ? totalReturn / count : 0;
-      // Approx. 22 trading days in a month
-      historicalForecast =
-        metrics.currentPrice * (1 + avgDailyReturn * 22);
     }
-  } catch (histErr) {
-    console.error("Historical data fetch error:", histErr.message);
+    await delay(1000); // delay between batches
   }
 
-  // Combine forecasts with fixed weights
-  const weightFundamental = 0.6;
-  const weightHistorical = 0.4;
-  let combinedForecast =
-    (fundamentalForecast * weightFundamental +
-      historicalForecast * weightHistorical) /
-    (weightFundamental + weightHistorical);
-
-  // Adjust forecast using news sentiment
-  const newsSentiment = await fetchStockNews(symbol);
-  const sentimentAdjustment =
-    newsSentiment * 0.005 * metrics.currentPrice;
-  combinedForecast += sentimentAdjustment;
-
-  const projectedGrowthPercent =
-    ((combinedForecast - metrics.currentPrice) / metrics.currentPrice) *
-    100;
-  const fundamentalRating =
-    baseScore + dayScore + weekScore + industryScore;
-  const rawCombinedScore = fundamentalRating + projectedGrowthPercent;
-  const numericCombinedScore = +rawCombinedScore.toFixed(2);
-
-  // Use the buy classification logic
-  let finalClassification, finalAdvice;
-  if (numericCombinedScore >= 40) {
-    finalClassification = "growth";
-    finalAdvice = "Very Good Stock to Buy";
-  } else if (numericCombinedScore >= 20) {
-    finalClassification = "growth";
-    finalAdvice = "Good Stock to Buy";
-  } else if (numericCombinedScore >= 0) {
-    finalClassification = "stable";
-    finalAdvice = "Okay Stock to Buy";
-  } else {
-    finalClassification = "unstable";
-    finalAdvice = "Bad Stock to Buy";
-  }
-
-  const forecastPeriodDays = 22;
-  const forecastEndDate = new Date(
-    Date.now() + forecastPeriodDays * 24 * 60 * 60 * 1000
-  );
-  const stockRevenueGrowth =
-    stockIndustry !== "Unknown" &&
-    industryMetrics[stockIndustry] &&
-    industryMetrics[stockIndustry].revenueGrowth
-      ? industryMetrics[stockIndustry].revenueGrowth
-      : 0;
-  const stockName = stock.price?.longName || symbol;
-
-  return {
-    symbol,
-    name: stockName,
-    industry: stockIndustry,
-    fundamentalRating: +fundamentalRating.toFixed(2),
-    combinedScore: numericCombinedScore,
-    classification: finalClassification,
-    advice: finalAdvice,
-    metrics: {
-      ...metrics,
-      dayRange: metrics.dayHigh - metrics.dayLow,
-      fiftyTwoWeekRange:
-        metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow,
-    },
-    forecast: {
-      forecastPrice: +combinedForecast.toFixed(2),
-      projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
-      forecastPeriod: "1 month",
-      forecastEndDate: forecastEndDate.toISOString(),
-    },
-    revenueGrowth: stockRevenueGrowth,
-  };
+  console.log(`Filtered symbols count: ${filteredSymbols.length}`);
+  return filteredSymbols;
 }
 
-/**
- * Helper: Evaluate sell signal for a given holding.
- * Tracks a static stop-loss, a dynamic trailing stop (based on the maximum price seen so far),
- * time-based exit, and negative news sentiment.
- */
-async function evaluateSellSignal(holding, currentPrice) {
-  const reasons = [];
-  let sell = false;
-
-  // Static stop-loss trigger: sell if current price falls below 95% of buy price.
-  const stopLoss = holding.buyPrice * 0.95;
-  if (currentPrice <= stopLoss) {
-    sell = true;
-    reasons.push("Price dropped below stop-loss threshold");
-  }
-
-  // Trailing stop: track the highest price seen since purchase.
-  if (!holding.maxPrice) {
-    holding.maxPrice = holding.buyPrice;
-  }
-  if (currentPrice > holding.maxPrice) {
-    holding.maxPrice = currentPrice;
-  } else {
-    // Sell if current price falls more than 5% from the peak.
-    if (currentPrice < holding.maxPrice * 0.95) {
-      sell = true;
-      reasons.push("Price dropped more than 5% from peak");
-    }
-  }
-
-  // Time-based exit: if held for more than 60 days and gain is modest (<5%), trigger exit.
-  const daysHeld =
-    (Date.now() - new Date(holding.buyDate).getTime()) /
-    (1000 * 3600 * 24);
-  if (daysHeld >= 60 && currentPrice < holding.buyPrice * 1.05) {
-    sell = true;
-    reasons.push("Held for over 60 days with insufficient gains");
-  }
-
-  // News sentiment check: if strong negative sentiment, trigger sell.
-  const sentiment = await fetchStockNews(holding.symbol);
-  if (sentiment < -3) {
-    sell = true;
-    reasons.push("Strong negative news sentiment");
-  }
-
-  return { sell, reasons };
-}
-
-/**
- * Automated Buying Logic.
- * Instead of a simple price threshold, we now analyze each stock with our comprehensive
- * scoring algorithm (via analyzeStock). If the combined score is strong enough (e.g., >=20),
- * and the stock is not already held, then buy.
- */
+// Use the filter in automated buying logic.
 async function autoBuyStocks() {
-  if (!isMarketOpen()) {
-    return;
-  }
+  if (!isMarketOpen()) return;
 
-  for (const stock of stockList) {
+  // Set filter criteria (adjust as needed)
+  const stockType = "growth";  // or "stable"
+  const exchange = "NASDAQ";   // Change as desired: "NASDAQ", "NYSE", "TSX", etc.
+  const minPrice = 10;
+  const maxPrice = 100;
+
+  const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
+
+  for (const symbol of filteredSymbols) {
     try {
-      const analysis = await analyzeStock(stock.symbol);
-      // Set a threshold – for example, only buy if combinedScore is at least 20
+      const analysis = await analyzeStock(symbol);
+      // Set threshold for buying
       if (analysis.combinedScore >= 20) {
-        // Avoid buying duplicates (optional)
-        if (!portfolio.find((holding) => holding.symbol === stock.symbol)) {
-          console.log(
-            `[AutoBuy] Buying ${stock.symbol} at $${analysis.metrics.currentPrice}. Combined Score: ${analysis.combinedScore}`
-          );
+        if (!portfolio.find((holding) => holding.symbol === symbol)) {
+          console.log(`[AutoBuy] Buying ${symbol} at $${analysis.metrics.currentPrice}. Combined Score: ${analysis.combinedScore}`);
           portfolio.push({
-            symbol: stock.symbol,
+            symbol,
             buyPrice: analysis.metrics.currentPrice,
-            quantity: 10, // or use a dynamic quantity based on your strategy
+            quantity: 10,
             buyDate: new Date().toISOString(),
-            maxPrice: analysis.metrics.currentPrice, // initialize for trailing stop
+            maxPrice: analysis.metrics.currentPrice,
           });
           savePortfolio();
         }
       }
     } catch (error) {
-      console.error(`Error analyzing stock ${stock.symbol}:`, error.message);
+      console.error(`Error analyzing stock ${symbol}:`, error.message);
     }
   }
 }
 
 /**
- * Automated Selling Logic.
- * Uses the evaluateSellSignal helper to check multiple sell conditions:
- * static stop-loss, trailing stop, time-based exit, and news sentiment.
+ * Automated Selling Logic (unchanged)
  */
 async function autoSellStocks() {
-  if (!isMarketOpen()) {
-    return;
-  }
+  if (!isMarketOpen()) return;
 
-  // Iterate over portfolio (using a standard loop so that we can remove items safely)
   for (let i = 0; i < portfolio.length; i++) {
     const holding = portfolio[i];
     const currentPrice = await getStockPrice(holding.symbol);
     if (!currentPrice) continue;
-
     const { sell, reasons } = await evaluateSellSignal(holding, currentPrice);
     if (sell) {
-      console.log(
-        `[AutoSell] Selling ${holding.symbol} at $${currentPrice}. Reasons: ${reasons.join(
-          ", "
-        )}`
-      );
+      console.log(`[AutoSell] Selling ${holding.symbol} at $${currentPrice}. Reasons: ${reasons.join(", ")}`);
+      // Optionally, send email notification:
+      sendSellNotification(holding.symbol, currentPrice, reasons);
       portfolio.splice(i, 1);
       i--;
       savePortfolio();
@@ -1019,30 +575,25 @@ setInterval(async () => {
   }
 }, 60_000);
 
-// Optional: Provide an endpoint to view the portfolio
-app.get("/api/portfolio", (req, res) => {
-  res.json({ portfolio });
-});
-
 // --- Simulation Endpoint for Automated Investor Trades (Secret) ---
 app.get("/api/simulate-trades", async (req, res) => {
   try {
-    // Clone current portfolio to avoid modifying production data
     let simulatedPortfolio = JSON.parse(JSON.stringify(portfolio));
     let simulationLog = [];
 
-    // Simulate Buy Trades using enhanced buy logic
-    for (const stock of stockList) {
-      try {
-        console.log(`Simulating buy for symbol: ${stock.symbol}`);
-        const data = await fetchStockData(stock.symbol);
-        if (!data || !data.price) continue;
+    // Simulate Buy Trades using filtered symbols and buy logic
+    const stockType = "growth";
+    const exchange = "NASDAQ";
+    const minPrice = 10;
+    const maxPrice = 100;
+    const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
 
-        // Compute similar metrics as in /api/check-stock
-        const computedAvgVolume =
-          data.summaryDetail?.averageDailyVolume3Month ||
-          data.price?.regularMarketVolume ||
-          0;
+    for (const symbol of filteredSymbols) {
+      try {
+        console.log(`Simulating buy for symbol: ${symbol}`);
+        const data = await fetchStockData(symbol);
+        if (!data || !data.price) continue;
+        const computedAvgVolume = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const metrics = {
           volume: data.price?.regularMarketVolume ?? 0,
           currentPrice: data.price?.regularMarketPrice ?? 0,
@@ -1066,39 +617,31 @@ app.get("/api/simulate-trades", async (req, res) => {
         if (metrics.debtRatio >= 0 && metrics.debtRatio <= 0.5) baseScore += 2;
         else if (metrics.debtRatio > 0.7) baseScore -= 2;
 
-        // Day range scoring
         const dayRange = metrics.dayHigh - metrics.dayLow;
         let dayScore = 0;
         if (dayRange > 0) {
-          const dayPosition =
-            (metrics.currentPrice - metrics.dayLow) / dayRange;
+          const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
           dayScore = dayPosition < 0.3 ? 1 : -1;
         }
-        // 52-week range scoring
-        const weekRange =
-          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+        const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
         let weekScore = 0;
         if (weekRange > 0) {
-          const weekPosition =
-            (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+          const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
           weekScore = weekPosition < 0.5 ? 2 : -2;
         }
         let fundamentalRating = baseScore + dayScore + weekScore;
 
-        // For simulation, let’s simulate a buy if the fundamentalRating is at least 2 and the price is below a threshold (e.g., $100)
         if (fundamentalRating >= 2 && metrics.currentPrice < 100) {
-          simulationLog.push(
-            `Simulated Buy: ${stock.symbol} at $${metrics.currentPrice} (Rating: ${fundamentalRating})`
-          );
+          simulationLog.push(`Simulated Buy: ${symbol} at $${metrics.currentPrice} (Rating: ${fundamentalRating})`);
           simulatedPortfolio.push({
-            symbol: stock.symbol,
+            symbol,
             buyPrice: metrics.currentPrice,
             quantity: 10,
             buyDate: new Date().toISOString(),
           });
         }
       } catch (err) {
-        console.error(`Simulation: Skipping ${stock.symbol} due to error: ${err.message}`);
+        console.error(`Simulation: Skipping ${symbol} due to error: ${err.message}`);
         continue;
       }
     }
@@ -1110,16 +653,9 @@ app.get("/api/simulate-trades", async (req, res) => {
         const data = await fetchStockData(holding.symbol);
         if (!data || !data.price) continue;
         const currentPrice = data.price?.regularMarketPrice || 0;
-
-        // Basic stop-loss and take-profit thresholds
         const stopLoss = holding.buyPrice * 0.95;
         const takeProfit = holding.buyPrice * 1.10;
-
-        // Recompute metrics for enhanced sell signal analysis
-        const computedAvgVolume =
-          data.summaryDetail?.averageDailyVolume3Month ||
-          data.price?.regularMarketVolume ||
-          0;
+        const computedAvgVolume = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const metrics = {
           volume: data.price?.regularMarketVolume ?? 0,
           currentPrice: data.price?.regularMarketPrice ?? 0,
@@ -1144,29 +680,18 @@ app.get("/api/simulate-trades", async (req, res) => {
         const dayRange = metrics.dayHigh - metrics.dayLow;
         let dayScore = 0;
         if (dayRange > 0) {
-          const dayPosition =
-            (metrics.currentPrice - metrics.dayLow) / dayRange;
+          const dayPosition = (metrics.currentPrice - metrics.dayLow) / dayRange;
           dayScore = dayPosition < 0.3 ? 1 : -1;
         }
-        const weekRange =
-          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+        const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
         let weekScore = 0;
         if (weekRange > 0) {
-          const weekPosition =
-            (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+          const weekPosition = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
           weekScore = weekPosition < 0.5 ? 2 : -2;
         }
         let fundamentalRating = baseScore + dayScore + weekScore;
-
-        // Sell if the price hits stop-loss/take-profit OR if the fundamental rating is very low (e.g., <= -2)
-        if (
-          currentPrice <= stopLoss ||
-          currentPrice >= takeProfit ||
-          fundamentalRating <= -2
-        ) {
-          simulationLog.push(
-            `Simulated Sell: ${holding.symbol} at $${currentPrice} (Buy Price: $${holding.buyPrice}, Rating: ${fundamentalRating})`
-          );
+        if (currentPrice <= stopLoss || currentPrice >= takeProfit || fundamentalRating <= -2) {
+          simulationLog.push(`Simulated Sell: ${holding.symbol} at $${currentPrice} (Buy Price: $${holding.buyPrice}, Rating: ${fundamentalRating})`);
           simulatedPortfolio.splice(i, 1);
           i--;
         }
@@ -1183,9 +708,7 @@ app.get("/api/simulate-trades", async (req, res) => {
     });
   } catch (error) {
     console.error("Simulation error:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Simulation error.", error: error.message });
+    return res.status(500).json({ message: "Simulation error.", error: error.message });
   }
 });
 
