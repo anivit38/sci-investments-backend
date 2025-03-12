@@ -227,7 +227,6 @@ async function fetchStockData(symbol) {
     stockDataCache[symbol] = { data, timestamp: now };
     return data;
   } catch (err) {
-    // If we get invalid JSON (like "Edge: Too..."), handle it
     console.error(`❌ Error fetching data for ${symbol}:`, err.message);
     throw err;
   }
@@ -418,18 +417,34 @@ app.post("/api/check-stock", async (req, res) => {
       try {
         const featureKeys = ["currentPrice", "peRatio", "earningsGrowth", "debtRatio", "volume"];
         const values = featureKeys.map((k) => metrics[k] || 0);
+
+        // DEBUG: log raw metrics
+        console.log(`[DEBUG] Raw metrics for forecast:`, values);
+
+        // Normalize
         const normalized = values.map((val, i) => {
           const k = featureKeys[i];
           const mean = normalizationParams[k]?.mean || 0;
           const std = normalizationParams[k]?.std || 1;
           return (val - mean) / std;
         });
+
+        // DEBUG: log normalized metrics
+        console.log(`[DEBUG] Normalized metrics for forecast:`, normalized);
+
         const inputTensor = tf.tensor2d([normalized]);
         const pred = forecastModel.predict(inputTensor);
         const predVal = pred.dataSync()[0];
+
+        // DEBUG: log prediction
+        console.log(`[DEBUG] Model raw prediction:`, predVal);
+
         const cpMean = normalizationParams.currentPrice?.mean || 0;
         const cpStd = normalizationParams.currentPrice?.std || 1;
         advancedForecastPrice = predVal * cpStd + cpMean;
+
+        // DEBUG: log final advanced forecast price
+        console.log(`[DEBUG] advancedForecastPrice for ${symbol}:`, advancedForecastPrice);
       } catch (tfErr) {
         console.error(`Model forecast error for ${symbol}:`, tfErr.message);
       }
@@ -444,6 +459,10 @@ app.post("/api/check-stock", async (req, res) => {
           { period: "5d", interval: "1d" },
           { fetchOptions: requestOptions }
         );
+
+        // DEBUG: log fallbackData
+        console.log(`[DEBUG] fallbackData for ${symbol}:`, fallbackData);
+
         if (fallbackData && fallbackData.length > 1) {
           fallbackData.sort((a, b) => new Date(a.date) - new Date(b.date));
           let totalReturn = 0;
@@ -459,6 +478,9 @@ app.post("/api/check-stock", async (req, res) => {
           const avgDailyReturn = count > 0 ? totalReturn / count : 0;
           // Extrapolate that daily return for 1 more day
           finalForecastPrice = metrics.currentPrice * (1 + avgDailyReturn);
+
+          // DEBUG: log fallback forecast
+          console.log(`[DEBUG] fallback finalForecastPrice for ${symbol}:`, finalForecastPrice);
         }
       } catch (fbErr) {
         console.error(`Fallback forecast error for ${symbol}:`, fbErr.message);
@@ -468,10 +490,12 @@ app.post("/api/check-stock", async (req, res) => {
     // If still no finalForecastPrice, just set it = currentPrice
     if (!finalForecastPrice) {
       finalForecastPrice = metrics.currentPrice;
+      console.log(`[DEBUG] finalForecastPrice set to currentPrice for ${symbol}`);
     }
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
-    const projectedGrowthPercent = ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const projectedGrowthPercent =
+      ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
     const numericCombinedScore = +(fundamentalRating + projectedGrowthPercent).toFixed(2);
 
     // Classification
@@ -542,7 +566,6 @@ app.post("/api/check-stock", async (req, res) => {
  * Used by the Finder to see if a stock is 'growth' or 'stable' or 'unstable'
  ****************************************************/
 async function classifyStockForBuy(symbol) {
-  // fetch data & skip if error
   const stock = await fetchStockData(symbol);
   if (!stock || !stock.price) {
     throw new Error(`No price data for symbol ${symbol}`);
@@ -627,11 +650,9 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   }
 });
 finderRouter.post("/signup", async (req, res) => {
-  // you can omit or replicate your /signup logic
   return res.json({ message: "Signup from finder not used." });
 });
 finderRouter.post("/login", async (req, res) => {
-  // you can omit or replicate your /login logic
   return res.json({ message: "Login from finder not used." });
 });
 app.use("/finder", finderRouter);
@@ -641,7 +662,6 @@ let popularStocksCache = null;
 let popularStocksCacheTimestamp = 0;
 const POPULAR_CACHE_DURATION = 5 * 60 * 1000;
 app.get("/api/popular-stocks", async (req, res) => {
-  // placeholder
   return res.json({ message: "Popular stocks not fully implemented." });
 });
 
