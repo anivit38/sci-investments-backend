@@ -419,7 +419,7 @@ app.post("/api/check-stock", async (req, res) => {
         const values = featureKeys.map((k) => metrics[k] || 0);
 
         // DEBUG: log raw metrics
-        console.log(`[DEBUG] Raw metrics for forecast:`, values);
+        console.log("[DEBUG] Raw metrics for forecast:", values);
 
         // Normalize
         const normalized = values.map((val, i) => {
@@ -430,21 +430,22 @@ app.post("/api/check-stock", async (req, res) => {
         });
 
         // DEBUG: log normalized metrics
-        console.log(`[DEBUG] Normalized metrics for forecast:`, normalized);
+        console.log("[DEBUG] Normalized metrics for forecast:", normalized);
 
-        const inputTensor = tf.tensor2d([normalized]);
+        // Reshape input to 3D: [batchSize, timeSteps, features]
+        const inputTensor = tf.tensor3d([normalized], [1, 1, 5]);
         const pred = forecastModel.predict(inputTensor);
         const predVal = pred.dataSync()[0];
 
         // DEBUG: log prediction
-        console.log(`[DEBUG] Model raw prediction:`, predVal);
+        console.log("[DEBUG] Model raw prediction:", predVal);
 
         const cpMean = normalizationParams.currentPrice?.mean || 0;
         const cpStd = normalizationParams.currentPrice?.std || 1;
         advancedForecastPrice = predVal * cpStd + cpMean;
 
         // DEBUG: log final advanced forecast price
-        console.log(`[DEBUG] advancedForecastPrice for ${symbol}:`, advancedForecastPrice);
+        console.log("[DEBUG] advancedForecastPrice for", symbol, ":", advancedForecastPrice);
       } catch (tfErr) {
         console.error(`Model forecast error for ${symbol}:`, tfErr.message);
       }
@@ -454,14 +455,15 @@ app.post("/api/check-stock", async (req, res) => {
     let finalForecastPrice = advancedForecastPrice;
     if (!finalForecastPrice) {
       try {
+        // Use 'range' instead of 'period' to fix invalid options error.
         const fallbackData = await yahooFinance.historical(
           symbol,
-          { period: "5d", interval: "1d" },
+          { range: "5d", interval: "1d" },
           { fetchOptions: requestOptions }
         );
 
         // DEBUG: log fallbackData
-        console.log(`[DEBUG] fallbackData for ${symbol}:`, fallbackData);
+        console.log("[DEBUG] fallbackData for", symbol, fallbackData);
 
         if (fallbackData && fallbackData.length > 1) {
           fallbackData.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -480,7 +482,7 @@ app.post("/api/check-stock", async (req, res) => {
           finalForecastPrice = metrics.currentPrice * (1 + avgDailyReturn);
 
           // DEBUG: log fallback forecast
-          console.log(`[DEBUG] fallback finalForecastPrice for ${symbol}:`, finalForecastPrice);
+          console.log("[DEBUG] fallback finalForecastPrice for", symbol, ":", finalForecastPrice);
         }
       } catch (fbErr) {
         console.error(`Fallback forecast error for ${symbol}:`, fbErr.message);
@@ -490,7 +492,7 @@ app.post("/api/check-stock", async (req, res) => {
     // If still no finalForecastPrice, just set it = currentPrice
     if (!finalForecastPrice) {
       finalForecastPrice = metrics.currentPrice;
-      console.log(`[DEBUG] finalForecastPrice set to currentPrice for ${symbol}`);
+      console.log("[DEBUG] finalForecastPrice set to currentPrice for", symbol);
     }
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
@@ -763,7 +765,6 @@ async function autoBuyStocks() {
   const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
   for (const symbol of filteredSymbols) {
     try {
-      // Insert advanced logic if desired
       console.log(`autoBuyStocks would analyze ${symbol} here...`);
     } catch (error) {
       console.error(`Error analyzing stock ${symbol}:`, error.message);
@@ -801,7 +802,6 @@ app.get("/api/simulate-trades", async (req, res) => {
         console.log(`Simulating buy for symbol: ${symbol}`);
         const data = await fetchStockData(symbol);
         if (!data || !data.price) continue;
-        // Quick check logic
         let rating = 0;
         const avgVol = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const currPrice = data.price?.regularMarketPrice || 0;
@@ -838,15 +838,6 @@ app.get("/api/simulate-trades", async (req, res) => {
 app.post("/api/execute-trade", async (req, res) => {
   const { symbol, quantity, action } = req.body;
   try {
-    // If you have an investopediaTrader module, call it
-    // e.g.:
-    // const { placeTrade } = require('./investopediaTrader');
-    // await placeTrade({
-    //   username: process.env.INVESTOPEDIA_USER,
-    //   symbol,
-    //   quantity,
-    //   action,
-    // });
     res.json({ message: `Trade executed: ${action} ${quantity} shares of ${symbol}` });
   } catch (error) {
     console.error("Trade execution error:", error.message);
