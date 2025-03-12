@@ -416,23 +416,22 @@ app.post("/api/check-stock", async (req, res) => {
     if (forecastModel && normalizationParams) {
       try {
         const featureKeys = ["currentPrice", "peRatio", "earningsGrowth", "debtRatio", "volume"];
-        const values = featureKeys.map((k) => metrics[k] || 0);
+        const values = featureKeys.map((k) => Number(metrics[k]) || 0);
 
         // DEBUG: log raw metrics
         console.log("[DEBUG] Raw metrics for forecast:", values);
 
-        // Normalize
+        // Normalize (forcing numeric conversion)
         const normalized = values.map((val, i) => {
-          const k = featureKeys[i];
-          const mean = normalizationParams[k]?.mean || 0;
-          const std = normalizationParams[k]?.std || 1;
-          return (val - mean) / std;
+          const mean = Number(normalizationParams[featureKeys[i]]?.mean) || 0;
+          const std = Number(normalizationParams[featureKeys[i]]?.std) || 1;
+          return (Number(val) - mean) / std;
         });
 
         // DEBUG: log normalized metrics
         console.log("[DEBUG] Normalized metrics for forecast:", normalized);
 
-        // Reshape input to 3D: [batchSize, timeSteps, features]
+        // Reshape input to 3D: [batchSize, timeSteps, features] (assuming timeSteps=1)
         const inputTensor = tf.tensor3d([normalized], [1, 1, 5]);
         const pred = forecastModel.predict(inputTensor);
         const predVal = pred.dataSync()[0];
@@ -440,8 +439,8 @@ app.post("/api/check-stock", async (req, res) => {
         // DEBUG: log prediction
         console.log("[DEBUG] Model raw prediction:", predVal);
 
-        const cpMean = normalizationParams.currentPrice?.mean || 0;
-        const cpStd = normalizationParams.currentPrice?.std || 1;
+        const cpMean = Number(normalizationParams.currentPrice?.mean) || 0;
+        const cpStd = Number(normalizationParams.currentPrice?.std) || 1;
         advancedForecastPrice = predVal * cpStd + cpMean;
 
         // DEBUG: log final advanced forecast price
@@ -455,10 +454,12 @@ app.post("/api/check-stock", async (req, res) => {
     let finalForecastPrice = advancedForecastPrice;
     if (!finalForecastPrice) {
       try {
-        // Use 'range' instead of 'period' to fix invalid options error.
+        // Use period1 and period2 for a 5-day history
+        const endDate = new Date();
+        const startDate = new Date(endDate.getTime() - 5 * 24 * 60 * 60 * 1000);
         const fallbackData = await yahooFinance.historical(
           symbol,
-          { range: "5d", interval: "1d" },
+          { period1: startDate, period2: endDate, interval: "1d" },
           { fetchOptions: requestOptions }
         );
 
