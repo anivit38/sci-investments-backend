@@ -86,58 +86,6 @@ const requestOptions = {
   redirect: "follow",
 };
 
-// Helper function to fetch stock-related news (sentiment analysis)
-async function fetchStockNews(query) {
-  const apiKey = process.env.NEWS_API_KEY;
-  if (!apiKey) {
-    console.warn("No NEWS_API_KEY provided. Skipping news sentiment analysis.");
-    return 0;
-  }
-  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(
-    query
-  )}&apiKey=${apiKey}&language=en`;
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!data.articles) return 0;
-    let sentimentScore = 0;
-    const positiveWords = [
-      "growth",
-      "profit",
-      "record",
-      "surge",
-      "gain",
-      "positive",
-      "upgrade",
-      "bullish",
-    ];
-    const negativeWords = [
-      "crash",
-      "loss",
-      "decline",
-      "drop",
-      "warn",
-      "bearish",
-      "cut",
-      "scandal",
-    ];
-    data.articles.forEach((article) => {
-      const title = article.title.toLowerCase();
-      positiveWords.forEach((word) => {
-        if (title.includes(word)) sentimentScore += 1;
-      });
-      negativeWords.forEach((word) => {
-        if (title.includes(word)) sentimentScore -= 1;
-      });
-    });
-    console.log(`News sentiment score for "${query}":`, sentimentScore);
-    return sentimentScore;
-  } catch (error) {
-    console.error("Error fetching stock news:", error.message);
-    return 0;
-  }
-}
-
 // 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
 
@@ -227,7 +175,6 @@ async function fetchStockData(symbol) {
     stockDataCache[symbol] = { data, timestamp: now };
     return data;
   } catch (err) {
-    // If we get invalid JSON (like "Edge: Too..."), handle it
     console.error(`❌ Error fetching data for ${symbol}:`, err.message);
     throw err;
   }
@@ -416,17 +363,24 @@ app.post("/api/check-stock", async (req, res) => {
     let advancedForecastPrice = null;
     if (forecastModel && normalizationParams) {
       try {
+        // NOTE: If your model is a GRU/LSTM expecting shape [batch, timesteps, features],
+        // we do shape [1,1,5]. If that doesn't fix the error, adjust accordingly.
         const featureKeys = ["currentPrice", "peRatio", "earningsGrowth", "debtRatio", "volume"];
         const values = featureKeys.map((k) => metrics[k] || 0);
+
+        // Normalize
         const normalized = values.map((val, i) => {
           const k = featureKeys[i];
           const mean = normalizationParams[k]?.mean || 0;
           const std = normalizationParams[k]?.std || 1;
           return (val - mean) / std;
         });
-        const inputTensor = tf.tensor2d([normalized]);
+
+        // shape: [1, 1, 5]
+        const inputTensor = tf.tensor3d([normalized], [1, 1, 5]);
         const pred = forecastModel.predict(inputTensor);
         const predVal = pred.dataSync()[0];
+
         const cpMean = normalizationParams.currentPrice?.mean || 0;
         const cpStd = normalizationParams.currentPrice?.std || 1;
         advancedForecastPrice = predVal * cpStd + cpMean;
@@ -435,53 +389,33 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // Fallback: short-term historical approach
+    // If advanced forecast fails, skip it
     let finalForecastPrice = advancedForecastPrice;
-    if (!finalForecastPrice) {
-      try {
-        const fallbackData = await yahooFinance.historical(
-          symbol,
-          { period: "5d", interval: "1d" },
-          { fetchOptions: requestOptions }
-        );
-        if (fallbackData && fallbackData.length > 1) {
-          fallbackData.sort((a, b) => new Date(a.date) - new Date(b.date));
-          let totalReturn = 0;
-          let count = 0;
-          for (let i = 1; i < fallbackData.length; i++) {
-            const prevClose = fallbackData[i - 1].close;
-            const currClose = fallbackData[i].close;
-            if (prevClose && currClose) {
-              totalReturn += currClose / prevClose - 1;
-              count++;
-            }
-          }
-          const avgDailyReturn = count > 0 ? totalReturn / count : 0;
-          finalForecastPrice = metrics.currentPrice * (1 + avgDailyReturn);
-        }
-      } catch (fbErr) {
-        console.error(`Fallback forecast error for ${symbol}:`, fbErr.message);
-      }
-    }
 
     if (!finalForecastPrice) {
+      // if the model forecast fails, set forecastPrice = currentPrice
       finalForecastPrice = metrics.currentPrice;
     }
 
+    // Weighted approach: combine fundamentals + 70% forecast
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
-    const projectedGrowthPercent = ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
-    const numericCombinedScore = +(fundamentalRating + projectedGrowthPercent).toFixed(2);
+    const forecastGrowthPercent =
+      ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+
+    // Weighted combined score
+    // For example: 30% fundamentals + 70% forecastGrowth
+    const combinedScore = 0.3 * fundamentalRating + 0.7 * forecastGrowthPercent;
 
     // Classification
     let finalClassification, finalAdvice;
     if (intent === "buy") {
-      if (numericCombinedScore >= 30) {
+      if (combinedScore >= 30) {
         finalClassification = "growth";
         finalAdvice = "Very Good Stock to Buy";
-      } else if (numericCombinedScore >= 10) {
+      } else if (combinedScore >= 10) {
         finalClassification = "growth";
         finalAdvice = "Good Stock to Buy";
-      } else if (numericCombinedScore >= -5) {
+      } else if (combinedScore >= -5) {
         finalClassification = "stable";
         finalAdvice = "Okay Stock to Buy";
       } else {
@@ -490,7 +424,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     } else {
       // Sell logic
-      if (projectedGrowthPercent > 7) {
+      if (forecastGrowthPercent > 7) {
         finalClassification = "stable";
         finalAdvice = "Hold the Stock (Forecast indicates growth)";
       } else {
@@ -513,7 +447,7 @@ app.post("/api/check-stock", async (req, res) => {
       name: stockName,
       industry: stockIndustry,
       fundamentalRating: +fundamentalRating.toFixed(2),
-      combinedScore: numericCombinedScore,
+      combinedScore: +combinedScore.toFixed(2),
       classification: finalClassification,
       advice: finalAdvice,
       metrics: {
@@ -523,7 +457,7 @@ app.post("/api/check-stock", async (req, res) => {
       },
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
-        projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
+        projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
         forecastPeriod: "End of Day",
         forecastEndDate: forecastEndDate.toISOString(),
       },
@@ -538,10 +472,9 @@ app.post("/api/check-stock", async (req, res) => {
 /****************************************************
  * HELPER: classifyStockForBuy(symbol)
  * Used by the Finder to see if a stock is 'growth' or 'stable' or 'unstable'
- * (No forecasting used here)
+ * (NO FORECAST used here, just fundamentals)
  ****************************************************/
 async function classifyStockForBuy(symbol) {
-  // fetch data & skip if error
   const stock = await fetchStockData(symbol);
   if (!stock || !stock.price) {
     throw new Error(`No price data for symbol ${symbol}`);
@@ -565,14 +498,11 @@ async function classifyStockForBuy(symbol) {
   // A quick scoring
   if (metrics.volume > computedAvgVolume * 1.2) score += 3;
   else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
-
   if (metrics.peRatio >= 5 && metrics.peRatio <= 20) score += 2;
   else if (metrics.peRatio > 40) score -= 2;
-
   if (metrics.earningsGrowth > 0.2) score += 4;
   else if (metrics.earningsGrowth > 0.05) score += 2;
   else if (metrics.earningsGrowth < 0) score -= 2;
-
   if (metrics.debtRatio < 0.3) score += 3;
   else if (metrics.debtRatio > 1) score -= 2;
 
@@ -584,16 +514,10 @@ async function classifyStockForBuy(symbol) {
     else if (pos > 0.8) score -= 2;
   }
 
-  // -- CHANGED: Lower threshold for 'growth'
-  let classification;
-  if (score >= 5) classification = "growth"; // <-- used to be >= 8
-  else if (score >= 0) classification = "stable";
-  else classification = "unstable";
-
-  console.log(
-    `[classifyStockForBuy] Symbol=${symbol}, score=${score}, classification=${classification}`
-  );
-  return { classification };
+  // Lower threshold for "growth" to get more results
+  if (score >= 5) return { classification: "growth" };
+  if (score >= 0) return { classification: "stable" };
+  return { classification: "unstable" };
 }
 
 /* --- Finder Endpoints --- */
@@ -602,7 +526,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   try {
     let { stockType, exchange, minPrice, maxPrice } = req.body;
 
-    // -- CHANGED: Convert to consistent case for matching
+    // Convert to consistent case for matching
     if (typeof stockType === "string") {
       stockType = stockType.toLowerCase();
     }
@@ -613,27 +537,18 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
-
     const filtered = [];
-    // We'll use allStocks from the loaded JSON
     for (const s of allStocks) {
-      // uppercase s.exchange so "NASDAQ" matches "Nasdaq"
-      if (s.exchange && s.exchange.toUpperCase() !== exchange) {
-        continue;
-      }
+      if (s.exchange && s.exchange.toUpperCase() !== exchange) continue;
       try {
         const data = await fetchStockData(s.symbol);
         const currentPrice = data?.price?.regularMarketPrice;
         if (!currentPrice) continue;
         if (currentPrice < minPrice || currentPrice > maxPrice) continue;
-        // Classify for buy
         const { classification } = await classifyStockForBuy(s.symbol);
-
-        // if user wants "growth" only, skip stable/unstable
         if (stockType === "growth" && classification !== "growth") continue;
         if (stockType === "stable" && classification !== "stable") continue;
         if (stockType === "unstable" && classification !== "unstable") continue;
-
         filtered.push({ symbol: s.symbol, exchange: s.exchange || "N/A" });
       } catch (err) {
         console.warn(`Finder: skipping ${s.symbol} due to error: ${err.message}`);
@@ -647,11 +562,9 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   }
 });
 finderRouter.post("/signup", async (req, res) => {
-  // you can omit or replicate your /signup logic
   return res.json({ message: "Signup from finder not used." });
 });
 finderRouter.post("/login", async (req, res) => {
-  // you can omit or replicate your /login logic
   return res.json({ message: "Login from finder not used." });
 });
 app.use("/finder", finderRouter);
@@ -701,7 +614,7 @@ app.get("/api/notifications", (req, res) => {
 });
 
 /*******************************************
- * AUTOMATED INVESTOR SECTION (UPDATED)
+ * AUTOMATED INVESTOR SECTION
  *******************************************/
 const STOCKS_JSON = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
@@ -763,8 +676,8 @@ async function autoBuyStocks() {
   const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
   for (const symbol of filteredSymbols) {
     try {
-      // Insert advanced logic if desired
       console.log(`autoBuyStocks would analyze ${symbol} here...`);
+      // advanced logic or forecast calls if desired
     } catch (error) {
       console.error(`Error analyzing stock ${symbol}:`, error.message);
     }
@@ -801,7 +714,6 @@ app.get("/api/simulate-trades", async (req, res) => {
         console.log(`Simulating buy for symbol: ${symbol}`);
         const data = await fetchStockData(symbol);
         if (!data || !data.price) continue;
-        // Quick check logic
         let rating = 0;
         const avgVol = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const currPrice = data.price?.regularMarketPrice || 0;
