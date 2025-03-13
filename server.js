@@ -86,6 +86,58 @@ const requestOptions = {
   redirect: "follow",
 };
 
+// Helper function to fetch stock-related news (sentiment analysis)
+async function fetchStockNews(query) {
+  const apiKey = process.env.NEWS_API_KEY;
+  if (!apiKey) {
+    console.warn("No NEWS_API_KEY provided. Skipping news sentiment analysis.");
+    return 0;
+  }
+  const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(
+    query
+  )}&apiKey=${apiKey}&language=en`;
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.articles) return 0;
+    let sentimentScore = 0;
+    const positiveWords = [
+      "growth",
+      "profit",
+      "record",
+      "surge",
+      "gain",
+      "positive",
+      "upgrade",
+      "bullish",
+    ];
+    const negativeWords = [
+      "crash",
+      "loss",
+      "decline",
+      "drop",
+      "warn",
+      "bearish",
+      "cut",
+      "scandal",
+    ];
+    data.articles.forEach((article) => {
+      const title = article.title.toLowerCase();
+      positiveWords.forEach((word) => {
+        if (title.includes(word)) sentimentScore += 1;
+      });
+      negativeWords.forEach((word) => {
+        if (title.includes(word)) sentimentScore -= 1;
+      });
+    });
+    console.log(`News sentiment score for "${query}":`, sentimentScore);
+    return sentimentScore;
+  } catch (error) {
+    console.error("Error fetching stock news:", error.message);
+    return 0;
+  }
+}
+
 // 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
 
@@ -154,8 +206,9 @@ const stockDataCache = {};
 const CACHE_TTL = 15 * 60 * 1000;
 async function fetchStockData(symbol) {
   const now = Date.now();
+  const marketOpen = isMarketOpen();
   // If market is closed, or cache is fresh, use cache
-  if (!isMarketOpen() && stockDataCache[symbol]) {
+  if (!marketOpen && stockDataCache[symbol]) {
     console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
@@ -174,6 +227,7 @@ async function fetchStockData(symbol) {
     stockDataCache[symbol] = { data, timestamp: now };
     return data;
   } catch (err) {
+    // If we get invalid JSON (like "Edge: Too..."), handle it
     console.error(`❌ Error fetching data for ${symbol}:`, err.message);
     throw err;
   }
@@ -274,19 +328,220 @@ app.get("/protected", (req, res) => {
 });
 
 /*******************************************
- * ADVANCED END-OF-DAY FORECASTING - STOCK CHECKER
+ * ADVANCED END-OF-DAY FORECASTING
  *******************************************/
 app.post("/api/check-stock", async (req, res) => {
-  // (same advanced logic as before, not shown here for brevity)
-  // ...
-  return res.json({ message: "Placeholder: check-stock logic" });
+  const { symbol, intent } = req.body;
+  if (!symbol || !intent) {
+    return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
+  }
+  try {
+    let stock;
+    try {
+      stock = await fetchStockData(symbol);
+    } catch (innerErr) {
+      console.error(`❌ Error fetching stock data for symbol "${symbol}":`, innerErr.message);
+      return res.status(500).json({ message: "Error fetching stock data." });
+    }
+    if (!stock || !stock.price) {
+      return res.status(404).json({ message: "Stock not found or data unavailable." });
+    }
+
+    const computedAvgVolume =
+      stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
+    const metrics = {
+      volume: stock.price?.regularMarketVolume ?? 0,
+      currentPrice: stock.price?.regularMarketPrice ?? 0,
+      peRatio: stock.summaryDetail?.trailingPE ?? 0,
+      pbRatio: stock.summaryDetail?.priceToBook ?? 0,
+      dividendYield: stock.summaryDetail?.dividendYield ?? 0,
+      earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
+      debtRatio: stock.financialData?.debtToEquity ?? 0,
+      dayHigh: stock.price?.regularMarketDayHigh ?? 0,
+      dayLow: stock.price?.regularMarketDayLow ?? 0,
+      fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+      fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
+    };
+
+    // Fundamental scoring
+    let baseScore = 0;
+    if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
+    else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
+
+    if (metrics.peRatio >= 5 && metrics.peRatio <= 20) baseScore += 2;
+    else if (metrics.peRatio > 40) baseScore -= 2;
+
+    if (metrics.earningsGrowth > 0.2) baseScore += 4;
+    else if (metrics.earningsGrowth > 0.05) baseScore += 2;
+    else if (metrics.earningsGrowth < 0) baseScore -= 2;
+
+    if (metrics.debtRatio < 0.3) baseScore += 3;
+    else if (metrics.debtRatio > 1.0) baseScore -= 2;
+
+    // Day range
+    let dayScore = 0;
+    const dayRange = metrics.dayHigh - metrics.dayLow;
+    if (dayRange > 0) {
+      const dayPos = (metrics.currentPrice - metrics.dayLow) / dayRange;
+      if (dayPos < 0.2) dayScore = 1;
+      else if (dayPos > 0.8) dayScore = -1;
+    }
+
+    // 52-week range
+    let weekScore = 0;
+    const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+    if (weekRange > 0) {
+      const weekPos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+      if (weekPos < 0.3) weekScore = 2;
+      else if (weekPos > 0.8) weekScore = -2;
+    }
+
+    // Industry comparison
+    let industryScore = 0;
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+      const ind = industryMetrics[stockIndustry];
+      if (metrics.peRatio && ind.peRatio) {
+        industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
+      }
+      if (metrics.earningsGrowth && ind.revenueGrowth) {
+        industryScore += metrics.earningsGrowth * 100 > ind.revenueGrowth ? 2 : -2;
+      }
+      if (metrics.debtRatio && ind.debtToEquity) {
+        industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
+      }
+    }
+
+    // Attempt advanced model forecast for EOD
+    let advancedForecastPrice = null;
+    if (forecastModel && normalizationParams) {
+      try {
+        const featureKeys = ["currentPrice", "peRatio", "earningsGrowth", "debtRatio", "volume"];
+        const values = featureKeys.map((k) => metrics[k] || 0);
+        const normalized = values.map((val, i) => {
+          const k = featureKeys[i];
+          const mean = normalizationParams[k]?.mean || 0;
+          const std = normalizationParams[k]?.std || 1;
+          return (val - mean) / std;
+        });
+        const inputTensor = tf.tensor2d([normalized]);
+        const pred = forecastModel.predict(inputTensor);
+        const predVal = pred.dataSync()[0];
+        const cpMean = normalizationParams.currentPrice?.mean || 0;
+        const cpStd = normalizationParams.currentPrice?.std || 1;
+        advancedForecastPrice = predVal * cpStd + cpMean;
+      } catch (tfErr) {
+        console.error(`Model forecast error for ${symbol}:`, tfErr.message);
+      }
+    }
+
+    // Fallback: short-term historical approach
+    let finalForecastPrice = advancedForecastPrice;
+    if (!finalForecastPrice) {
+      try {
+        const fallbackData = await yahooFinance.historical(
+          symbol,
+          { period: "5d", interval: "1d" },
+          { fetchOptions: requestOptions }
+        );
+        if (fallbackData && fallbackData.length > 1) {
+          fallbackData.sort((a, b) => new Date(a.date) - new Date(b.date));
+          let totalReturn = 0;
+          let count = 0;
+          for (let i = 1; i < fallbackData.length; i++) {
+            const prevClose = fallbackData[i - 1].close;
+            const currClose = fallbackData[i].close;
+            if (prevClose && currClose) {
+              totalReturn += currClose / prevClose - 1;
+              count++;
+            }
+          }
+          const avgDailyReturn = count > 0 ? totalReturn / count : 0;
+          finalForecastPrice = metrics.currentPrice * (1 + avgDailyReturn);
+        }
+      } catch (fbErr) {
+        console.error(`Fallback forecast error for ${symbol}:`, fbErr.message);
+      }
+    }
+
+    if (!finalForecastPrice) {
+      finalForecastPrice = metrics.currentPrice;
+    }
+
+    const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+    const projectedGrowthPercent = ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+    const numericCombinedScore = +(fundamentalRating + projectedGrowthPercent).toFixed(2);
+
+    // Classification
+    let finalClassification, finalAdvice;
+    if (intent === "buy") {
+      if (numericCombinedScore >= 30) {
+        finalClassification = "growth";
+        finalAdvice = "Very Good Stock to Buy";
+      } else if (numericCombinedScore >= 10) {
+        finalClassification = "growth";
+        finalAdvice = "Good Stock to Buy";
+      } else if (numericCombinedScore >= -5) {
+        finalClassification = "stable";
+        finalAdvice = "Okay Stock to Buy";
+      } else {
+        finalClassification = "unstable";
+        finalAdvice = "Bad Stock to Buy";
+      }
+    } else {
+      // Sell logic
+      if (projectedGrowthPercent > 7) {
+        finalClassification = "stable";
+        finalAdvice = "Hold the Stock (Forecast indicates growth)";
+      } else {
+        finalClassification = "unstable";
+        finalAdvice = "Sell the Stock";
+      }
+    }
+
+    const forecastEndDate = getMarketCloseTime();
+    const stockName = stock.price?.longName || symbol;
+    const stockRevenueGrowth =
+      stockIndustry !== "Unknown" &&
+      industryMetrics[stockIndustry] &&
+      industryMetrics[stockIndustry].revenueGrowth
+        ? industryMetrics[stockIndustry].revenueGrowth
+        : 0;
+
+    return res.json({
+      symbol,
+      name: stockName,
+      industry: stockIndustry,
+      fundamentalRating: +fundamentalRating.toFixed(2),
+      combinedScore: numericCombinedScore,
+      classification: finalClassification,
+      advice: finalAdvice,
+      metrics: {
+        ...metrics,
+        dayRange: metrics.dayHigh - metrics.dayLow,
+        fiftyTwoWeekRange: metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow,
+      },
+      forecast: {
+        forecastPrice: +finalForecastPrice.toFixed(2),
+        projectedGrowthPercent: projectedGrowthPercent.toFixed(2) + "%",
+        forecastPeriod: "End of Day",
+        forecastEndDate: forecastEndDate.toISOString(),
+      },
+      revenueGrowth: stockRevenueGrowth,
+    });
+  } catch (error) {
+    console.error("❌ Error in /api/check-stock:", error.message);
+    return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
+  }
 });
 
 /****************************************************
  * HELPER: classifyStockForBuy(symbol)
- * (No forecast model usage here)
+ * Used by the Finder to see if a stock is 'growth' or 'stable' or 'unstable'
+ * (No forecasting used here)
  ****************************************************/
 async function classifyStockForBuy(symbol) {
+  // fetch data & skip if error
   const stock = await fetchStockData(symbol);
   if (!stock || !stock.price) {
     throw new Error(`No price data for symbol ${symbol}`);
@@ -310,11 +565,14 @@ async function classifyStockForBuy(symbol) {
   // A quick scoring
   if (metrics.volume > computedAvgVolume * 1.2) score += 3;
   else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
+
   if (metrics.peRatio >= 5 && metrics.peRatio <= 20) score += 2;
   else if (metrics.peRatio > 40) score -= 2;
+
   if (metrics.earningsGrowth > 0.2) score += 4;
   else if (metrics.earningsGrowth > 0.05) score += 2;
   else if (metrics.earningsGrowth < 0) score -= 2;
+
   if (metrics.debtRatio < 0.3) score += 3;
   else if (metrics.debtRatio > 1) score -= 2;
 
@@ -326,13 +584,15 @@ async function classifyStockForBuy(symbol) {
     else if (pos > 0.8) score -= 2;
   }
 
-  // **Lower the threshold for growth** so some stocks actually pass
+  // -- CHANGED: Lower threshold for 'growth'
   let classification;
-  if (score >= 5) classification = "growth";  // used to be >= 8
+  if (score >= 5) classification = "growth"; // <-- used to be >= 8
   else if (score >= 0) classification = "stable";
   else classification = "unstable";
 
-  console.log(`[classifyStockForBuy] Symbol=${symbol}, Score=${score}, Classification=${classification}`);
+  console.log(
+    `[classifyStockForBuy] Symbol=${symbol}, score=${score}, classification=${classification}`
+  );
   return { classification };
 }
 
@@ -342,71 +602,66 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
   try {
     let { stockType, exchange, minPrice, maxPrice } = req.body;
 
-    // Convert to consistent case
-    stockType = stockType?.toLowerCase();
-    exchange = exchange?.toUpperCase();
+    // -- CHANGED: Convert to consistent case for matching
+    if (typeof stockType === "string") {
+      stockType = stockType.toLowerCase();
+    }
+    if (typeof exchange === "string") {
+      exchange = exchange.toUpperCase();
+    }
 
     if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
-    const filtered = [];
 
+    const filtered = [];
     // We'll use allStocks from the loaded JSON
     for (const s of allStocks) {
-      // Also uppercase s.exchange so "NASDAQ" matches "Nasdaq"
-      if (s.exchange?.toUpperCase() !== exchange) {
-        // e.g. skip if user wants "NASDAQ" but the symbol is "NYSE"
+      // uppercase s.exchange so "NASDAQ" matches "Nasdaq"
+      if (s.exchange && s.exchange.toUpperCase() !== exchange) {
         continue;
       }
       try {
         const data = await fetchStockData(s.symbol);
         const currentPrice = data?.price?.regularMarketPrice;
         if (!currentPrice) continue;
-        // Filter by price
         if (currentPrice < minPrice || currentPrice > maxPrice) continue;
-
-        // Classify for buy using only fundamental criteria
+        // Classify for buy
         const { classification } = await classifyStockForBuy(s.symbol);
 
-        // If user wants "growth" only, skip stable/unstable
+        // if user wants "growth" only, skip stable/unstable
         if (stockType === "growth" && classification !== "growth") continue;
-        // If user wants "stable" only, skip growth/unstable
         if (stockType === "stable" && classification !== "stable") continue;
-        // If user wants "unstable" only, skip growth/stable
         if (stockType === "unstable" && classification !== "unstable") continue;
 
-        filtered.push({
-          symbol: s.symbol,
-          exchange: s.exchange || "N/A",
-          classification,
-          price: currentPrice
-        });
+        filtered.push({ symbol: s.symbol, exchange: s.exchange || "N/A" });
       } catch (err) {
         console.warn(`Finder: skipping ${s.symbol} due to error: ${err.message}`);
         continue;
       }
     }
-
-    // If you want to debug:
-    console.log(`Finder returning ${filtered.length} stocks`);
-
     return res.json({ stocks: filtered });
   } catch (error) {
     console.error("Finder error:", error.message);
     return res.status(500).json({ message: "Error finding stocks." });
   }
 });
-
 finderRouter.post("/signup", async (req, res) => {
+  // you can omit or replicate your /signup logic
   return res.json({ message: "Signup from finder not used." });
 });
 finderRouter.post("/login", async (req, res) => {
+  // you can omit or replicate your /login logic
   return res.json({ message: "Login from finder not used." });
 });
 app.use("/finder", finderRouter);
 
 // --- Popular Stocks Endpoint (placeholder) ---
+let popularStocksCache = null;
+let popularStocksCacheTimestamp = 0;
+const POPULAR_CACHE_DURATION = 5 * 60 * 1000;
 app.get("/api/popular-stocks", async (req, res) => {
+  // placeholder
   return res.json({ message: "Popular stocks not fully implemented." });
 });
 
@@ -446,7 +701,7 @@ app.get("/api/notifications", (req, res) => {
 });
 
 /*******************************************
- * AUTOMATED INVESTOR SECTION
+ * AUTOMATED INVESTOR SECTION (UPDATED)
  *******************************************/
 const STOCKS_JSON = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON = path.join(__dirname, "portfolio.json");
@@ -474,14 +729,14 @@ function savePortfolio() {
   fs.writeFileSync(PORTFOLIO_JSON, JSON.stringify(portfolio, null, 2));
 }
 
-// Example filter function for auto investor
+// Filter function for auto investor
 async function getFilteredSymbols(stockType, exchange, minPrice, maxPrice) {
   const filteredSymbols = [];
   const batchSize = 10;
   for (let i = 0; i < allStocks.length; i += batchSize) {
     const batch = allStocks.slice(i, i + batchSize);
     for (const s of batch) {
-      if (s.exchange?.toUpperCase() !== exchange.toUpperCase()) continue;
+      if (s.exchange && s.exchange !== exchange) continue;
       try {
         const data = await fetchStockData(s.symbol);
         const currentPrice = data?.price?.regularMarketPrice;
@@ -508,6 +763,7 @@ async function autoBuyStocks() {
   const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
   for (const symbol of filteredSymbols) {
     try {
+      // Insert advanced logic if desired
       console.log(`autoBuyStocks would analyze ${symbol} here...`);
     } catch (error) {
       console.error(`Error analyzing stock ${symbol}:`, error.message);
@@ -545,6 +801,7 @@ app.get("/api/simulate-trades", async (req, res) => {
         console.log(`Simulating buy for symbol: ${symbol}`);
         const data = await fetchStockData(symbol);
         if (!data || !data.price) continue;
+        // Quick check logic
         let rating = 0;
         const avgVol = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const currPrice = data.price?.regularMarketPrice || 0;
@@ -581,6 +838,15 @@ app.get("/api/simulate-trades", async (req, res) => {
 app.post("/api/execute-trade", async (req, res) => {
   const { symbol, quantity, action } = req.body;
   try {
+    // If you have an investopediaTrader module, call it
+    // e.g.:
+    // const { placeTrade } = require('./investopediaTrader');
+    // await placeTrade({
+    //   username: process.env.INVESTOPEDIA_USER,
+    //   symbol,
+    //   quantity,
+    //   action,
+    // });
     res.json({ message: `Trade executed: ${action} ${quantity} shares of ${symbol}` });
   } catch (error) {
     console.error("Trade execution error:", error.message);
