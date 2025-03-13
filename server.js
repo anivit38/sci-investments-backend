@@ -189,7 +189,9 @@ let forecastModel = null;
 let normalizationParams = null;
 async function loadForecastResources() {
   try {
-    forecastModel = await tf.loadLayersModel("file://model/forecast_model/model.json");
+    // Use __dirname to ensure the absolute path is used
+    const modelPath = path.join(__dirname, "model", "forecast_model", "model.json");
+    forecastModel = await tf.loadLayersModel("file://" + modelPath);
     console.log("✅ Forecast model loaded successfully.");
     const normPath = path.join(__dirname, "model", "forecast_model", "normalization.json");
     const normData = fs.readFileSync(normPath);
@@ -431,8 +433,8 @@ app.post("/api/check-stock", async (req, res) => {
         // DEBUG: log normalized metrics
         console.log("[DEBUG] Normalized metrics for forecast:", normalized);
 
-        // Reshape input to 3D: [batchSize, timeSteps, features] (assuming timeSteps=1)
-        const inputTensor = tf.tensor3d([normalized], [1, 1, 5]);
+        // Wrap normalized array as a 3D array: [[ normalized ]] gives shape [1,1,5]
+        const inputTensor = tf.tensor3d([[normalized]], [1, 1, 5]);
         const pred = forecastModel.predict(inputTensor);
         const predVal = pred.dataSync()[0];
 
@@ -454,12 +456,14 @@ app.post("/api/check-stock", async (req, res) => {
     let finalForecastPrice = advancedForecastPrice;
     if (!finalForecastPrice) {
       try {
-        // Use period1 and period2 for a 5-day history
+        // Use Unix timestamps for period1 and period2 for a 5-day history
         const endDate = new Date();
         const startDate = new Date(endDate.getTime() - 5 * 24 * 60 * 60 * 1000);
+        const period1 = Math.floor(startDate.getTime() / 1000);
+        const period2 = Math.floor(endDate.getTime() / 1000);
         const fallbackData = await yahooFinance.historical(
           symbol,
-          { period1: startDate, period2: endDate, interval: "1d" },
+          { period1, period2, interval: "1d" },
           { fetchOptions: requestOptions }
         );
 
