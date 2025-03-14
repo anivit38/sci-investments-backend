@@ -1,7 +1,9 @@
 /*******************************************
- * COMBINED SERVER (server.js)
+ * COMBINED SERVER FOR AUTH, STOCK CHECKER,
+ * FINDER, DASHBOARD, FORECASTING, COMMUNITY
  *******************************************/
 
+// 1. Load Environment & Libraries
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -15,15 +17,11 @@ const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
 const nodemailer = require("nodemailer");
 
-// -- Import from fetchData.js
+// --- Import fetchData helpers (for caching historical data, etc.)
 const {
-  loadHistoricalDataFromCSV,
-  getCachedHistoricalData,
   fetchAllSymbolsHistoricalData,
-} = require("./fetchData");
-
-// ------------- Load CSV into memory at startup -------------
-loadHistoricalDataFromCSV(); // <-- ensures getCachedHistoricalData() works
+  getCachedHistoricalData,
+} = require("./fetchData"); // <--- Make sure this points to the correct file
 
 // ------------- Nodemailer Setup (Optional) -------------
 const transporter = nodemailer.createTransport({
@@ -58,14 +56,14 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Check if market is open (M–F, 9:30–16:00 ET)
+// Check if the market is open (NYSE hours: M–F, 9:30–16:00 ET)
 function isMarketOpen() {
   const now = new Date();
   const options = { timeZone: "America/New_York", hour12: false };
   const estString = now.toLocaleString("en-US", options);
   const est = new Date(estString);
   const day = est.getDay();
-  if (day === 0 || day === 6) return false;
+  if (day === 0 || day === 6) return false; // Sunday (0) or Saturday (6)
   const hour = est.getHours();
   const minute = est.getMinutes();
   if (hour < 9 || (hour === 9 && minute < 30)) return false;
@@ -73,13 +71,20 @@ function isMarketOpen() {
   return true;
 }
 
+/**
+ * getForecastEndTime():
+ * If the market is open, returns today's 4:00 PM ET.
+ * If the market is closed, returns the next business day's 4:00 PM ET.
+ */
 function getForecastEndTime() {
   const now = new Date();
+  // Get current time in ET
   const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   if (isMarketOpen()) {
     etNow.setHours(16, 0, 0, 0);
     return etNow;
   } else {
+    // Move to next day and skip weekends
     let next = new Date(etNow);
     next.setDate(next.getDate() + 1);
     while (next.getDay() === 0 || next.getDay() === 6) {
@@ -90,6 +95,7 @@ function getForecastEndTime() {
   }
 }
 
+// Custom request options for Yahoo Finance
 const requestOptions = {
   headers: {
     "User-Agent":
@@ -98,7 +104,7 @@ const requestOptions = {
   redirect: "follow",
 };
 
-// 2. Mongoose Models
+// 2. Models & External APIs
 const UserModel = require(path.join(__dirname, "models", "User"));
 
 // CommunityPost Model
@@ -117,11 +123,11 @@ try {
   console.error("Error loading industryMetrics.json:", err.message);
 }
 
-// 3. Express App
+// 3. Create Express App
 const app = express();
 app.use(
   cors({
-    origin: "https://sci-investments.web.app",
+    origin: "https://sci-investments.web.app", // <--- your frontend domain
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
@@ -171,19 +177,21 @@ async function loadForecastResources() {
 }
 loadForecastResources();
 
-// Forecast Cache
+// Forecast Cache (refreshes daily)
 const forecastCache = {};
-const FORECAST_CACHE_TTL = 24 * 60 * 60 * 1000;
+const FORECAST_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-// A fallback simple forecasting function using recent daily returns
+// A fallback simple forecasting function using recent historical daily returns
 async function simpleForecastPrice(symbol, currentPrice) {
   try {
-    const historicalData = getCachedHistoricalData(symbol);
+    const historicalData = await getCachedHistoricalData(symbol);
     if (!historicalData || historicalData.length < 5) {
+      // Not enough data, fallback is just the current price
       return currentPrice;
     }
     // Sort ascending
     historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+    // Use the last 10 days (or all if less than 10 exist)
     const recentData = historicalData.slice(-10);
     let sumPct = 0;
     let count = 0;
@@ -208,22 +216,27 @@ async function simpleForecastPrice(symbol, currentPrice) {
   }
 }
 
-// ----------------- Stock Data Caching for Fundamentals -----------------
+// ----------------- Stock Data Caching -----------------
 const stockDataCache = {};
-const CACHE_TTL = 15 * 60 * 1000;
+const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
 async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
+
+  // If market is closed and we have cached data, use it
   if (!marketOpen && stockDataCache[symbol]) {
-    console.log(`Market closed, using cached fundamentals for ${symbol}`);
+    console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
+  // If cache is still valid, use it
   if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
-    console.log(`Using cached fundamentals for ${symbol}`);
+    console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-  console.log(`Fetching fresh fundamentals for ${symbol}`);
+
+  // Otherwise, fetch fresh data
+  console.log(`Fetching fresh data for ${symbol}`);
   const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
     const data = await yahooFinance.quoteSummary(
@@ -234,31 +247,36 @@ async function fetchStockData(symbol) {
     if (!data || !data.price) {
       throw new Error("Missing or invalid data from quoteSummary");
     }
+    // Store in cache
     stockDataCache[symbol] = { data, timestamp: now };
     return data;
   } catch (err) {
     if (err.message.includes("Unexpected token")) {
       console.error(`❌ Possibly rate-limited or captcha from Yahoo for ${symbol}:`, err.message);
     } else {
-      console.error(`❌ Error fetching fundamentals for ${symbol}:`, err.message);
+      console.error(`❌ Error fetching data for ${symbol}:`, err.message);
     }
     return null;
   }
 }
 
-// ----------------- "Up to 30" trading days for advanced forecasting -----------------
-function fetchTimeSeriesData(symbol, maxDays = 30) {
+/**
+ * fetchTimeSeriesData(symbol, days=30)
+ * Pulls from getCachedHistoricalData (which your fetchData.js populates).
+ * We do NOT require 30 *consecutive* days, just the last 'days' records we have.
+ */
+async function fetchTimeSeriesData(symbol, days = 30) {
   const historical = getCachedHistoricalData(symbol);
   if (!historical || historical.length === 0) {
     throw new Error(`No daily data available for ${symbol}.`);
   }
   // Sort ascending
   historical.sort((a, b) => new Date(a.date) - new Date(b.date));
-  // Return up to last `maxDays` rows
-  return historical.slice(-maxDays);
+  // Return up to the last N
+  return historical.slice(-days);
 }
 
-// ----------------- Historical Data for Charting (live from Yahoo) -----------------
+// ----------------- Historical Data for Charting (Optional) -----------------
 app.post("/api/stock-history", async (req, res) => {
   const { symbol, range } = req.body;
   if (!symbol) return res.status(400).json({ message: "Stock symbol is required." });
@@ -276,6 +294,7 @@ app.post("/api/stock-history", async (req, res) => {
   }
 
   try {
+    // This route directly fetches from Yahoo (live), ignoring your CSV cache
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
     const historicalData = await yahooFinance.historical(
@@ -364,8 +383,9 @@ app.post("/api/check-stock", async (req, res) => {
   if (!symbol || !intent) {
     return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
+
   try {
-    // 1) Fetch fundamentals
+    // 1) Fetch current fundamentals
     let stock;
     try {
       stock = await fetchStockData(symbol);
@@ -377,8 +397,9 @@ app.post("/api/check-stock", async (req, res) => {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
 
-    // Basic metrics
-    const computedAvgVolume = stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
+    // 2) Basic metrics
+    const computedAvgVolume =
+      stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
@@ -393,7 +414,7 @@ app.post("/api/check-stock", async (req, res) => {
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // 2) Fundamental scoring
+    // 3) Fundamental scoring
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
@@ -439,29 +460,36 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // 3) Advanced Model Forecasting
+    // 4) Attempt advanced forecasting (needs 30 data points + model + normalization)
     let advancedForecastPrice = null;
-    let timeSeriesData = null;
+    let timeSeriesData;
     try {
-      timeSeriesData = fetchTimeSeriesData(symbol, 30); // up to last 30
+      timeSeriesData = await fetchTimeSeriesData(symbol, 30); // from CSV
     } catch (e) {
       console.warn(`⚠️  Not enough historical data for advanced forecasting for ${symbol}:`, e.message);
     }
 
-    if (timeSeriesData && timeSeriesData.length >= 30 && forecastModel && normalizationParams) {
+    if (
+      timeSeriesData &&
+      timeSeriesData.length === 30 && // exactly 30 points
+      forecastModel &&
+      normalizationParams
+    ) {
       try {
         const featureKeys = ["open", "high", "low", "close", "volume", "peRatio", "earningsGrowth", "debtToEquity"];
-        const sequence = timeSeriesData.map((day) => {
-          return featureKeys.map((k) => {
+        // Build input: shape [1, 30, 8]
+        const sequence = timeSeriesData.map((day) =>
+          featureKeys.map((k) => {
             const val = day[k] ?? 0;
             const { mean = 0, std = 1 } = normalizationParams[k] || {};
             return std !== 0 ? (val - mean) / std : 0;
-          });
-        });
+          })
+        );
         const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
         console.log("Time-series input shape:", inputTensor.shape);
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
+        // De-normalize
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
         advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
         console.log(`Advanced forecast for ${symbol}: ${advancedForecastPrice.toFixed(2)}`);
@@ -476,7 +504,7 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // 4) Fallback to simple forecast if advanced is not viable
+    // 5) If advanced forecast is null or extremely close to current price, do simple forecast
     let finalForecastPrice = null;
     if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
       finalForecastPrice = forecastCache[symbol].price;
@@ -490,14 +518,14 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // 5) Growth percentage
+    // 6) Compute growth percentage from current price
     const forecastGrowthPercent = ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
 
-    // 6) Combine fundamentals + forecast
+    // 7) Combine fundamentals + forecast
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
     const combinedScore = 0.3 * fundamentalRating + 0.7 * forecastGrowthPercent;
 
-    // 7) Classification
+    // 8) Classification & Advice
     let finalClassification, finalAdvice;
     if (intent === "buy") {
       if (combinedScore >= 30) {
@@ -514,6 +542,7 @@ app.post("/api/check-stock", async (req, res) => {
         finalAdvice = "Bad Stock to Buy";
       }
     } else {
+      // for selling
       if (forecastGrowthPercent > 7) {
         finalClassification = "stable";
         finalAdvice = "Hold the Stock (Forecast indicates growth)";
@@ -523,7 +552,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // 8) Forecast end time
+    // 9) Additional info
     const forecastEndDate = getForecastEndTime();
     const stockName = stock.price?.longName || symbol;
     const stockRevenueGrowth =
@@ -533,7 +562,7 @@ app.post("/api/check-stock", async (req, res) => {
         ? industryMetrics[stockIndustry].revenueGrowth
         : 0;
 
-    // 9) Return result
+    // 10) Return result
     return res.json({
       symbol,
       name: stockName,
@@ -716,6 +745,7 @@ function savePortfolio() {
   fs.writeFileSync(PORTFOLIO_JSON, JSON.stringify(portfolio, null, 2));
 }
 
+// Filter function for auto investor
 async function getFilteredSymbols(stockType, exchange, minPrice, maxPrice) {
   const filteredSymbols = [];
   const batchSize = 10;
@@ -738,7 +768,7 @@ async function getFilteredSymbols(stockType, exchange, minPrice, maxPrice) {
         continue;
       }
     }
-    // Slight delay to avoid rate-limits
+    // Delay 5s to reduce rate-limit issues
     await delay(5000);
   }
   console.log(`Filtered symbols count: ${filteredSymbols.length}`);
@@ -755,7 +785,7 @@ async function autoBuyStocks() {
   for (const symbol of filteredSymbols) {
     try {
       console.log(`autoBuyStocks would analyze ${symbol} here...`);
-      // Possibly do advanced logic or forecasting
+      // Additional logic or forecasting calls
     } catch (error) {
       console.error(`Error analyzing stock ${symbol}:`, error.message);
     }
@@ -764,9 +794,10 @@ async function autoBuyStocks() {
 
 async function autoSellStocks() {
   if (!isMarketOpen()) return;
-  // Implement autoSell logic here
+  // Implement your autoSell logic here
 }
 
+// Automated tasks (runs every minute)
 setInterval(async () => {
   try {
     await autoBuyStocks();
@@ -821,11 +852,11 @@ app.get("/api/simulate-trades", async (req, res) => {
   }
 });
 
-// Execute-trade endpoint (optional)
+// ----------------- EXECUTE-TRADE ENDPOINT (Optional) -----------------
 app.post("/api/execute-trade", async (req, res) => {
   const { symbol, quantity, action } = req.body;
   try {
-    // Example: call a trading module if available
+    // Example stub
     res.json({ message: `Trade executed: ${action} ${quantity} shares of ${symbol}` });
   } catch (error) {
     console.error("Trade execution error:", error.message);
@@ -833,30 +864,30 @@ app.post("/api/execute-trade", async (req, res) => {
   }
 });
 
-// Daily job: load 1 year of data from Yahoo (optional)
+// ----------------- DAILY JOB: LOAD 1 YEAR HISTORICAL DATA -----------------
 const ONE_DAY = 24 * 60 * 60 * 1000;
 async function refreshAllHistoricalData() {
   try {
-    const STOCKS_JSON = path.join(__dirname, "symbols.json");
     if (!fs.existsSync(STOCKS_JSON)) {
       console.log("No symbols.json found, skipping daily historical fetch.");
       return;
     }
     const raw = fs.readFileSync(STOCKS_JSON, "utf-8");
     const symbols = JSON.parse(raw);
-    // If you want to do a big fetch each day:
-    await fetchAllSymbolsHistoricalData(symbols, 1);
+    await fetchAllSymbolsHistoricalData(symbols, 1); // fetch 1 year of data
   } catch (err) {
     console.error("Error in refreshAllHistoricalData:", err.message);
   }
 }
+// Call once on server start
 refreshAllHistoricalData();
+// Then schedule daily
 setInterval(() => {
   console.log("⏰ Running daily refreshAllHistoricalData...");
   refreshAllHistoricalData();
 }, ONE_DAY);
 
-// Start the server
+// ----------------- START THE SERVER -----------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Combined server running on port ${PORT}`);
