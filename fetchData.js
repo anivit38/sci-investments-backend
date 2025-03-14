@@ -1,117 +1,190 @@
 /*******************************************************
  * fetchData.js
  * 
- * Responsible for:
- *   - In-memory caching of historicalData.csv
- *   - Exports getCachedHistoricalData(symbol)
- *   - Optionally fetching from Yahoo if needed (not strictly used if you rely on updateCSV.js)
+ * Provides:
+ *   - historicalDataCache: an in-memory object 
+ *   - loadCsvIntoMemory(): read the CSV, parse, store in memory
+ *   - getCachedHistoricalData(symbol)
+ *   - storeInMemoryData(symbol, dataArray)
+ *   - fetchHistoricalData, fetchAllSymbolsHistoricalData (if you want)
  *******************************************************/
-
+require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const yahooFinance = require("yahoo-finance2").default;
 
-// This will hold an array of rows for each symbol
-//   e.g. historicalDataCache["AAPL"] = [{ date, open, high, ... }, ...]
+/** The in-memory object for storing historical data:
+ *   historicalDataCache[symbol] = array of daily objects
+ */
 const historicalDataCache = {};
 
-/**
- * Loads historicalData.csv into memory (historicalDataCache).
- * Call this at server startup so advanced forecasting can read from it.
- */
-function loadHistoricalDataFromCSV() {
-  const csvPath = path.join(__dirname, "historicalData.csv");
-  if (!fs.existsSync(csvPath)) {
-    console.warn("⚠️  No historicalData.csv found, so advanced forecasting may have no data.");
-    return;
-  }
-  console.log("Loading historicalData.csv into memory...");
-  const csvData = fs.readFileSync(csvPath, "utf-8").trim();
-  const lines = csvData.split("\n");
-  if (lines.length < 2) {
-    console.warn("⚠️  historicalData.csv is empty or invalid header.");
-    return;
-  }
+/** The path to your CSV file */
+const CSV_FILE = path.join(__dirname, "historicalData.csv");
 
+/** 
+ * Helper to parse CSV lines.
+ * We assume the CSV has a header like:
+ *   symbol,date,open,high,low,close,volume,peRatio,earningsGrowth,debtToEquity
+ */
+function loadCsvIntoMemory() {
+  if (!fs.existsSync(CSV_FILE)) {
+    console.warn(`No CSV file found at ${CSV_FILE}. Skipping loadCsvIntoMemory().`);
+    return;
+  }
+  console.log(`Loading CSV into memory from: ${CSV_FILE}`);
+  const raw = fs.readFileSync(CSV_FILE, "utf-8").trim();
+  const lines = raw.split("\n");
+  if (lines.length <= 1) {
+    console.warn("CSV file is empty or has no data rows.");
+    return;
+  }
   const header = lines[0].split(",");
-  const rows = lines.slice(1).map(line => {
-    const values = line.split(",");
-    const rowObj = {};
-    header.forEach((col, i) => {
-      rowObj[col] = values[i];
-    });
-    return rowObj;
+  // We expect something like:
+  //  0: symbol
+  //  1: date
+  //  2: open
+  //  3: high
+  //  4: low
+  //  5: close
+  //  6: volume
+  //  7: peRatio
+  //  8: earningsGrowth
+  //  9: debtToEquity
+
+  // We'll figure out each column index:
+  const colIndex = {};
+  header.forEach((colName, idx) => {
+    colIndex[colName] = idx;
   });
 
-  // Group by symbol
-  const grouped = {};
-  for (const row of rows) {
-    const sym = row.symbol;
-    if (!grouped[sym]) grouped[sym] = [];
-    // Convert numeric fields as needed
-    grouped[sym].push({
-      symbol: row.symbol,
-      date: row.date,
-      open: parseFloat(row.open),
-      high: parseFloat(row.high),
-      low: parseFloat(row.low),
-      close: parseFloat(row.close),
-      volume: parseFloat(row.volume),
-      peRatio: parseFloat(row.peRatio),
-      earningsGrowth: parseFloat(row.earningsGrowth),
-      debtToEquity: parseFloat(row.debtToEquity),
+  // Now parse each data row
+  for (let i = 1; i < lines.length; i++) {
+    const row = lines[i].split(",");
+    if (row.length < 2) continue; // skip blank lines
+
+    const symbol = row[colIndex["symbol"]];
+    const dateStr = row[colIndex["date"]];
+    const open = parseFloat(row[colIndex["open"]]) || 0;
+    const high = parseFloat(row[colIndex["high"]]) || 0;
+    const low = parseFloat(row[colIndex["low"]]) || 0;
+    const close = parseFloat(row[colIndex["close"]]) || 0;
+    const volume = parseFloat(row[colIndex["volume"]]) || 0;
+    const peRatio = parseFloat(row[colIndex["peRatio"]]) || 0;
+    const earningsGrowth = parseFloat(row[colIndex["earningsGrowth"]]) || 0;
+    const debtToEquity = parseFloat(row[colIndex["debtToEquity"]]) || 0;
+
+    if (!historicalDataCache[symbol]) {
+      historicalDataCache[symbol] = [];
+    }
+    historicalDataCache[symbol].push({
+      date: dateStr,
+      open,
+      high,
+      low,
+      close,
+      volume,
+      peRatio,
+      earningsGrowth,
+      debtToEquity,
     });
   }
 
-  // Store in historicalDataCache
-  for (const sym in grouped) {
-    // Sort ascending by date, just in case
-    grouped[sym].sort((a, b) => new Date(a.date) - new Date(b.date));
-    historicalDataCache[sym] = grouped[sym];
+  // (Optional) sort each symbol’s array ascending by date
+  for (const sym in historicalDataCache) {
+    historicalDataCache[sym].sort((a, b) => new Date(a.date) - new Date(b.date));
   }
-  console.log("✅ historicalDataCache loaded with", Object.keys(grouped).length, "symbols.");
+
+  console.log("Finished loading CSV into memory. Symbols loaded:", Object.keys(historicalDataCache).length);
 }
 
 /**
- * Return the array of daily data objects for the given symbol from in-memory cache.
- * Each object has {symbol,date,open,high,low,close,volume,peRatio,earningsGrowth,debtToEquity}.
+ * getCachedHistoricalData(symbol)
+ * Return the array from memory, or empty if none.
  */
 function getCachedHistoricalData(symbol) {
   return historicalDataCache[symbol] || [];
 }
 
 /**
- * Optional: fetch historical data directly from Yahoo (if you want).
- * Not strictly required if you rely on updateCSV.js to populate the CSV.
+ * storeInMemoryData(symbol, dataArray)
+ * Overwrite or merge data in memory for that symbol
+ */
+function storeInMemoryData(symbol, dataArray) {
+  // You might want to merge with existing data. 
+  // For simplicity, let's just overwrite:
+  historicalDataCache[symbol] = dataArray;
+  // But if you want to do a merge, you'd do something like:
+  //   combined = existing + dataArray => remove duplicates => sort => store
+}
+
+/** 
+ * fetchHistoricalData(symbol, yearsBack = 1)
+ * Example function if you want to fetch from Yahoo for up to 'yearsBack'
  */
 async function fetchHistoricalData(symbol, yearsBack = 1) {
-  // ...
-  // Implementation omitted or minimal. Typically you'd do yahooFinance.historical here.
-  // ...
-  return []; // or real data
+  const now = new Date();
+  const start = new Date(now);
+  start.setFullYear(start.getFullYear() - yearsBack);
+  try {
+    const results = await yahooFinance.historical(symbol, {
+      period1: start,
+      period2: now,
+      interval: "1d",
+    });
+    return results || [];
+  } catch (err) {
+    console.error(`Error in fetchHistoricalData for ${symbol}:`, err.message);
+    return [];
+  }
 }
 
-/**
- * Optional: fetch for multiple symbols (1 year, etc.).
- * updateCSV.js typically does this too, so you may not need it.
+/** 
+ * fetchAllSymbolsHistoricalData(symbols, yearsBack = 1)
+ * For each symbol in 'symbols', fetch up to 'yearsBack' of data from Yahoo,
+ * then store in memory (and optionally append to CSV).
  */
 async function fetchAllSymbolsHistoricalData(symbols, yearsBack = 1) {
-  // ...
-  // Implementation omitted or minimal
+  for (const s of symbols) {
+    const symbol = typeof s === "string" ? s : s.symbol;
+    console.log(`fetchAllSymbolsHistoricalData: fetching for ${symbol}...`);
+    const data = await fetchHistoricalData(symbol, yearsBack);
+    if (data && data.length > 0) {
+      // Convert to your shape
+      const shaped = data.map((d) => ({
+        date: d.date.toISOString().substr(0, 10),
+        open: d.open || 0,
+        high: d.high || 0,
+        low: d.low || 0,
+        close: d.close || 0,
+        volume: d.volume || 0,
+        peRatio: 0,
+        earningsGrowth: 0,
+        debtToEquity: 0,
+      }));
+      shaped.sort((a, b) => new Date(a.date) - new Date(b.date));
+      // Store in memory
+      storeInMemoryData(symbol, shaped);
+      // Optionally append to CSV or rewrite CSV
+      // ...
+    } else {
+      console.warn(`No data fetched for ${symbol}.`);
+    }
+  }
 }
 
+// Export
 module.exports = {
-  loadHistoricalDataFromCSV,
+  loadCsvIntoMemory,
   getCachedHistoricalData,
-  historicalDataCache,
-  // The following are optional if used in other places
+  storeInMemoryData,
   fetchHistoricalData,
   fetchAllSymbolsHistoricalData,
+  historicalDataCache,
 };
 
-// If you want to allow "node fetchData.js" to test, you can do:
+// If run standalone: node fetchData.js
 if (require.main === module) {
   console.log("Running fetchData.js standalone...");
-  loadHistoricalDataFromCSV();
-  console.log("Done. You can console.log(...) to inspect historicalDataCache if needed.");
+  loadCsvIntoMemory();
+  console.log("Done. You now have historicalDataCache filled from CSV.");
 }
