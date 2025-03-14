@@ -111,7 +111,7 @@ try {
 const app = express();
 app.use(
   cors({
-    origin: "https://sci-investments.web.app", // or whatever your front-end domain is
+    origin: "https://sci-investments.web.app", // or your front-end domain
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
@@ -247,8 +247,8 @@ async function fetchStockData(symbol) {
  * Returns an array of daily objects with price + fundamentals:
  * e.g. { open, high, low, close, volume, peRatio, earningsGrowth, debtToEquity, ... }
  *
- * This example tries to read from getCachedHistoricalData(symbol) (which you presumably fill with daily data).
- * If your CSV doesn't have daily fundamentals, you may need to store them or approximate them.
+ * Must match how your GRU model was trained. If your CSV doesn't have daily fundamentals,
+ * you either need to store them or approximate them from Yahoo. This is just an example.
  */
 async function fetchTimeSeriesData(symbol, days = 30) {
   // We'll attempt to get the last 'days' from your getCachedHistoricalData:
@@ -263,9 +263,8 @@ async function fetchTimeSeriesData(symbol, days = 30) {
   // Slice the last 'days'
   const recent = historical.slice(-days);
 
-  // Make sure each object has these keys:
-  // open, high, low, close, volume, peRatio, earningsGrowth, debtToEquity, ...
-  // If your CSV doesn't have them, fill in placeholders or gather from Yahoo as needed.
+  // Ensure each object has open, high, low, close, volume, peRatio, earningsGrowth, debtToEquity, etc.
+  // If missing, fill with 0 or a placeholder. This must match how you trained your model.
   return recent;
 }
 
@@ -470,8 +469,8 @@ app.post("/api/check-stock", async (req, res) => {
     // Industry comparison
     let industryScore = 0;
     const stockIndustry =
-      stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
-    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+  stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
       if (metrics.peRatio && ind.peRatio) {
         industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
@@ -488,11 +487,10 @@ app.post("/api/check-stock", async (req, res) => {
     let advancedForecastPrice = null;
     if (forecastModel && normalizationParams) {
       try {
-        // a) Fetch the last 30 days of daily data (price + fundamentals)
+        // a) Fetch the last 30 days of daily data
         const last30 = await fetchTimeSeriesData(symbol, 30);
 
-        // We'll define which columns we feed into the model
-        // (Must match how you trained your GRU model!)
+        // Must match how the GRU was trained
         const featureKeys = [
           "open",
           "high",
@@ -517,11 +515,11 @@ app.post("/api/check-stock", async (req, res) => {
         const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
         console.log("Time-series input shape:", inputTensor.shape);
 
-        // c) Predict next day's close (or price)
+        // c) Predict next day's close
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0]; // single value (normalized)
 
-        // d) De-normalize the predicted "close"
+        // d) De-normalize
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
         advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
 
@@ -629,21 +627,22 @@ app.post("/api/check-stock", async (req, res) => {
   }
 });
 
-// ----------------- HELPER: classifyStockForBuy(symbol) -----------------
-async function classifyStockForBuy(symbol) {
+// ----------------- HELPER: advancedClassifyStockForBuy(symbol) -----------------
+/**
+ * This helper replicates the logic of /api/check-stock with intent="buy"
+ * but only returns { classification, currentPrice } so we can filter quickly.
+ */
+async function advancedClassifyStockForBuy(symbol) {
+  // 1) fetch data
   const stock = await fetchStockData(symbol);
   if (!stock || !stock.price) {
     throw new Error(`No price data for symbol ${symbol}`);
   }
-  const computedAvgVolume =
-    stock.summaryDetail?.averageDailyVolume3Month ||
-    stock.price?.regularMarketVolume ||
-    0;
-  let score = 0;
   const metrics = {
     volume: stock.price?.regularMarketVolume ?? 0,
     currentPrice: stock.price?.regularMarketPrice ?? 0,
     peRatio: stock.summaryDetail?.trailingPE ?? 0,
+    pbRatio: stock.summaryDetail?.priceToBook ?? 0,
     earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
     debtRatio: stock.financialData?.debtToEquity ?? 0,
     dayHigh: stock.price?.regularMarketDayHigh ?? 0,
@@ -652,26 +651,136 @@ async function classifyStockForBuy(symbol) {
     fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
   };
 
-  if (metrics.volume > computedAvgVolume * 1.2) score += 3;
-  else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
-  if (metrics.peRatio >= 5 && metrics.peRatio <= 20) score += 2;
-  else if (metrics.peRatio > 40) score -= 2;
-  if (metrics.earningsGrowth > 0.2) score += 4;
-  else if (metrics.earningsGrowth > 0.05) score += 2;
-  else if (metrics.earningsGrowth < 0) score -= 2;
-  if (metrics.debtRatio < 0.3) score += 3;
-  else if (metrics.debtRatio > 1) score -= 2;
+  // 2) fundamentals
+  const computedAvgVolume =
+    stock.summaryDetail?.averageDailyVolume3Month ||
+    stock.price?.regularMarketVolume ||
+    0;
+  let baseScore = 0;
+  if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
+  else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
 
-  const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
-  if (weekRange > 0) {
-    const pos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-    if (pos < 0.3) score += 2;
-    else if (pos > 0.8) score -= 2;
+  if (metrics.peRatio >= 5 && metrics.peRatio <= 20) baseScore += 2;
+  else if (metrics.peRatio > 40) baseScore -= 2;
+
+  if (metrics.earningsGrowth > 0.2) baseScore += 4;
+  else if (metrics.earningsGrowth > 0.05) baseScore += 2;
+  else if (metrics.earningsGrowth < 0) baseScore -= 2;
+
+  if (metrics.debtRatio < 0.3) baseScore += 3;
+  else if (metrics.debtRatio > 1) baseScore -= 2;
+
+  // day range
+  let dayScore = 0;
+  const dayRange = metrics.dayHigh - metrics.dayLow;
+  if (dayRange > 0) {
+    const dayPos = (metrics.currentPrice - metrics.dayLow) / dayRange;
+    if (dayPos < 0.2) dayScore = 1;
+    else if (dayPos > 0.8) dayScore = -1;
   }
 
-  if (score >= 5) return { classification: "growth" };
-  if (score >= 0) return { classification: "stable" };
-  return { classification: "unstable" };
+  // 52-week range
+  let weekScore = 0;
+  const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+  if (weekRange > 0) {
+    const weekPos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+    if (weekPos < 0.3) weekScore = 2;
+    else if (weekPos > 0.8) weekScore = -2;
+  }
+
+  // industry
+  let industryScore = 0;
+  const stockIndustry =
+    stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+  if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+    const ind = industryMetrics[stockIndustry];
+    if (metrics.peRatio && ind.peRatio) {
+      industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
+    }
+    if (metrics.earningsGrowth && ind.revenueGrowth) {
+      industryScore += metrics.earningsGrowth * 100 > ind.revenueGrowth ? 2 : -2;
+    }
+    if (metrics.debtRatio && ind.debtToEquity) {
+      industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
+    }
+  }
+
+  // 3) advanced forecast
+  let advancedForecastPrice = null;
+  if (forecastModel && normalizationParams) {
+    try {
+      // get last 30 days
+      const last30 = await fetchTimeSeriesData(symbol, 30);
+      const featureKeys = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "peRatio",
+        "earningsGrowth",
+        "debtToEquity",
+      ];
+
+      const sequence = last30.map((day) => {
+        return featureKeys.map((k) => {
+          const val = day[k] ?? 0;
+          const { mean = 0, std = 1 } = normalizationParams[k] || {};
+          return std !== 0 ? (val - mean) / std : 0;
+        });
+      });
+      const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
+      const predictionTensor = forecastModel.predict(inputTensor);
+      const predVal = predictionTensor.dataSync()[0];
+      const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
+      advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
+    } catch (err) {
+      console.error(`Forecast error for finder ${symbol}:`, err.message);
+    }
+  }
+
+  // fallback
+  let finalForecastPrice = null;
+  if (
+    forecastCache[symbol] &&
+    Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+  ) {
+    finalForecastPrice = forecastCache[symbol].price;
+  } else {
+    if (!advancedForecastPrice) {
+      finalForecastPrice = await simpleForecastPrice(symbol, metrics.currentPrice);
+    } else {
+      if (Math.abs(advancedForecastPrice - metrics.currentPrice) < 0.01) {
+        finalForecastPrice = await simpleForecastPrice(symbol, metrics.currentPrice);
+      } else {
+        finalForecastPrice = advancedForecastPrice;
+      }
+    }
+    forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
+  }
+
+  // 4) combined
+  const forecastGrowthPercent =
+    ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+  const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+  const combinedScore = 0.3 * fundamentalRating + 0.7 * forecastGrowthPercent;
+
+  // 5) classification with intent="buy"
+  let finalClassification;
+  if (combinedScore >= 30) {
+    finalClassification = "growth";
+  } else if (combinedScore >= 10) {
+    finalClassification = "growth";
+  } else if (combinedScore >= -5) {
+    finalClassification = "stable";
+  } else {
+    finalClassification = "unstable";
+  }
+
+  return {
+    classification: finalClassification,
+    currentPrice: metrics.currentPrice,
+  };
 }
 
 // ----------------- Finder Endpoints -----------------
@@ -688,24 +797,36 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
+
     const filtered = [];
     for (const s of allStocks) {
+      // Filter by exchange first
       if (s.exchange && s.exchange.toUpperCase() !== exchange) continue;
       try {
-        const data = await fetchStockData(s.symbol);
-        const currentPrice = data?.price?.regularMarketPrice;
-        if (!currentPrice) continue;
-        if (currentPrice < minPrice || currentPrice > maxPrice) continue;
-        const { classification } = await classifyStockForBuy(s.symbol);
-        if (stockType === "growth" && classification !== "growth") continue;
-        if (stockType === "stable" && classification !== "stable") continue;
-        if (stockType === "unstable" && classification !== "unstable") continue;
-        filtered.push({ symbol: s.symbol, exchange: s.exchange || "N/A" });
+        // We'll run the advanced classification for "buy" intent
+        const { classification, currentPrice } = await advancedClassifyStockForBuy(s.symbol);
+
+        // Then check price range
+        if (currentPrice < minPrice || currentPrice > maxPrice) {
+          continue;
+        }
+        // Finally check if classification matches requested type
+        if (classification !== stockType) {
+          continue;
+        }
+
+        filtered.push({
+          symbol: s.symbol,
+          exchange: s.exchange || "N/A",
+          classification,
+          currentPrice,
+        });
       } catch (err) {
         console.warn(`Finder: skipping ${s.symbol} due to error: ${err.message}`);
         continue;
       }
     }
+
     return res.json({ stocks: filtered });
   } catch (error) {
     console.error("Finder error:", error.message);
