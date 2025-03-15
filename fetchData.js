@@ -19,7 +19,7 @@ const yahooFinance = require("yahoo-finance2").default;
 const historicalDataCache = {};
 
 /** The path to your CSV file */
-const CSV_FILE = path.join(__dirname, "historicalData.csv");
+const CSV_FILE = path.join(__dirname, "data", "historicalData.csv");
 
 /** 
  * Helper to parse CSV lines.
