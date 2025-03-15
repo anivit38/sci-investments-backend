@@ -3,16 +3,6 @@
  * FINDER, DASHBOARD, FORECASTING, COMMUNITY
  *******************************************/
 
-/* 
-   ────────────────────────────────────────────────────────────
-   NOTE: This server uses:
-   - fetchData.js for loading CSV data into memory
-   - "symbols.json" for the list of stocks
-   - "historicalData.csv" to provide the daily data
-   - TF model for advanced forecasting
-   ────────────────────────────────────────────────────────────
-*/
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -242,7 +232,18 @@ async function simpleForecastPrice(symbol, currentPrice) {
 const stockDataCache = {};
 const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
+// Helper: if the symbol’s exchange is TSX (per symbols.json), adjust for Yahoo Finance
+function adjustSymbolForYahoo(symbol) {
+  // allStocks is loaded later from symbols.json (see section 18)
+  const found = allStocks.find(s => (typeof s === "string" ? s === symbol : s.symbol === symbol));
+  if (found && found.exchange && found.exchange.toUpperCase() === "TSX") {
+    return symbol + ".TO";
+  }
+  return symbol;
+}
+
 async function fetchStockData(symbol) {
+  const adjustedSymbol = adjustSymbolForYahoo(symbol);
   const now = Date.now();
   const marketOpen = isMarketOpen();
   if (!marketOpen && stockDataCache[symbol]) {
@@ -253,11 +254,11 @@ async function fetchStockData(symbol) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-  console.log(`Fetching fresh data for ${symbol}`);
+  console.log(`Fetching fresh data for ${symbol} (as ${adjustedSymbol})`);
   const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
     const data = await yahooFinance.quoteSummary(
-      symbol,
+      adjustedSymbol,
       { modules, validateResult: false },
       { fetchOptions: requestOptions }
     );
@@ -307,10 +308,12 @@ app.post("/api/stock-history", async (req, res) => {
     default: days = 30; break;
   }
   try {
+    // Adjust symbol if needed
+    const adjustedSymbol = adjustSymbolForYahoo(symbol);
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
     const historicalData = await yahooFinance.historical(
-      symbol,
+      adjustedSymbol,
       { period1: startDate, period2: endDate, interval: "1d" },
       { fetchOptions: requestOptions }
     );
@@ -436,14 +439,11 @@ app.post("/api/check-stock", async (req, res) => {
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
-    // Adjusted PE Ratio criteria: widen upper bound to 25, and soften penalty if >30
     if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
     else if (metrics.peRatio > 30) baseScore -= 1;
-    // Adjusted Earnings Growth: lower threshold from 0.2 to 0.15, and mid-tier from 0.05 to 0.03
     if (metrics.earningsGrowth > 0.15) baseScore += 4;
     else if (metrics.earningsGrowth > 0.03) baseScore += 2;
     else if (metrics.earningsGrowth < 0) baseScore -= 2;
-    // Adjusted Debt Ratio: softer penalty for high debt
     if (metrics.debtRatio < 0.3) baseScore += 3;
     else if (metrics.debtRatio > 1) baseScore -= 1;
 
@@ -620,7 +620,6 @@ async function classifyStockForBuy(symbol) {
     fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
   };
 
-  // UPDATED scoring parameters as in check-stock:
   if (metrics.volume > computedAvgVolume * 1.2) score += 3;
   else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
   if (metrics.peRatio >= 5 && metrics.peRatio <= 25) score += 2;
@@ -730,7 +729,7 @@ app.post("/api/community-posts", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 17) Notifications Endpoint (Placeholder)
+// 17) Helper: Notifications (Placeholder)
 // ────────────────────────────────────────────────────────────
 app.get("/api/notifications", (req, res) => {
   return res.json({ notifications: [] });

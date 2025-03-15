@@ -61,7 +61,8 @@ async function fetchHistoricalData(symbol, startDate, endDate) {
     });
     return data || [];
   } catch (error) {
-    console.error(`Error fetching data for ${symbol} between ${formatDate(startDate)} and ${formatDate(endDate)}:`,
+    console.error(
+      `Error fetching data for ${symbol} between ${formatDate(startDate)} and ${formatDate(endDate)}:`,
       error.message
     );
     return [];
@@ -118,10 +119,17 @@ async function updateCSV() {
 
   // 4) For each symbol, fetch and keep the last 30 trading days
   for (const stock of symbols) {
+    // stock can be a string or an object with a symbol and exchange property.
     const symbol = typeof stock === "string" ? stock : stock.symbol;
-    console.log(`\n--- Processing ${symbol} ---`);
+    // Determine which ticker to fetch.
+    let fetchSymbol = symbol;
+    if (stock.exchange && stock.exchange.toUpperCase() === "TSX") {
+      // Append .TO for TSX symbols on Yahoo Finance.
+      fetchSymbol = symbol + ".TO";
+    }
+    console.log(`\n--- Processing ${symbol} (fetching as ${fetchSymbol}) ---`);
 
-    const historicalData = await fetchHistoricalData(symbol, startDate, endDate);
+    const historicalData = await fetchHistoricalData(fetchSymbol, startDate, endDate);
     if (!historicalData || historicalData.length === 0) {
       console.warn(`No data found for ${symbol}. Skipping.`);
       continue;
@@ -139,7 +147,7 @@ async function updateCSV() {
     for (const day of recentData) {
       const dateStr = formatDate(new Date(day.date));
       const newRow = {
-        symbol,
+        symbol, // use original symbol
         date: dateStr,
         open: day.open,
         high: day.high,
