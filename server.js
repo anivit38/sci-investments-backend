@@ -137,7 +137,7 @@ try {
 const app = express();
 app.use(
   cors({
-    origin: "https://sci-investments.web.app",
+    origin: "https://sci-investments.web.app", // or your domain
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
@@ -217,7 +217,9 @@ async function simpleForecastPrice(symbol, currentPrice) {
     const avgDailyReturn = count ? sumPct / count : 0;
     const forecast = currentPrice * (1 + avgDailyReturn);
     console.log(
-      `Simple forecast for ${symbol}: currentPrice=${currentPrice}, avgDailyReturn=${(avgDailyReturn * 100).toFixed(2)}%, forecast=${forecast.toFixed(2)}`
+      `Simple forecast for ${symbol}: currentPrice=${currentPrice}, avgDailyReturn=${(
+        avgDailyReturn * 100
+      ).toFixed(2)}%, forecast=${forecast.toFixed(2)}`
     );
     return forecast;
   } catch (err) {
@@ -401,7 +403,7 @@ app.get("/protected", (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 12) ADVANCED END-OF-DAY FORECASTING / STOCK CHECKER
+// 12) ADVANCED END-OF-DAY FORECASTING
 // ────────────────────────────────────────────────────────────
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
@@ -524,7 +526,9 @@ app.post("/api/check-stock", async (req, res) => {
       }
     } else {
       console.log(
-        `Advanced forecasting skipped for ${symbol} (data points: ${timeSeriesData ? timeSeriesData.length : 0}).`
+        `Advanced forecasting skipped for ${symbol} (data points: ${
+          timeSeriesData ? timeSeriesData.length : 0
+        }).`
       );
     }
 
@@ -546,39 +550,33 @@ app.post("/api/check-stock", async (req, res) => {
     const forecastGrowthPercent =
       ((finalForecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
 
-    // 7) Combined weighted score - now 10% fundamentals and 90% forecast
-    const combinedScore = 0.1 * fundamentalRating + 0.9 * forecastGrowthPercent;
+    // 7) Combined weighted score - heavier emphasis on forecast
+    const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
 
-    console.log(
-      `Symbol=${symbol}, fundamentalRating=${fundamentalRating}, forecastGrowthPercent=${forecastGrowthPercent.toFixed(
-        2
-      )}, combinedScore=${combinedScore.toFixed(2)}`
-    );
-
-    // 8) Classification & Advice with enhanced thresholds:
-    // If forecast growth is less than 1%, then we force classification as stable.
+    // 8) Classification & Advice with enhanced logic:
+    // For "buy" intent, if the forecast growth is less than 1%, classify as "stable"
     let finalClassification, finalAdvice;
     if (intent === "buy") {
       if (forecastGrowthPercent < 1) {
         finalClassification = "stable";
-        finalAdvice = "Low forecast growth (<1%), stock considered stable.";
+        finalAdvice = "Forecasted growth is less than 1%; consider this stock stable.";
       } else {
-        if (combinedScore >= 20) {
+        if (combinedScore >= 30) {
           finalClassification = "growth";
           finalAdvice = "Very Good Stock to Buy";
-        } else if (combinedScore >= 8) {
+        } else if (combinedScore >= 10) {
           finalClassification = "growth";
           finalAdvice = "Good Stock to Buy";
-        } else if (combinedScore >= 0) {
+        } else if (combinedScore >= -5) {
           finalClassification = "stable";
-          finalAdvice = "Mild Growth, but Mostly Stable Stock to Buy";
+          finalAdvice = "Okay Stock to Buy";
         } else {
           finalClassification = "unstable";
           finalAdvice = "Bad Stock to Buy";
         }
       }
     } else {
-      // SELL logic remains similar
+      // SELL logic remains unchanged
       if (forecastGrowthPercent > 7) {
         finalClassification = "stable";
         finalAdvice = "Hold the Stock (Forecast indicates growth)";
@@ -647,6 +645,7 @@ async function classifyStockForBuy(symbol) {
     fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
   };
 
+  // The same fundamental scoring approach:
   if (metrics.volume > computedAvgVolume * 1.2) score += 3;
   else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
   if (metrics.peRatio >= 5 && metrics.peRatio <= 25) score += 2;
@@ -703,7 +702,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         if (!currentPrice) continue;
         if (currentPrice < minPrice || currentPrice > maxPrice) continue;
 
-        // Quick classification for filtering
+        // Quick classification for stable/growth
         const { classification } = await classifyStockForBuy(sym);
         if (stockType === "growth" && classification !== "growth") continue;
         if (stockType === "stable" && classification !== "stable") continue;
