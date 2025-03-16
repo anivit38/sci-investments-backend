@@ -216,8 +216,7 @@ async function simpleForecastPrice(symbol, currentPrice) {
       }
     }
     const avgDailyReturn = count ? sumPct / count : 0;
-    const forecast = currentPrice * (1 + avgDailyReturn);
-    return forecast;
+    return currentPrice * (1 + avgDailyReturn);
   } catch (err) {
     console.error(`Error in simpleForecastPrice for ${symbol}:`, err.message);
     return currentPrice;
@@ -394,18 +393,90 @@ app.get("/protected", (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 12) Forecast/Classification Helper
-//    -> We unify the classification logic here
+// 12) Forecast/Classification + Fundamental Rating
+//    -> We unify classification on forecast, but still compute fundamental
 // ────────────────────────────────────────────────────────────
-async function getForecastClassification(symbol) {
+async function getForecastAndScores(symbol) {
   // 1) fetch fundamentals
   const stock = await fetchStockData(symbol);
   if (!stock || !stock.price) {
     throw new Error(`No price data for symbol ${symbol}`);
   }
-  const currentPrice = stock.price?.regularMarketPrice ?? 0;
 
-  // 2) advanced forecast if possible
+  const currentPrice = stock.price?.regularMarketPrice ?? 0;
+  const computedAvgVolume =
+    stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
+
+  // 2) gather metrics for fundamental rating
+  const metrics = {
+    volume: stock.price?.regularMarketVolume ?? 0,
+    currentPrice,
+    peRatio: stock.summaryDetail?.trailingPE ?? 0,
+    earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
+    debtRatio: stock.financialData?.debtToEquity ?? 0,
+    dayHigh: stock.price?.regularMarketDayHigh ?? 0,
+    dayLow: stock.price?.regularMarketDayLow ?? 0,
+    fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
+    fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
+  };
+
+  // Calculate fundamentalRating (purely informational)
+  let baseScore = 0;
+  // Volume
+  if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
+  else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
+  // PE Ratio
+  if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
+  else if (metrics.peRatio > 30) baseScore -= 1;
+  // Earnings Growth
+  if (metrics.earningsGrowth > 0.15) baseScore += 4;
+  else if (metrics.earningsGrowth > 0.03) baseScore += 2;
+  else if (metrics.earningsGrowth < 0) baseScore -= 2;
+  // Debt Ratio
+  if (metrics.debtRatio < 0.3) baseScore += 3;
+  else if (metrics.debtRatio > 1) baseScore -= 1;
+
+  // Day range
+  let dayScore = 0;
+  const dayRange = metrics.dayHigh - metrics.dayLow;
+  if (dayRange > 0) {
+    const dayPos = (currentPrice - metrics.dayLow) / dayRange;
+    if (dayPos < 0.2) dayScore = 1;
+    else if (dayPos > 0.8) dayScore = -1;
+  }
+
+  // 52-week range
+  let weekScore = 0;
+  const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+  if (weekRange > 0) {
+    const weekPos = (currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+    if (weekPos < 0.3) weekScore = 2;
+    else if (weekPos > 0.8) weekScore = -2;
+  }
+
+  // Industry comparison (optional)
+  let industryScore = 0;
+  const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+  if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+    const ind = industryMetrics[stockIndustry];
+    // Compare PE
+    if (metrics.peRatio && ind.peRatio) {
+      industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
+    }
+    // Compare earningsGrowth to industry revenueGrowth
+    if (metrics.earningsGrowth && ind.revenueGrowth) {
+      const stockEG = metrics.earningsGrowth * 100;
+      industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
+    }
+    // Compare debt ratio
+    if (metrics.debtRatio && ind.debtToEquity) {
+      industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
+    }
+  }
+
+  const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+
+  // 3) advanced forecast if possible
   let advancedForecastPrice = null;
   let timeSeriesData;
   try {
@@ -440,7 +511,7 @@ async function getForecastClassification(symbol) {
     }
   }
 
-  // 3) fallback if advanced forecast not available
+  // 4) fallback if advanced forecast not available
   let finalForecastPrice = null;
   if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
     finalForecastPrice = forecastCache[symbol].price;
@@ -453,10 +524,10 @@ async function getForecastClassification(symbol) {
     forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
   }
 
-  // 4) compute growth
+  // 5) compute forecast growth
   const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
 
-  // 5) classify
+  // 6) classification based ONLY on forecastGrowthPercent
   let classification;
   if (forecastGrowthPercent >= 2) {
     classification = "growth";
@@ -466,18 +537,24 @@ async function getForecastClassification(symbol) {
     classification = "unstable";
   }
 
+  // 7) combinedScore (for display only)
+  // For example: 20% weighting fundamental, 80% weighting forecast
+  const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
+
   return {
+    stock,
     classification,
     forecastGrowthPercent,
     finalForecastPrice,
-    currentPrice,
-    stock,
+    fundamentalRating,
+    combinedScore,
+    metrics,
   };
 }
 
 // ────────────────────────────────────────────────────────────
 // 13) /api/check-stock
-//    -> Uses the same getForecastClassification for consistency
+//    -> show fundamentalRating and combinedScore, but don't classify by them
 // ────────────────────────────────────────────────────────────
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
@@ -487,14 +564,16 @@ app.post("/api/check-stock", async (req, res) => {
 
   try {
     const {
+      stock,
       classification,
       forecastGrowthPercent,
       finalForecastPrice,
-      currentPrice,
-      stock,
-    } = await getForecastClassification(symbol);
+      fundamentalRating,
+      combinedScore,
+      metrics,
+    } = await getForecastAndScores(symbol);
 
-    // Additional "advice" message depending on classification
+    // Advice message
     let finalAdvice;
     if (classification === "growth") {
       finalAdvice =
@@ -507,21 +586,20 @@ app.post("/api/check-stock", async (req, res) => {
         "This stock is projected to decline. Consider selling or avoiding.";
     }
 
-    // You could customize advice further if the user says "intent = buy" or "sell"
-    // but for now let's keep it simple
     const forecastEndDate = getForecastEndTime();
 
-    // For reference, let's keep some metrics
-    const computedAvgVolume =
-      stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
-
-    // Return JSON
     return res.json({
       symbol,
       name: stock.price?.longName || symbol,
       industry: stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown",
+
+      // We show fundamentalRating and combinedScore but do NOT use them for classification
+      fundamentalRating: +fundamentalRating.toFixed(2),
+      combinedScore: +combinedScore.toFixed(2),
+
       classification,
       advice: finalAdvice,
+
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
         projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
@@ -529,20 +607,12 @@ app.post("/api/check-stock", async (req, res) => {
         forecastEndDate: forecastEndDate.toISOString(),
       },
       metrics: {
-        currentPrice,
-        volume: stock.price?.regularMarketVolume ?? 0,
-        avgVolume3Month: computedAvgVolume,
-        peRatio: stock.summaryDetail?.trailingPE ?? 0,
-        earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
-        debtRatio: stock.financialData?.debtToEquity ?? 0,
-        dayHigh: stock.price?.regularMarketDayHigh ?? 0,
-        dayLow: stock.price?.regularMarketDayLow ?? 0,
-        dayRange: (stock.price?.regularMarketDayHigh ?? 0) - (stock.price?.regularMarketDayLow ?? 0),
-        fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
-        fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
-        fiftyTwoWeekRange:
-          (stock.summaryDetail?.fiftyTwoWeekHigh ?? 0) -
-          (stock.summaryDetail?.fiftyTwoWeekLow ?? 0),
+        ...metrics,
+        // Already have dayRange, 52week range in metrics, but let's ensure we store them
+        dayRange: (metrics.dayHigh - metrics.dayLow).toFixed(2),
+        fiftyTwoWeekRange: (
+          metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow
+        ).toFixed(2),
       },
     });
   } catch (error) {
@@ -553,7 +623,8 @@ app.post("/api/check-stock", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────
 // 14) Finder Endpoints
-//    -> Now uses the same forecast-based classification
+//    -> now uses the same forecast-based classification
+//       but also can return fundamentalRating, combinedScore, etc.
 // ────────────────────────────────────────────────────────────
 const finderRouter = express.Router();
 finderRouter.post("/api/find-stocks", async (req, res) => {
@@ -574,7 +645,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       if (exch.toUpperCase() !== exchange) continue;
 
       try {
-        // Basic price check to skip unnecessary forecast calls
+        // Quick price check to skip forecast calls if out of range
         const data = await fetchStockData(sym);
         if (!data) {
           console.warn(`Finder: skipping ${sym} due to fetch error.`);
@@ -584,16 +655,13 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         if (!currentPrice) continue;
         if (currentPrice < minPrice || currentPrice > maxPrice) continue;
 
-        // Now do the forecast-based classification
-        const {
-          classification: forecastClass,
-          forecastGrowthPercent,
-        } = await getForecastClassification(sym);
+        // Full forecast-based classification
+        const { classification } = await getForecastAndScores(sym);
 
         // Filter out based on requested stockType
-        if (stockType === "growth" && forecastClass !== "growth") continue;
-        if (stockType === "stable" && forecastClass !== "stable") continue;
-        if (stockType === "unstable" && forecastClass !== "unstable") continue;
+        if (stockType === "growth" && classification !== "growth") continue;
+        if (stockType === "stable" && classification !== "stable") continue;
+        if (stockType === "unstable" && classification !== "unstable") continue;
 
         // If it matches, push it
         filtered.push({ symbol: sym, exchange: exch });
