@@ -467,49 +467,89 @@ app.post("/api/check-stock", async (req, res) => {
         .json({ message: "Stock not found or data unavailable." });
     }
 
-    // 2) Fundamental rating (kept for display only; not used for classification)
-    //    We'll do a simple approach just so you have a rating in the response
-    let fundamentalRating = 0;
+    // 2) Calculate metrics for info
     const computedAvgVolume =
       stock.summaryDetail?.averageDailyVolume3Month ||
       stock.price?.regularMarketVolume ||
       0;
-    const peRatio = stock.summaryDetail?.trailingPE ?? 0;
-    const earningsGrowth = stock.financialData?.earningsGrowth ?? 0;
-    const debtRatio = stock.financialData?.debtToEquity ?? 0;
-    // Volume check
-    if (stock.price?.regularMarketVolume > computedAvgVolume * 1.2) {
-      fundamentalRating += 2;
-    }
-    // PE ratio check
-    if (peRatio >= 5 && peRatio <= 25) {
-      fundamentalRating += 1;
-    }
-    // Earnings Growth
-    if (earningsGrowth > 0.05) {
-      fundamentalRating += 2;
-    }
-    // Debt ratio
-    if (debtRatio < 0.5) {
-      fundamentalRating += 2;
-    }
-
-    // 3) Metrics for the response
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
-      peRatio,
+      peRatio: stock.summaryDetail?.trailingPE ?? 0,
       pbRatio: stock.summaryDetail?.priceToBook ?? 0,
       dividendYield: stock.summaryDetail?.dividendYield ?? 0,
-      earningsGrowth,
-      debtRatio,
+      earningsGrowth: stock.financialData?.earningsGrowth ?? 0,
+      debtRatio: stock.financialData?.debtToEquity ?? 0,
       dayHigh: stock.price?.regularMarketDayHigh ?? 0,
       dayLow: stock.price?.regularMarketDayLow ?? 0,
       fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? 0,
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // 4) Forecast attempt using last 30 trading days
+    // ────────────────────────────────────────────────────────
+    // (A) Compute a "fundamentalRating" for display
+    // ────────────────────────────────────────────────────────
+    let baseScore = 0;
+    // Volume
+    if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
+    else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
+    // PE Ratio
+    if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
+    else if (metrics.peRatio > 30) baseScore -= 1;
+    // Earnings Growth
+    if (metrics.earningsGrowth > 0.15) baseScore += 4;
+    else if (metrics.earningsGrowth > 0.03) baseScore += 2;
+    else if (metrics.earningsGrowth < 0) baseScore -= 2;
+    // Debt Ratio
+    if (metrics.debtRatio < 0.3) baseScore += 3;
+    else if (metrics.debtRatio > 1) baseScore -= 1;
+
+    // Day range
+    let dayScore = 0;
+    const dayRange = metrics.dayHigh - metrics.dayLow;
+    if (dayRange > 0) {
+      const dayPos = (metrics.currentPrice - metrics.dayLow) / dayRange;
+      if (dayPos < 0.2) dayScore = 1;
+      else if (dayPos > 0.8) dayScore = -1;
+    }
+
+    // 52-week range
+    let weekScore = 0;
+    const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
+    if (weekRange > 0) {
+      const weekPos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+      if (weekPos < 0.3) weekScore = 2;
+      else if (weekPos > 0.8) weekScore = -2;
+    }
+
+    // Industry
+    let industryScore = 0;
+    const stockIndustry =
+      stock.assetProfile?.industry ||
+      stock.assetProfile?.sector ||
+      "Unknown";
+    if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
+      const ind = industryMetrics[stockIndustry];
+      // Compare PE
+      if (metrics.peRatio && ind.peRatio) {
+        industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
+      }
+      // Compare earningsGrowth to industry revenueGrowth
+      if (metrics.earningsGrowth && ind.revenueGrowth) {
+        const stockEG = metrics.earningsGrowth * 100;
+        industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
+      }
+      // Compare debt ratio
+      if (metrics.debtRatio && ind.debtToEquity) {
+        industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
+      }
+    }
+
+    const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
+
+    // ────────────────────────────────────────────────────────
+    // (B) Advanced forecasting attempt using last 30 days
+    // ────────────────────────────────────────────────────────
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
@@ -520,7 +560,6 @@ app.post("/api/check-stock", async (req, res) => {
         e.message
       );
     }
-
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
         const featureKeys = [
@@ -558,10 +597,13 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // 5) Fallback forecast if advanced is missing or nearly identical to current
+    // (C) Fallback forecast if advanced missing
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
-    if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
+    if (
+      forecastCache[symbol] &&
+      Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+    ) {
       finalForecastPrice = forecastCache[symbol].price;
       console.log(`Using cached forecast for ${symbol}: ${finalForecastPrice}`);
     } else {
@@ -576,11 +618,18 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // 6) Calculate forecast growth percentage
+    // (D) Forecast growth
     const forecastGrowthPercent =
       ((finalForecastPrice - currentPrice) / currentPrice) * 100;
 
-    // 7) Classification based solely on forecasted growth
+    // ────────────────────────────────────────────────────────
+    // (E) Combined Score (for display only)
+    //     0.2 * fundamentalRating + 0.8 * forecastGrowth
+    // ────────────────────────────────────────────────────────
+    const combinedScore =
+      0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
+
+    // (F) Classification based solely on forecastGrowthPercent
     let finalClassification, finalAdvice;
     if (forecastGrowthPercent >= 2) {
       finalClassification = "growth";
@@ -597,7 +646,6 @@ app.post("/api/check-stock", async (req, res) => {
 
     const forecastEndDate = getForecastEndTime();
     const stockName = stock.price?.longName || symbol;
-    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     const stockRevenueGrowth =
       stockIndustry !== "Unknown" &&
       industryMetrics[stockIndustry] &&
@@ -605,13 +653,16 @@ app.post("/api/check-stock", async (req, res) => {
         ? industryMetrics[stockIndustry].revenueGrowth
         : 0;
 
-    // Return the result
+    //  Return the result
     return res.json({
       symbol,
       name: stockName,
       industry: stockIndustry,
-      // Keep fundamentalRating in the response but not used for classification
-      fundamentalRating: fundamentalRating.toFixed(1),
+
+      // These two are now displayed (not used for classification):
+      fundamentalRating: fundamentalRating.toFixed(2),
+      combinedScore: combinedScore.toFixed(2),
+
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
         projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
@@ -637,28 +688,23 @@ app.post("/api/check-stock", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────
 // 13) Forecast-based classification for Finder
-//     (instead of old fundamental approach)
+//     (unchanged except that it calls fetchStockData and
+//      classifyStockByForecast for classification)
 // ────────────────────────────────────────────────────────────
 async function classifyStockByForecast(symbol) {
-  // We'll do a quick forecast approach, similar to /api/check-stock,
-  // but less verbose. You could also re-use code if you prefer.
   const data = await fetchStockData(symbol);
   if (!data || !data.price) {
     throw new Error(`No price data for symbol ${symbol}`);
   }
   const currentPrice = data.price.regularMarketPrice ?? 0;
 
-  // Attempt advanced forecast or fallback
   let finalForecastPrice = null;
-
-  // Check local forecast cache
   if (
     forecastCache[symbol] &&
     Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
   ) {
     finalForecastPrice = forecastCache[symbol].price;
   } else {
-    // Attempt advanced
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
@@ -679,7 +725,6 @@ async function classifyStockByForecast(symbol) {
           "earningsGrowth",
           "debtToEquity",
         ];
-        // We don't have all those keys from CSV unless you do. We'll assume you do.
         const sequence = timeSeriesData.map((day) =>
           featureKeys.map((k) => {
             const val = day[k] ?? 0;
@@ -693,7 +738,7 @@ async function classifyStockByForecast(symbol) {
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
         advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
       } catch {
-        // advanced forecast error, ignore
+        // advanced forecast error
       }
     }
 
@@ -703,18 +748,14 @@ async function classifyStockByForecast(symbol) {
     ) {
       finalForecastPrice = advancedForecastPrice;
     } else {
-      // fallback to simple forecast
       finalForecastPrice = await simpleForecastPrice(symbol, currentPrice);
     }
-    // cache it
     forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
   }
 
   if (!finalForecastPrice || !currentPrice || currentPrice <= 0) {
-    // If no forecast or no price, default to "unstable"
     return { classification: "unstable" };
   }
-
   const forecastGrowthPercent =
     ((finalForecastPrice - currentPrice) / currentPrice) * 100;
 
@@ -723,9 +764,6 @@ async function classifyStockByForecast(symbol) {
   return { classification: "unstable" };
 }
 
-// ────────────────────────────────────────────────────────────
-// 14) Finder Endpoints
-// ────────────────────────────────────────────────────────────
 const finderRouter = express.Router();
 finderRouter.post("/api/find-stocks", async (req, res) => {
   try {
@@ -745,10 +783,8 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     for (const s of allStocks) {
       const sym = typeof s === "string" ? s : s.symbol;
       const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
-      // Skip if not matching exchange
       if (exch.toUpperCase() !== exchange) continue;
 
-      // Skip if price out of range
       let data = null;
       try {
         data = await fetchStockData(sym);
@@ -768,10 +804,8 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       try {
         const { classification } = await classifyStockByForecast(sym);
         if (classification !== stockType) {
-          // skip if doesn't match user's desired classification
           continue;
         }
-        // If it matches, push it
         filtered.push({ symbol: sym, exchange: exch });
       } catch (err) {
         console.warn(`Finder classification error for ${sym}: ${err.message}`);
