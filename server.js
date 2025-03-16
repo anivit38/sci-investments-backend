@@ -48,7 +48,7 @@ function sendSellNotification(symbol, currentPrice, reasons) {
   };
   transporter.sendMail(mailOptions, (error, info) => {
     if (error) {
-      console.error("Error sending notification email:", error);
+      console.error("Error sending notification email:", error.message);
     } else {
       console.log("Notification email sent:", info.response);
     }
@@ -237,14 +237,19 @@ const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
+
+  // If market is closed and we have something cached, use it
   if (!marketOpen && stockDataCache[symbol]) {
     console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
+
+  // If we have something cached recently, use it
   if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
+
   console.log(`Fetching fresh data for ${symbol}`);
   const modules = ["financialData", "price", "summaryDetail", "defaultKeyStatistics", "assetProfile"];
   try {
@@ -261,10 +266,12 @@ async function fetchStockData(symbol) {
   } catch (err) {
     if (err.message.includes("Unexpected token")) {
       console.error(`❌ Possibly rate-limited or captcha from Yahoo for ${symbol}:`, err.message);
+      // Return null so that we skip this symbol
+      return null;
     } else {
       console.error(`❌ Error fetching data for ${symbol}:`, err.message);
+      return null;
     }
-    return null;
   }
 }
 
@@ -410,6 +417,7 @@ app.post("/api/check-stock", async (req, res) => {
   if (!symbol || !intent) {
     return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
+
   try {
     // 1) Fetch current fundamentals
     let stock;
@@ -485,7 +493,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
       // Compare earningsGrowth to industry revenueGrowth
       if (metrics.earningsGrowth && ind.revenueGrowth) {
-        const stockEG = metrics.earningsGrowth * 100;
+        const stockEG = metrics.earningsGrowth * 100; // e.g., 0.07 => 7
         industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
       }
       // Compare debt ratio
@@ -494,6 +502,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
+    // This is our fundamentalRating
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
     // 4) Advanced forecasting attempt using last 30 trading days
@@ -516,6 +525,7 @@ app.post("/api/check-stock", async (req, res) => {
         );
         const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
         console.log("Time-series input shape:", inputTensor.shape);
+
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -532,7 +542,7 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // 5) Fallback forecast
+    // 5) Fallback forecast if advancedForecastPrice is not valid or near current
     let finalForecastPrice = null;
     if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
       finalForecastPrice = forecastCache[symbol].price;
@@ -553,14 +563,18 @@ app.post("/api/check-stock", async (req, res) => {
     // 7) Combined weighted score - heavier emphasis on forecast
     const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
 
-    // 8) Classification & Advice with enhanced logic:
-    // For "buy" intent, if the forecast growth is less than 1%, classify as "stable"
+    // 8) Classification & Advice
+    //    - If forecastGrowthPercent < 1%, treat as stable (for a buy).
+    //    - Else do normal combinedScore classification.
     let finalClassification, finalAdvice;
+
     if (intent === "buy") {
       if (forecastGrowthPercent < 1) {
+        // Force stable classification if next-day growth is < 1%
         finalClassification = "stable";
-        finalAdvice = "Forecasted growth is less than 1%; consider this stock stable.";
+        finalAdvice = "Likely stable or minimal growth.";
       } else {
+        // Otherwise, use combinedScore
         if (combinedScore >= 30) {
           finalClassification = "growth";
           finalAdvice = "Very Good Stock to Buy";
@@ -576,7 +590,7 @@ app.post("/api/check-stock", async (req, res) => {
         }
       }
     } else {
-      // SELL logic remains unchanged
+      // SELL logic
       if (forecastGrowthPercent > 7) {
         finalClassification = "stable";
         finalAdvice = "Hold the Stock (Forecast indicates growth)";
@@ -586,6 +600,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
+    // 9) Final output
     const forecastEndDate = getForecastEndTime();
     const stockName = stock.price?.longName || symbol;
     const stockRevenueGrowth =
@@ -645,7 +660,7 @@ async function classifyStockForBuy(symbol) {
     fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
   };
 
-  // The same fundamental scoring approach:
+  // Basic fundamental scoring (without advanced forecast).
   if (metrics.volume > computedAvgVolume * 1.2) score += 3;
   else if (metrics.volume < computedAvgVolume * 0.8) score -= 2;
   if (metrics.peRatio >= 5 && metrics.peRatio <= 25) score += 2;
@@ -663,6 +678,7 @@ async function classifyStockForBuy(symbol) {
     else if (pos > 0.8) score -= 2;
   }
 
+  // Return classification only based on fundamental score
   if (score >= 5) return { classification: "growth" };
   if (score >= 0) return { classification: "stable" };
   return { classification: "unstable" };
@@ -702,7 +718,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         if (!currentPrice) continue;
         if (currentPrice < minPrice || currentPrice > maxPrice) continue;
 
-        // Quick classification for stable/growth
+        // We'll do a quick classification for stable/growth based on fundamentals
         const { classification } = await classifyStockForBuy(sym);
         if (stockType === "growth" && classification !== "growth") continue;
         if (stockType === "stable" && classification !== "stable") continue;
@@ -787,7 +803,7 @@ if (fs.existsSync(SYMBOLS_JSON_PATH)) {
     allStocks = JSON.parse(rawContent);
     console.log(`✅ Loaded ${allStocks.length} stocks from symbols.json`);
   } catch (err) {
-    console.error("Error parsing symbols.json:", err);
+    console.error("Error parsing symbols.json:", err.message);
     allStocks = [];
   }
 } else {
@@ -916,7 +932,7 @@ app.post("/api/execute-trade", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 18) Daily Job: Refresh All Historical Data
+// 19) Daily Job: Refresh All Historical Data
 // ────────────────────────────────────────────────────────────
 const ONE_DAY = 24 * 60 * 60 * 1000;
 async function refreshAllHistoricalData() {
@@ -928,7 +944,7 @@ async function refreshAllHistoricalData() {
     const raw = fs.readFileSync(SYMBOLS_JSON_PATH, "utf-8");
     const symbols = JSON.parse(raw);
     await fetchAllSymbolsHistoricalData(symbols, 1);
-    // Optionally, update CSV here
+    // Optionally, update CSV here if desired
   } catch (err) {
     console.error("Error in refreshAllHistoricalData:", err.message);
   }
@@ -940,7 +956,7 @@ setInterval(() => {
 }, ONE_DAY);
 
 // ────────────────────────────────────────────────────────────
-// 19) Start the Server
+// 20) Start the Server
 // ────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
