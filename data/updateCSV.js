@@ -11,8 +11,7 @@ const SYMBOLS_JSON = path.join(__dirname, "../symbols.json");
 
 const ONE_DAY = 24 * 60 * 60 * 1000;
 const TRADING_DAYS_REQUIRED = 30;
-// Extended historical window from 45 to 90 calendar days
-const LOOKBACK_CALENDAR_DAYS = 90;
+const LOOKBACK_CALENDAR_DAYS = 45; // look back ~45 calendar days
 
 function parseCSV(data) {
   const lines = data.trim().split("\n");
