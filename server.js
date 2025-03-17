@@ -16,7 +16,7 @@ const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
 const nodemailer = require("nodemailer");
 
-// (NEW) For password reset token generation
+// ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
 // ────────────────────────────────────────────────────────────
@@ -410,7 +410,9 @@ app.post("/signup", async (req, res) => {
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
-    return res.status(400).json({ message: "Username and password are required." });
+    return res
+      .status(400)
+      .json({ message: "Username and password are required." });
   }
   try {
     const user = await UserModel.findOne({ username });
@@ -421,9 +423,13 @@ app.post("/login", async (req, res) => {
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, {
-      expiresIn: "24h",
-    });
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      JWT_SECRET,
+      {
+        expiresIn: "24h",
+      }
+    );
     console.log("✅ Login Successful:", username);
     return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
@@ -442,73 +448,6 @@ app.get("/protected", (req, res) => {
       .json({ message: "Protected data accessed.", user: decoded });
   } catch (error) {
     return res.status(401).json({ message: "Invalid or expired token." });
-  }
-});
-
-// (NEW) Password Reset Endpoints
-// ────────────────────────────────────────────────────────────
-const resetTokens = {}; // In-memory store for tokens (consider using a database for production)
-
-app.post("/forgotPassword", async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ message: "Email is required." });
-    }
-    const user = await UserModel.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ message: "No account found with that email." });
-    }
-    // Generate a reset token
-    const token = crypto.randomBytes(32).toString("hex");
-    const expiresAt = Date.now() + 60 * 60 * 1000; // expires in 1 hour
-    resetTokens[token] = { email, expiresAt };
-
-    // Construct the reset link (adjust the URL if needed)
-    const resetLink = `https://sci-investments.web.app/resetPassword.html?token=${token}`;
-
-    // Send email
-    const mailOptions = {
-      from: process.env.NOTIFY_EMAIL,
-      to: email,
-      subject: "SCI Investments - Password Reset",
-      text: `You requested a password reset. Click the link to reset your password: ${resetLink}\n\nThis link will expire in 1 hour.`,
-    };
-    await transporter.sendMail(mailOptions);
-    return res.json({ message: "A password reset link has been sent to your email." });
-  } catch (err) {
-    console.error("Error in /forgotPassword:", err.message);
-    return res.status(500).json({ message: "Error processing forgot password request." });
-  }
-});
-
-app.post("/resetPassword", async (req, res) => {
-  try {
-    const { token, newPassword } = req.body;
-    if (!token || !newPassword) {
-      return res.status(400).json({ message: "Token and newPassword are required." });
-    }
-    const tokenData = resetTokens[token];
-    if (!tokenData) {
-      return res.status(400).json({ message: "Invalid or expired reset token." });
-    }
-    const { email, expiresAt } = tokenData;
-    if (Date.now() > expiresAt) {
-      delete resetTokens[token];
-      return res.status(400).json({ message: "Reset token has expired." });
-    }
-    const user = await UserModel.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ message: "User not found for this token." });
-    }
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    user.password = hashedPassword;
-    await user.save();
-    delete resetTokens[token];
-    return res.json({ message: "Password has been reset successfully!" });
-  } catch (err) {
-    console.error("Error in /resetPassword:", err.message);
-    return res.status(500).json({ message: "Error resetting password." });
   }
 });
 
@@ -560,15 +499,21 @@ app.post("/api/check-stock", async (req, res) => {
     // (A) Compute a "fundamentalRating" for display
     // ────────────────────────────────────────────────────────
     let baseScore = 0;
+    // Volume
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
+    // PE Ratio
     if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
     else if (metrics.peRatio > 30) baseScore -= 1;
+    // Earnings Growth
     if (metrics.earningsGrowth > 0.15) baseScore += 4;
     else if (metrics.earningsGrowth > 0.03) baseScore += 2;
     else if (metrics.earningsGrowth < 0) baseScore -= 2;
+    // Debt Ratio
     if (metrics.debtRatio < 0.3) baseScore += 3;
     else if (metrics.debtRatio > 1) baseScore -= 1;
+
+    // Day range
     let dayScore = 0;
     const dayRange = metrics.dayHigh - metrics.dayLow;
     if (dayRange > 0) {
@@ -576,6 +521,8 @@ app.post("/api/check-stock", async (req, res) => {
       if (dayPos < 0.2) dayScore = 1;
       else if (dayPos > 0.8) dayScore = -1;
     }
+
+    // 52-week range
     let weekScore = 0;
     const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     if (weekRange > 0) {
@@ -583,6 +530,8 @@ app.post("/api/check-stock", async (req, res) => {
       if (weekPos < 0.3) weekScore = 2;
       else if (weekPos > 0.8) weekScore = -2;
     }
+
+    // Industry
     let industryScore = 0;
     const stockIndustry =
       stock.assetProfile?.industry ||
@@ -590,17 +539,21 @@ app.post("/api/check-stock", async (req, res) => {
       "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
+      // Compare PE
       if (metrics.peRatio && ind.peRatio) {
         industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
       }
+      // Compare earningsGrowth to industry revenueGrowth
       if (metrics.earningsGrowth && ind.revenueGrowth) {
         const stockEG = metrics.earningsGrowth * 100;
         industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
       }
+      // Compare debt ratio
       if (metrics.debtRatio && ind.debtToEquity) {
         industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
       }
     }
+
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
     // ────────────────────────────────────────────────────────
@@ -653,9 +606,7 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // ────────────────────────────────────────────────────────
     // (C) Fallback forecast if advanced missing
-    // ────────────────────────────────────────────────────────
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
     if (
@@ -676,7 +627,6 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // ────────────────────────────────────────────────────────
     // (D) Forecast growth
     const forecastGrowthPercent =
       ((finalForecastPrice - currentPrice) / currentPrice) * 100;
@@ -688,7 +638,6 @@ app.post("/api/check-stock", async (req, res) => {
     const combinedScore =
       0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
 
-    // ────────────────────────────────────────────────────────
     // (F) Classification based solely on forecastGrowthPercent
     let finalClassification, finalAdvice;
     if (forecastGrowthPercent >= 2) {
@@ -713,12 +662,16 @@ app.post("/api/check-stock", async (req, res) => {
         ? industryMetrics[stockIndustry].revenueGrowth
         : 0;
 
+    //  Return the result
     return res.json({
       symbol,
       name: stockName,
       industry: stockIndustry,
+
+      // These two are now displayed (not used for classification):
       fundamentalRating: fundamentalRating.toFixed(2),
       combinedScore: combinedScore.toFixed(2),
+
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
         projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
@@ -768,6 +721,7 @@ async function classifyStockByForecast(symbol) {
     } catch {
       // not enough data
     }
+
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
         const featureKeys = [
@@ -796,6 +750,7 @@ async function classifyStockByForecast(symbol) {
         // advanced forecast error
       }
     }
+
     if (
       advancedForecastPrice &&
       Math.abs(advancedForecastPrice - currentPrice) > 0.01
@@ -832,11 +787,13 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     ) {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
+
     const filtered = [];
     for (const s of allStocks) {
       const sym = typeof s === "string" ? s : s.symbol;
       const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
       if (exch.toUpperCase() !== exchange) continue;
+
       let data = null;
       try {
         data = await fetchStockData(sym);
@@ -851,6 +808,8 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       const currentPrice = data.price.regularMarketPrice;
       if (!currentPrice) continue;
       if (currentPrice < minPrice || currentPrice > maxPrice) continue;
+
+      // Classify by forecast
       try {
         const { classification } = await classifyStockByForecast(sym);
         if (classification !== stockType) {
@@ -862,6 +821,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         continue;
       }
     }
+
     return res.json({ stocks: filtered });
   } catch (error) {
     console.error("Finder error:", error.message);
@@ -1107,4 +1067,96 @@ setInterval(() => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Combined server running on port ${PORT}`);
+});
+
+// ────────────────────────────────────────────────────────────
+// 20) FORGOT/RESET PASSWORD LOGIC (Appended at the bottom)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * We assume your User schema can store:
+ *  - resetPasswordToken: String
+ *  - resetPasswordExpires: Date
+ * If not, add them or use Mongoose schema extension.
+ */
+
+app.post("/forgotPassword", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ message: "Email is required." });
+    }
+
+    // Find user by email
+    const user = await UserModel.findOne({ email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ message: "No account with that email found." });
+    }
+
+    // Generate token
+    const token = crypto.randomBytes(20).toString("hex");
+    // Set expiration to 1 hour from now
+    const expires = Date.now() + 3600000;
+
+    // Update user
+    user.resetPasswordToken = token;
+    user.resetPasswordExpires = expires;
+    await user.save();
+
+    // Send email with link
+    const resetURL = `https://sci-investments.web.app/resetPassword.html?token=${token}`;
+    const mailOptions = {
+      from: process.env.NOTIFY_EMAIL,
+      to: user.email,
+      subject: "Password Reset Request",
+      text: `You requested a password reset. Click the link below or copy/paste into your browser.\n\n${resetURL}\n\nThis link is valid for 1 hour.`,
+    };
+    await transporter.sendMail(mailOptions);
+
+    return res.json({ message: "Reset link sent! Check your email." });
+  } catch (err) {
+    console.error("Error in /forgotPassword:", err.message);
+    return res
+      .status(500)
+      .json({ message: "Error sending reset link. Please try again." });
+  }
+});
+
+app.post("/resetPassword", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+      return res
+        .status(400)
+        .json({ message: "Token and newPassword are required." });
+    }
+
+    // Find user with matching token & unexpired
+    const user = await UserModel.findOne({
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: Date.now() }, // must be greater than now
+    });
+    if (!user) {
+      return res
+        .status(400)
+        .json({ message: "Reset token is invalid or has expired." });
+    }
+
+    // Update password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    // Clear the token fields
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    return res.json({ message: "Password has been reset successfully!" });
+  } catch (err) {
+    console.error("Error in /resetPassword:", err.message);
+    return res
+      .status(500)
+      .json({ message: "Error resetting password. Please try again." });
+  }
 });
