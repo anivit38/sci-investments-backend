@@ -443,7 +443,74 @@ app.get("/protected", (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 12) ADVANCED END-OF-DAY FORECASTING / STOCK CHECKER
+// 12) Forgot Password & Reset Password Endpoints
+// ────────────────────────────────────────────────────────────
+
+// Endpoint to request a password reset link
+app.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: "Email is required." });
+
+  try {
+    const user = await UserModel.findOne({ email });
+    // For security, don't reveal if the user exists or not
+    if (!user) return res.status(200).json({ message: "If that email exists, a reset link has been sent." });
+
+    // Create a reset token valid for 1 hour
+    const resetToken = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: "1h" });
+
+    // Construct reset URL (adjust the URL to your frontend reset page)
+    const resetURL = `https://your-frontend-domain/resetPassword.html?token=${resetToken}`;
+
+    // Send email with reset link
+    const mailOptions = {
+      from: process.env.NOTIFY_EMAIL,
+      to: email,
+      subject: "Password Reset Request",
+      text: `You requested a password reset. Click the link below to reset your password. This link will expire in 1 hour.\n\n${resetURL}`,
+    };
+
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
+        console.error("Error sending password reset email:", error);
+        return res.status(500).json({ message: "Error sending password reset email." });
+      } else {
+        console.log("Password reset email sent:", info.response);
+        return res.status(200).json({ message: "If that email exists, a reset link has been sent." });
+      }
+    });
+  } catch (error) {
+    console.error("Error in forgot-password endpoint:", error.message);
+    return res.status(500).json({ message: "Error processing password reset request." });
+  }
+});
+
+// Endpoint to reset password using token
+app.post("/reset-password", async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword)
+    return res.status(400).json({ message: "Token and new password are required." });
+
+  try {
+    // Verify token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.userId;
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update user's password
+    await UserModel.findByIdAndUpdate(userId, { password: hashedPassword });
+
+    return res.status(200).json({ message: "Password reset successful." });
+  } catch (error) {
+    console.error("Error in reset-password endpoint:", error.message);
+    return res.status(500).json({ message: "Error resetting password." });
+  }
+});
+
+// ────────────────────────────────────────────────────────────
+// 13) ADVANCED END-OF-DAY FORECASTING / STOCK CHECKER
 // ────────────────────────────────────────────────────────────
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
