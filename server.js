@@ -447,7 +447,7 @@ app.get("/protected", (req, res) => {
 // ────────────────────────────────────────────────────────────
 
 // Endpoint to request a password reset link
-app.post("/forgot-password", async (req, res) => {
+app.post("/forgotPassword", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required." });
 
@@ -480,7 +480,7 @@ app.post("/forgot-password", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Error in forgot-password endpoint:", error.message);
+    console.error("Error in forgotPassword endpoint:", error.message);
     return res.status(500).json({ message: "Error processing password reset request." });
   }
 });
