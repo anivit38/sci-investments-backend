@@ -141,6 +141,7 @@ try {
 // ────────────────────────────────────────────────────────────
 const app = express();
 
+// Expand CORS origins to allow both your frontend & localhost
 app.use(
   cors({
     origin: [
@@ -365,7 +366,7 @@ app.post("/api/stock-history", async (req, res) => {
 // ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("✅ Combined Server is running!"));
 
-// SIGNUP: uses email, username, and password
+// SIGNUP uses email, username, and password
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
   if (!email || !username || !password) {
@@ -387,9 +388,9 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-// LOGIN: now uses email and password so that it matches forgotPassword logic
+// LOGIN now uses email (instead of username)
 app.post("/login", async (req, res) => {
-  const { email, password } = req.body; // using email instead of username
+  const { email, password } = req.body; // CHANGED: using email instead of username
   if (!email || !password) {
     return res.status(400).json({ message: "Email and password are required." });
   }
@@ -432,7 +433,9 @@ app.get("/protected", (req, res) => {
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
   if (!symbol || !intent) {
-    return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
+    return res
+      .status(400)
+      .json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
   try {
     // 1) Fetch current fundamentals
@@ -468,16 +471,21 @@ app.post("/api/check-stock", async (req, res) => {
 
     // (A) Compute a "fundamentalRating" for display
     let baseScore = 0;
+    // Volume
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
+    // PE Ratio
     if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
     else if (metrics.peRatio > 30) baseScore -= 1;
+    // Earnings Growth
     if (metrics.earningsGrowth > 0.15) baseScore += 4;
     else if (metrics.earningsGrowth > 0.03) baseScore += 2;
     else if (metrics.earningsGrowth < 0) baseScore -= 2;
+    // Debt Ratio
     if (metrics.debtRatio < 0.3) baseScore += 3;
     else if (metrics.debtRatio > 1) baseScore -= 1;
 
+    // Day range
     let dayScore = 0;
     const dayRange = metrics.dayHigh - metrics.dayLow;
     if (dayRange > 0) {
@@ -486,6 +494,7 @@ app.post("/api/check-stock", async (req, res) => {
       else if (dayPos > 0.8) dayScore = -1;
     }
 
+    // 52-week range
     let weekScore = 0;
     const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     if (weekRange > 0) {
@@ -494,17 +503,24 @@ app.post("/api/check-stock", async (req, res) => {
       else if (weekPos > 0.8) weekScore = -2;
     }
 
+    // Industry
     let industryScore = 0;
-    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+    const stockIndustry =
+      stock.assetProfile?.industry ||
+      stock.assetProfile?.sector ||
+      "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
+      // Compare PE
       if (metrics.peRatio && ind.peRatio) {
         industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
       }
+      // Compare earningsGrowth to industry revenueGrowth
       if (metrics.earningsGrowth && ind.revenueGrowth) {
         const stockEG = metrics.earningsGrowth * 100;
         industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
       }
+      // Compare debt ratio
       if (metrics.debtRatio && ind.debtToEquity) {
         industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
       }
@@ -540,7 +556,6 @@ app.post("/api/check-stock", async (req, res) => {
           })
         );
         const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
-        console.log("Time-series input shape:", inputTensor.shape);
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -590,7 +605,9 @@ app.post("/api/check-stock", async (req, res) => {
     const forecastEndDate = getForecastEndTime();
     const stockName = stock.price?.longName || symbol;
     const stockRevenueGrowth =
-      stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth
+      stockIndustry !== "Unknown" &&
+      industryMetrics[stockIndustry] &&
+      industryMetrics[stockIndustry].revenueGrowth
         ? industryMetrics[stockIndustry].revenueGrowth
         : 0;
 
@@ -623,6 +640,8 @@ app.post("/api/check-stock", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────
 // 13) Forecast-based classification for Finder
+//     (unchanged except that it calls fetchStockData and
+//      classifyStockByForecast for classification)
 // ────────────────────────────────────────────────────────────
 async function classifyStockByForecast(symbol) {
   const data = await fetchStockData(symbol);
@@ -630,6 +649,7 @@ async function classifyStockByForecast(symbol) {
     throw new Error(`No price data for symbol ${symbol}`);
   }
   const currentPrice = data.price.regularMarketPrice ?? 0;
+
   let finalForecastPrice = null;
   if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
     finalForecastPrice = forecastCache[symbol].price;
@@ -641,9 +661,19 @@ async function classifyStockByForecast(symbol) {
     } catch {
       // not enough data
     }
+
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
-        const featureKeys = ["open", "high", "low", "close", "volume", "peRatio", "earningsGrowth", "debtToEquity"];
+        const featureKeys = [
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume",
+          "peRatio",
+          "earningsGrowth",
+          "debtToEquity",
+        ];
         const sequence = timeSeriesData.map((day) =>
           featureKeys.map((k) => {
             const val = day[k] ?? 0;
@@ -660,6 +690,7 @@ async function classifyStockByForecast(symbol) {
         // advanced forecast error
       }
     }
+
     if (advancedForecastPrice && Math.abs(advancedForecastPrice - currentPrice) > 0.01) {
       finalForecastPrice = advancedForecastPrice;
     } else {
@@ -667,10 +698,13 @@ async function classifyStockByForecast(symbol) {
     }
     forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
   }
+
   if (!finalForecastPrice || !currentPrice || currentPrice <= 0) {
     return { classification: "unstable" };
   }
-  const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+  const forecastGrowthPercent =
+    ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+
   if (forecastGrowthPercent >= 2) return { classification: "growth" };
   if (forecastGrowthPercent >= 0) return { classification: "stable" };
   return { classification: "unstable" };
@@ -682,14 +716,21 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     let { stockType, exchange, minPrice, maxPrice } = req.body;
     if (typeof stockType === "string") stockType = stockType.toLowerCase();
     if (typeof exchange === "string") exchange = exchange.toUpperCase();
-    if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
+    if (
+      !stockType ||
+      !exchange ||
+      typeof minPrice !== "number" ||
+      typeof maxPrice !== "number"
+    ) {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
+
     const filtered = [];
     for (const s of allStocks) {
       const sym = typeof s === "string" ? s : s.symbol;
       const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
       if (exch.toUpperCase() !== exchange) continue;
+
       let data = null;
       try {
         data = await fetchStockData(sym);
@@ -704,6 +745,8 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       const currentPrice = data.price.regularMarketPrice;
       if (!currentPrice) continue;
       if (currentPrice < minPrice || currentPrice > maxPrice) continue;
+
+      // Classify by forecast
       try {
         const { classification } = await classifyStockByForecast(sym);
         if (classification !== stockType) {
@@ -715,6 +758,7 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         continue;
       }
     }
+
     return res.json({ stocks: filtered });
   } catch (error) {
     console.error("Finder error:", error.message);
@@ -735,6 +779,7 @@ app.use("/finder", finderRouter);
 app.get("/api/popular-stocks", async (req, res) => {
   return res.json({ message: "Popular stocks not fully implemented." });
 });
+
 app.post("/api/forecast-stock", async (req, res) => {
   return res.json({ message: "Forecast-stock not fully implemented." });
 });
@@ -960,26 +1005,33 @@ app.listen(PORT, () => {
  * If not, add them or use Mongoose schema extension.
  */
 
-// -------------------------------------------------------------------
-// Since we're switching to Firebase's built-in password reset,
-// we no longer use these endpoints.
-// To revert to Node-based password reset, uncomment the following:
-/*
+// This is the Node-based forgot/reset password logic:
 app.post("/forgotPassword", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
       return res.status(400).json({ message: "Email is required." });
     }
+
+    // Find user by email
     const user = await UserModel.findOne({ email });
     if (!user) {
-      return res.status(404).json({ message: "No account with that email found." });
+      return res
+        .status(404)
+        .json({ message: "No account with that email found." });
     }
+
+    // Generate token
     const token = crypto.randomBytes(20).toString("hex");
+    // Set expiration to 1 hour from now
     const expires = Date.now() + 3600000;
+
+    // Update user
     user.resetPasswordToken = token;
     user.resetPasswordExpires = expires;
     await user.save();
+
+    // Send email with link
     const resetURL = `https://sci-investments.web.app/resetPassword.html?token=${token}`;
     const mailOptions = {
       from: process.env.NOTIFY_EMAIL,
@@ -988,10 +1040,13 @@ app.post("/forgotPassword", async (req, res) => {
       text: `You requested a password reset. Click the link below or copy/paste into your browser.\n\n${resetURL}\n\nThis link is valid for 1 hour.`,
     };
     await transporter.sendMail(mailOptions);
+
     return res.json({ message: "Reset link sent! Check your email." });
   } catch (err) {
     console.error("Error in /forgotPassword:", err.message);
-    return res.status(500).json({ message: "Error sending reset link. Please try again." });
+    return res
+      .status(500)
+      .json({ message: "Error sending reset link. Please try again." });
   }
 });
 
@@ -999,26 +1054,35 @@ app.post("/resetPassword", async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
-      return res.status(400).json({ message: "Token and newPassword are required." });
+      return res
+        .status(400)
+        .json({ message: "Token and newPassword are required." });
     }
+
+    // Find user with matching token & unexpired
     const user = await UserModel.findOne({
       resetPasswordToken: token,
       resetPasswordExpires: { $gt: Date.now() },
     });
     if (!user) {
-      return res.status(400).json({ message: "Reset token is invalid or has expired." });
+      return res
+        .status(400)
+        .json({ message: "Reset token is invalid or has expired." });
     }
+
+    // Update password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
+    // Clear the token fields
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
     await user.save();
+
     return res.json({ message: "Password has been reset successfully!" });
   } catch (err) {
     console.error("Error in /resetPassword:", err.message);
-    return res.status(500).json({ message: "Error resetting password. Please try again." });
+    return res
+      .status(500)
+      .json({ message: "Error resetting password. Please try again." });
   }
 });
-*/
-// -------------------------------------------------------------------
-
