@@ -140,14 +140,22 @@ try {
 //  5) Express App
 // ────────────────────────────────────────────────────────────
 const app = express();
+
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// ONLY CHANGE: Expand CORS origins to allow both your frontend & localhost
 app.use(
   cors({
-    origin: "https://sci-investments.web.app", // or your domain
+    origin: [
+      "https://sci-investments.web.app", 
+      "http://localhost:3000"
+    ],
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
 );
 app.options("*", cors());
+// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 app.use(bodyParser.json());
 
 // ────────────────────────────────────────────────────────────
