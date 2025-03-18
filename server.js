@@ -777,7 +777,35 @@ app.use("/finder", finderRouter);
 // 15) Other endpoints (Popular Stocks, Forecast-stock, etc.)
 // ────────────────────────────────────────────────────────────
 app.get("/api/popular-stocks", async (req, res) => {
-  return res.json({ message: "Popular stocks not fully implemented." });
+  try {
+    // 1) Define some "most traded" or "popular" symbols
+    const popularSymbols = ["AAPL", "TSLA", "AMZN", "NVDA", "META", "GOOG", "MSFT"];
+
+    const results = [];
+    for (const symbol of popularSymbols) {
+      // 2) Use your existing fetchStockData() to get Yahoo data
+      const stock = await fetchStockData(symbol);
+      if (!stock || !stock.price) {
+        console.warn(`Skipping ${symbol}: no price data`);
+        continue;
+      }
+
+      // 3) Build an object with the data your front end needs
+      results.push({
+        symbol: symbol,
+        name: stock.price.longName || symbol,
+        price: stock.price.regularMarketPrice || 0,
+        volume: stock.price.regularMarketVolume || 0,
+        // add any other fields your front end wants
+      });
+    }
+
+    // 4) Return them as JSON
+    return res.json({ stocks: results });
+  } catch (err) {
+    console.error("Error fetching popular stocks:", err.message);
+    return res.status(500).json({ message: "Error fetching popular stocks." });
+  }
 });
 
 app.post("/api/forecast-stock", async (req, res) => {
