@@ -141,7 +141,6 @@ try {
 // ────────────────────────────────────────────────────────────
 const app = express();
 
-// ONLY CHANGE: Expand CORS origins to allow both your frontend & localhost
 app.use(
   cors({
     origin: [
@@ -390,7 +389,7 @@ app.post("/signup", async (req, res) => {
 
 // LOGIN: now uses email and password so that it matches forgotPassword logic
 app.post("/login", async (req, res) => {
-  const { email, password } = req.body; // CHANGED: using email instead of username
+  const { email, password } = req.body; // using email instead of username
   if (!email || !password) {
     return res.status(400).json({ message: "Email and password are required." });
   }
@@ -523,7 +522,16 @@ app.post("/api/check-stock", async (req, res) => {
     }
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
-        const featureKeys = ["open", "high", "low", "close", "volume", "peRatio", "earningsGrowth", "debtToEquity"];
+        const featureKeys = [
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume",
+          "peRatio",
+          "earningsGrowth",
+          "debtToEquity",
+        ];
         const sequence = timeSeriesData.map((day) =>
           featureKeys.map((k) => {
             const val = day[k] ?? 0;
@@ -867,7 +875,10 @@ app.get("/api/simulate-trades", async (req, res) => {
         const data = await fetchStockData(symbol);
         if (!data || !data.price) continue;
         let rating = 0;
-        const avgVol = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
+        const avgVol =
+          data.summaryDetail?.averageDailyVolume3Month ||
+          data.price?.regularMarketVolume ||
+          0;
         const currPrice = data.price?.regularMarketPrice || 0;
         if (data.price?.regularMarketVolume > avgVol * 1.2) rating += 3;
         if (currPrice < 100) rating += 2;
@@ -949,30 +960,26 @@ app.listen(PORT, () => {
  * If not, add them or use Mongoose schema extension.
  */
 
+// -------------------------------------------------------------------
+// Since we're switching to Firebase's built-in password reset,
+// we no longer use these endpoints.
+// To revert to Node-based password reset, uncomment the following:
+/*
 app.post("/forgotPassword", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
       return res.status(400).json({ message: "Email is required." });
     }
-
-    // Find user by email
     const user = await UserModel.findOne({ email });
     if (!user) {
       return res.status(404).json({ message: "No account with that email found." });
     }
-
-    // Generate token
     const token = crypto.randomBytes(20).toString("hex");
-    // Set expiration to 1 hour from now
     const expires = Date.now() + 3600000;
-
-    // Update user
     user.resetPasswordToken = token;
     user.resetPasswordExpires = expires;
     await user.save();
-
-    // Send email with link
     const resetURL = `https://sci-investments.web.app/resetPassword.html?token=${token}`;
     const mailOptions = {
       from: process.env.NOTIFY_EMAIL,
@@ -981,7 +988,6 @@ app.post("/forgotPassword", async (req, res) => {
       text: `You requested a password reset. Click the link below or copy/paste into your browser.\n\n${resetURL}\n\nThis link is valid for 1 hour.`,
     };
     await transporter.sendMail(mailOptions);
-
     return res.json({ message: "Reset link sent! Check your email." });
   } catch (err) {
     console.error("Error in /forgotPassword:", err.message);
@@ -995,8 +1001,6 @@ app.post("/resetPassword", async (req, res) => {
     if (!token || !newPassword) {
       return res.status(400).json({ message: "Token and newPassword are required." });
     }
-
-    // Find user with matching token & unexpired
     const user = await UserModel.findOne({
       resetPasswordToken: token,
       resetPasswordExpires: { $gt: Date.now() },
@@ -1004,18 +1008,17 @@ app.post("/resetPassword", async (req, res) => {
     if (!user) {
       return res.status(400).json({ message: "Reset token is invalid or has expired." });
     }
-
-    // Update password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
-    // Clear the token fields
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
     await user.save();
-
     return res.json({ message: "Password has been reset successfully!" });
   } catch (err) {
     console.error("Error in /resetPassword:", err.message);
     return res.status(500).json({ message: "Error resetting password. Please try again." });
   }
 });
+*/
+// -------------------------------------------------------------------
+
