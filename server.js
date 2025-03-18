@@ -19,6 +19,23 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
+/* 
+  [ADDED] FIREBASE ADMIN
+  This block is added so that if a user isn’t found in MongoDB in /forgotPassword,
+  we look them up in Firebase and create a corresponding record.
+*/
+const admin = require("firebase-admin");
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    // Ensure any literal "\n" in your private key is replaced with actual newlines
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  }),
+  // Optionally, set your databaseURL here:
+  // databaseURL: "https://<YOUR-PROJECT-ID>.firebaseio.com",
+});
+
 // ────────────────────────────────────────────────────────────
 //  1) fetchData Helpers
 // ────────────────────────────────────────────────────────────
@@ -74,7 +91,7 @@ function isMarketOpen() {
   const options = { timeZone: "America/New_York", hour12: false };
   const estString = now.toLocaleString("en-US", options);
   const est = new Date(estString);
-  const day = est.getDay(); // 0=Sun,6=Sat
+  const day = est.getDay(); // 0=Sun, 6=Sat
   if (day === 0 || day === 6) return false;
   const hour = est.getHours();
   const minute = est.getMinutes();
@@ -141,12 +158,11 @@ try {
 // ────────────────────────────────────────────────────────────
 const app = express();
 
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 // ONLY CHANGE: Expand CORS origins to allow both your frontend & localhost
 app.use(
   cors({
     origin: [
-      "https://sci-investments.web.app", 
+      "https://sci-investments.web.app",
       "http://localhost:3000"
     ],
     methods: ["GET", "POST", "OPTIONS"],
@@ -154,8 +170,6 @@ app.use(
   })
 );
 app.options("*", cors());
-// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
 app.use(bodyParser.json());
 
 // ────────────────────────────────────────────────────────────
@@ -236,9 +250,7 @@ async function simpleForecastPrice(symbol, currentPrice) {
     const avgDailyReturn = count ? sumPct / count : 0;
     const forecast = currentPrice * (1 + avgDailyReturn);
     console.log(
-      `Simple forecast for ${symbol}: currentPrice=${currentPrice}, avgDailyReturn=${(
-        avgDailyReturn * 100
-      ).toFixed(2)}%, forecast=${forecast.toFixed(2)}`
+      `Simple forecast for ${symbol}: currentPrice=${currentPrice}, avgDailyReturn=${(avgDailyReturn * 100).toFixed(2)}%, forecast=${forecast.toFixed(2)}`
     );
     return forecast;
   } catch (err) {
@@ -262,22 +274,14 @@ async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
 
-  // If market is closed, prefer existing cache to avoid repeated fetches
   if (!marketOpen && stockDataCache[symbol]) {
     console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-
-  // If we have cached data < 15 min old, use it
-  if (
-    stockDataCache[symbol] &&
-    now - stockDataCache[symbol].timestamp < CACHE_TTL
-  ) {
+  if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-
-  // Otherwise, fetch fresh
   console.log(`Fetching fresh data for ${symbol}`);
   const modules = [
     "financialData",
@@ -299,10 +303,7 @@ async function fetchStockData(symbol) {
     return data;
   } catch (err) {
     if (err.message.includes("Unexpected token")) {
-      console.error(
-        `❌ Possibly rate-limited or captcha from Yahoo for ${symbol}:`,
-        err.message
-      );
+      console.error(`❌ Possibly rate-limited or captcha from Yahoo for ${symbol}:`, err.message);
     } else {
       console.error(`❌ Error fetching data for ${symbol}:`, err.message);
     }
@@ -367,9 +368,7 @@ app.post("/api/stock-history", async (req, res) => {
       { fetchOptions: requestOptions }
     );
     if (!historicalData || historicalData.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No historical data found for this symbol." });
+      return res.status(404).json({ message: "No historical data found for this symbol." });
     }
     historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
     const chartData = historicalData.map((item) => ({
@@ -383,9 +382,7 @@ app.post("/api/stock-history", async (req, res) => {
     return res.json({ symbol, range: range || "1m", data: chartData });
   } catch (error) {
     console.error("Error fetching historical data:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Error fetching historical data." });
+    return res.status(500).json({ message: "Error fetching historical data." });
   }
 });
 
@@ -418,9 +415,7 @@ app.post("/signup", async (req, res) => {
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
-    return res
-      .status(400)
-      .json({ message: "Username and password are required." });
+    return res.status(400).json({ message: "Username and password are required." });
   }
   try {
     const user = await UserModel.findOne({ username });
@@ -434,9 +429,7 @@ app.post("/login", async (req, res) => {
     const token = jwt.sign(
       { userId: user._id, username: user.username },
       JWT_SECRET,
-      {
-        expiresIn: "24h",
-      }
+      { expiresIn: "24h" }
     );
     console.log("✅ Login Successful:", username);
     return res.status(200).json({ message: "Login successful.", token });
@@ -448,12 +441,11 @@ app.post("/login", async (req, res) => {
 
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ message: "Unauthorized. Token required." });
+  if (!token)
+    return res.status(401).json({ message: "Unauthorized. Token required." });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    return res
-      .status(200)
-      .json({ message: "Protected data accessed.", user: decoded });
+    return res.status(200).json({ message: "Protected data accessed.", user: decoded });
   } catch (error) {
     return res.status(401).json({ message: "Invalid or expired token." });
   }
@@ -465,9 +457,7 @@ app.get("/protected", (req, res) => {
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
   if (!symbol || !intent) {
-    return res
-      .status(400)
-      .json({ message: "Stock symbol and intent (buy/sell) are required." });
+    return res.status(400).json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
   try {
     // 1) Fetch current fundamentals
@@ -479,9 +469,7 @@ app.post("/api/check-stock", async (req, res) => {
       return res.status(500).json({ message: "Error fetching stock data." });
     }
     if (!stock || !stock.price) {
-      return res
-        .status(404)
-        .json({ message: "Stock not found or data unavailable." });
+      return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
 
     // 2) Calculate metrics for info
@@ -507,21 +495,16 @@ app.post("/api/check-stock", async (req, res) => {
     // (A) Compute a "fundamentalRating" for display
     // ────────────────────────────────────────────────────────
     let baseScore = 0;
-    // Volume
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
-    // PE Ratio
     if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
     else if (metrics.peRatio > 30) baseScore -= 1;
-    // Earnings Growth
     if (metrics.earningsGrowth > 0.15) baseScore += 4;
     else if (metrics.earningsGrowth > 0.03) baseScore += 2;
     else if (metrics.earningsGrowth < 0) baseScore -= 2;
-    // Debt Ratio
     if (metrics.debtRatio < 0.3) baseScore += 3;
     else if (metrics.debtRatio > 1) baseScore -= 1;
 
-    // Day range
     let dayScore = 0;
     const dayRange = metrics.dayHigh - metrics.dayLow;
     if (dayRange > 0) {
@@ -530,7 +513,6 @@ app.post("/api/check-stock", async (req, res) => {
       else if (dayPos > 0.8) dayScore = -1;
     }
 
-    // 52-week range
     let weekScore = 0;
     const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     if (weekRange > 0) {
@@ -539,24 +521,17 @@ app.post("/api/check-stock", async (req, res) => {
       else if (weekPos > 0.8) weekScore = -2;
     }
 
-    // Industry
     let industryScore = 0;
-    const stockIndustry =
-      stock.assetProfile?.industry ||
-      stock.assetProfile?.sector ||
-      "Unknown";
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
-      // Compare PE
       if (metrics.peRatio && ind.peRatio) {
         industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
       }
-      // Compare earningsGrowth to industry revenueGrowth
       if (metrics.earningsGrowth && ind.revenueGrowth) {
         const stockEG = metrics.earningsGrowth * 100;
         industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
       }
-      // Compare debt ratio
       if (metrics.debtRatio && ind.debtToEquity) {
         industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
       }
@@ -564,31 +539,16 @@ app.post("/api/check-stock", async (req, res) => {
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
-    // ────────────────────────────────────────────────────────
-    // (B) Advanced forecasting attempt using last 30 days
-    // ────────────────────────────────────────────────────────
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
       timeSeriesData = await fetchTimeSeriesData(symbol, 30);
     } catch (e) {
-      console.warn(
-        `⚠️ Not enough historical data for advanced forecasting for ${symbol}:`,
-        e.message
-      );
+      console.warn(`⚠️ Not enough historical data for advanced forecasting for ${symbol}:`, e.message);
     }
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
-        const featureKeys = [
-          "open",
-          "high",
-          "low",
-          "close",
-          "volume",
-          "peRatio",
-          "earningsGrowth",
-          "debtToEquity",
-        ];
+        const featureKeys = ["open", "high", "low", "close", "volume", "peRatio", "earningsGrowth", "debtToEquity"];
         const sequence = timeSeriesData.map((day) =>
           featureKeys.map((k) => {
             const val = day[k] ?? 0;
@@ -607,27 +567,16 @@ app.post("/api/check-stock", async (req, res) => {
         console.error(`Model forecast error for ${symbol}:`, tfErr.message);
       }
     } else {
-      console.log(
-        `Advanced forecasting skipped for ${symbol} (data points: ${
-          timeSeriesData ? timeSeriesData.length : 0
-        }).`
-      );
+      console.log(`Advanced forecasting skipped for ${symbol} (data points: ${timeSeriesData ? timeSeriesData.length : 0}).`);
     }
 
-    // (C) Fallback forecast if advanced missing
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
-    if (
-      forecastCache[symbol] &&
-      Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
-    ) {
+    if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
       finalForecastPrice = forecastCache[symbol].price;
       console.log(`Using cached forecast for ${symbol}: ${finalForecastPrice}`);
     } else {
-      if (
-        !advancedForecastPrice ||
-        Math.abs(advancedForecastPrice - currentPrice) < 0.01
-      ) {
+      if (!advancedForecastPrice || Math.abs(advancedForecastPrice - currentPrice) < 0.01) {
         finalForecastPrice = await simpleForecastPrice(symbol, currentPrice);
       } else {
         finalForecastPrice = advancedForecastPrice;
@@ -635,51 +584,34 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // (D) Forecast growth
-    const forecastGrowthPercent =
-      ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+    const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+    const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
 
-    // ────────────────────────────────────────────────────────
-    // (E) Combined Score (for display only)
-    //     0.2 * fundamentalRating + 0.8 * forecastGrowth
-    // ────────────────────────────────────────────────────────
-    const combinedScore =
-      0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
-
-    // (F) Classification based solely on forecastGrowthPercent
     let finalClassification, finalAdvice;
     if (forecastGrowthPercent >= 2) {
       finalClassification = "growth";
       finalAdvice = "This stock is projected to grow significantly. Consider buying.";
     } else if (forecastGrowthPercent >= 0) {
       finalClassification = "stable";
-      finalAdvice =
-        "This stock is projected to have minimal growth. It may be better suited as a stable holding.";
+      finalAdvice = "This stock is projected to have minimal growth. It may be better suited as a stable holding.";
     } else {
       finalClassification = "unstable";
-      finalAdvice =
-        "This stock is projected to decline. Consider selling or avoiding.";
+      finalAdvice = "This stock is projected to decline. Consider selling or avoiding.";
     }
 
     const forecastEndDate = getForecastEndTime();
     const stockName = stock.price?.longName || symbol;
     const stockRevenueGrowth =
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
+      stockIndustry !== "Unknown" && industryMetrics[stockIndustry] && industryMetrics[stockIndustry].revenueGrowth
         ? industryMetrics[stockIndustry].revenueGrowth
         : 0;
 
-    //  Return the result
     return res.json({
       symbol,
       name: stockName,
       industry: stockIndustry,
-
-      // These two are now displayed (not used for classification):
       fundamentalRating: fundamentalRating.toFixed(2),
       combinedScore: combinedScore.toFixed(2),
-
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
         projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
@@ -697,16 +629,13 @@ app.post("/api/check-stock", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error in /api/check-stock:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Error fetching stock data.", error: error.message });
+    return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
   }
 });
 
 // ────────────────────────────────────────────────────────────
 // 13) Forecast-based classification for Finder
-//     (unchanged except that it calls fetchStockData and
-//      classifyStockByForecast for classification)
+// (unchanged except that it calls fetchStockData and classifyStockByForecast for classification)
 // ────────────────────────────────────────────────────────────
 async function classifyStockByForecast(symbol) {
   const data = await fetchStockData(symbol);
@@ -714,12 +643,8 @@ async function classifyStockByForecast(symbol) {
     throw new Error(`No price data for symbol ${symbol}`);
   }
   const currentPrice = data.price.regularMarketPrice ?? 0;
-
   let finalForecastPrice = null;
-  if (
-    forecastCache[symbol] &&
-    Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
-  ) {
+  if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
     finalForecastPrice = forecastCache[symbol].price;
   } else {
     let advancedForecastPrice = null;
@@ -729,19 +654,9 @@ async function classifyStockByForecast(symbol) {
     } catch {
       // not enough data
     }
-
     if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
       try {
-        const featureKeys = [
-          "open",
-          "high",
-          "low",
-          "close",
-          "volume",
-          "peRatio",
-          "earningsGrowth",
-          "debtToEquity",
-        ];
+        const featureKeys = ["open", "high", "low", "close", "volume", "peRatio", "earningsGrowth", "debtToEquity"];
         const sequence = timeSeriesData.map((day) =>
           featureKeys.map((k) => {
             const val = day[k] ?? 0;
@@ -758,24 +673,17 @@ async function classifyStockByForecast(symbol) {
         // advanced forecast error
       }
     }
-
-    if (
-      advancedForecastPrice &&
-      Math.abs(advancedForecastPrice - currentPrice) > 0.01
-    ) {
+    if (advancedForecastPrice && Math.abs(advancedForecastPrice - currentPrice) > 0.01) {
       finalForecastPrice = advancedForecastPrice;
     } else {
       finalForecastPrice = await simpleForecastPrice(symbol, currentPrice);
     }
     forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
   }
-
   if (!finalForecastPrice || !currentPrice || currentPrice <= 0) {
     return { classification: "unstable" };
   }
-  const forecastGrowthPercent =
-    ((finalForecastPrice - currentPrice) / currentPrice) * 100;
-
+  const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
   if (forecastGrowthPercent >= 2) return { classification: "growth" };
   if (forecastGrowthPercent >= 0) return { classification: "stable" };
   return { classification: "unstable" };
@@ -787,21 +695,14 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
     let { stockType, exchange, minPrice, maxPrice } = req.body;
     if (typeof stockType === "string") stockType = stockType.toLowerCase();
     if (typeof exchange === "string") exchange = exchange.toUpperCase();
-    if (
-      !stockType ||
-      !exchange ||
-      typeof minPrice !== "number" ||
-      typeof maxPrice !== "number"
-    ) {
+    if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
       return res.status(400).json({ message: "Invalid finder parameters." });
     }
-
     const filtered = [];
     for (const s of allStocks) {
       const sym = typeof s === "string" ? s : s.symbol;
       const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
       if (exch.toUpperCase() !== exchange) continue;
-
       let data = null;
       try {
         data = await fetchStockData(sym);
@@ -816,8 +717,6 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
       const currentPrice = data.price.regularMarketPrice;
       if (!currentPrice) continue;
       if (currentPrice < minPrice || currentPrice > maxPrice) continue;
-
-      // Classify by forecast
       try {
         const { classification } = await classifyStockByForecast(sym);
         if (classification !== stockType) {
@@ -829,7 +728,6 @@ finderRouter.post("/api/find-stocks", async (req, res) => {
         continue;
       }
     }
-
     return res.json({ stocks: filtered });
   } catch (error) {
     console.error("Finder error:", error.message);
@@ -850,7 +748,6 @@ app.use("/finder", finderRouter);
 app.get("/api/popular-stocks", async (req, res) => {
   return res.json({ message: "Popular stocks not fully implemented." });
 });
-
 app.post("/api/forecast-stock", async (req, res) => {
   return res.json({ message: "Forecast-stock not fully implemented." });
 });
@@ -951,12 +848,7 @@ async function autoBuyStocks() {
   const exchange = "NASDAQ";
   const minPrice = 10;
   const maxPrice = 100;
-  const filteredSymbols = await getFilteredSymbols(
-    stockType,
-    exchange,
-    minPrice,
-    maxPrice
-  );
+  const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
   for (const symbol of filteredSymbols) {
     try {
       console.log(`autoBuyStocks would analyze ${symbol} here...`);
@@ -989,22 +881,14 @@ app.get("/api/simulate-trades", async (req, res) => {
     const exchange = "NASDAQ";
     const minPrice = 10;
     const maxPrice = 100;
-    const filteredSymbols = await getFilteredSymbols(
-      stockType,
-      exchange,
-      minPrice,
-      maxPrice
-    );
+    const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
     for (const symbol of filteredSymbols) {
       try {
         console.log(`Simulating buy for symbol: ${symbol}`);
         const data = await fetchStockData(symbol);
         if (!data || !data.price) continue;
         let rating = 0;
-        const avgVol =
-          data.summaryDetail?.averageDailyVolume3Month ||
-          data.price?.regularMarketVolume ||
-          0;
+        const avgVol = data.summaryDetail?.averageDailyVolume3Month || data.price?.regularMarketVolume || 0;
         const currPrice = data.price?.regularMarketPrice || 0;
         if (data.price?.regularMarketVolume > avgVol * 1.2) rating += 3;
         if (currPrice < 100) rating += 2;
@@ -1029,9 +913,7 @@ app.get("/api/simulate-trades", async (req, res) => {
     });
   } catch (error) {
     console.error("Simulation error:", error.message);
-    return res
-      .status(500)
-      .json({ message: "Simulation error.", error: error.message });
+    return res.status(500).json({ message: "Simulation error.", error: error.message });
   }
 });
 
@@ -1088,6 +970,7 @@ app.listen(PORT, () => {
  * If not, add them or use Mongoose schema extension.
  */
 
+// [MODIFIED] /forgotPassword: If not found in Mongo, try Firebase
 app.post("/forgotPassword", async (req, res) => {
   try {
     const { email } = req.body;
@@ -1095,18 +978,27 @@ app.post("/forgotPassword", async (req, res) => {
       return res.status(400).json({ message: "Email is required." });
     }
 
-    // Find user by email
-    const user = await UserModel.findOne({ email });
+    // Find user by email in Mongo
+    let user = await UserModel.findOne({ email });
     if (!user) {
-      return res
-        .status(404)
-        .json({ message: "No account with that email found." });
+      // If not found, see if they exist in Firebase
+      try {
+        const userRecord = await admin.auth().getUserByEmail(email);
+        // Create them in Mongo so we can set the reset token
+        user = new UserModel({
+          email,
+          username: userRecord.displayName || email,
+          password: "FIREBASE_USER",
+        });
+        await user.save();
+      } catch (firebaseErr) {
+        return res.status(404).json({ message: "No account with that email found." });
+      }
     }
 
     // Generate token
     const token = crypto.randomBytes(20).toString("hex");
-    // Set expiration to 1 hour from now
-    const expires = Date.now() + 3600000;
+    const expires = Date.now() + 3600000; // 1 hour
 
     // Update user
     user.resetPasswordToken = token;
@@ -1126,9 +1018,7 @@ app.post("/forgotPassword", async (req, res) => {
     return res.json({ message: "Reset link sent! Check your email." });
   } catch (err) {
     console.error("Error in /forgotPassword:", err.message);
-    return res
-      .status(500)
-      .json({ message: "Error sending reset link. Please try again." });
+    return res.status(500).json({ message: "Error sending reset link. Please try again." });
   }
 });
 
@@ -1136,26 +1026,21 @@ app.post("/resetPassword", async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
-      return res
-        .status(400)
-        .json({ message: "Token and newPassword are required." });
+      return res.status(400).json({ message: "Token and newPassword are required." });
     }
 
     // Find user with matching token & unexpired
     const user = await UserModel.findOne({
       resetPasswordToken: token,
-      resetPasswordExpires: { $gt: Date.now() }, // must be greater than now
+      resetPasswordExpires: { $gt: Date.now() },
     });
     if (!user) {
-      return res
-        .status(400)
-        .json({ message: "Reset token is invalid or has expired." });
+      return res.status(400).json({ message: "Reset token is invalid or has expired." });
     }
 
     // Update password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
-    // Clear the token fields
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
     await user.save();
@@ -1163,8 +1048,6 @@ app.post("/resetPassword", async (req, res) => {
     return res.json({ message: "Password has been reset successfully!" });
   } catch (err) {
     console.error("Error in /resetPassword:", err.message);
-    return res
-      .status(500)
-      .json({ message: "Error resetting password. Please try again." });
+    return res.status(500).json({ message: "Error resetting password. Please try again." });
   }
 });
