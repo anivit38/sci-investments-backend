@@ -19,23 +19,6 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
-/* 
-  [ADDED] FIREBASE ADMIN
-  This block is added so that if a user isn’t found in MongoDB in /forgotPassword,
-  we look them up in Firebase and create a corresponding record.
-*/
-const admin = require("firebase-admin");
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    // Ensure any literal "\n" in your private key is replaced with actual newlines
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-  }),
-  // Optionally, set your databaseURL here:
-  // databaseURL: "https://<YOUR-PROJECT-ID>.firebaseio.com",
-});
-
 // ────────────────────────────────────────────────────────────
 //  1) fetchData Helpers
 // ────────────────────────────────────────────────────────────
@@ -91,7 +74,7 @@ function isMarketOpen() {
   const options = { timeZone: "America/New_York", hour12: false };
   const estString = now.toLocaleString("en-US", options);
   const est = new Date(estString);
-  const day = est.getDay(); // 0=Sun, 6=Sat
+  const day = est.getDay(); // 0=Sun,6=Sat
   if (day === 0 || day === 6) return false;
   const hour = est.getHours();
   const minute = est.getMinutes();
@@ -265,11 +248,6 @@ async function simpleForecastPrice(symbol, currentPrice) {
 const stockDataCache = {};
 const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
-/**
- * fetchStockData(symbol):
- *   - Returns cached data if fresh (or if market is closed).
- *   - Otherwise fetches from Yahoo and caches for 15 min.
- */
 async function fetchStockData(symbol) {
   const now = Date.now();
   const marketOpen = isMarketOpen();
@@ -282,6 +260,7 @@ async function fetchStockData(symbol) {
     console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
+
   console.log(`Fetching fresh data for ${symbol}`);
   const modules = [
     "financialData",
@@ -311,10 +290,6 @@ async function fetchStockData(symbol) {
   }
 }
 
-/**
- * fetchTimeSeriesData(symbol, days=30)
- * Return up to the last 'days' records from CSV memory.
- */
 async function fetchTimeSeriesData(symbol, days = 30) {
   const historical = getCachedHistoricalData(symbol);
   if (!historical || historical.length === 0) {
@@ -391,6 +366,7 @@ app.post("/api/stock-history", async (req, res) => {
 // ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("✅ Combined Server is running!"));
 
+// SIGNUP: uses email, username, and password
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
   if (!email || !username || !password) {
@@ -412,13 +388,14 @@ app.post("/signup", async (req, res) => {
   }
 });
 
+// LOGIN: now uses email and password so that it matches forgotPassword logic
 app.post("/login", async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ message: "Username and password are required." });
+  const { email, password } = req.body; // CHANGED: using email instead of username
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required." });
   }
   try {
-    const user = await UserModel.findOne({ username });
+    const user = await UserModel.findOne({ email }); // lookup by email
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
@@ -427,11 +404,11 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials." });
     }
     const token = jwt.sign(
-      { userId: user._id, username: user.username },
+      { userId: user._id, email: user.email },
       JWT_SECRET,
       { expiresIn: "24h" }
     );
-    console.log("✅ Login Successful:", username);
+    console.log("✅ Login Successful:", email);
     return res.status(200).json({ message: "Login successful.", token });
   } catch (error) {
     console.error("❌ Login Error:", error.message);
@@ -441,8 +418,7 @@ app.post("/login", async (req, res) => {
 
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
-  if (!token)
-    return res.status(401).json({ message: "Unauthorized. Token required." });
+  if (!token) return res.status(401).json({ message: "Unauthorized. Token required." });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     return res.status(200).json({ message: "Protected data accessed.", user: decoded });
@@ -491,9 +467,7 @@ app.post("/api/check-stock", async (req, res) => {
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // ────────────────────────────────────────────────────────
     // (A) Compute a "fundamentalRating" for display
-    // ────────────────────────────────────────────────────────
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
@@ -539,6 +513,7 @@ app.post("/api/check-stock", async (req, res) => {
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
+    // (B) Advanced forecasting attempt using last 30 days
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
@@ -570,6 +545,7 @@ app.post("/api/check-stock", async (req, res) => {
       console.log(`Advanced forecasting skipped for ${symbol} (data points: ${timeSeriesData ? timeSeriesData.length : 0}).`);
     }
 
+    // (C) Fallback forecast if advanced missing
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
     if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
@@ -584,9 +560,13 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
+    // (D) Forecast growth
     const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+
+    // (E) Combined Score (for display only)
     const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
 
+    // (F) Classification based solely on forecastGrowthPercent
     let finalClassification, finalAdvice;
     if (forecastGrowthPercent >= 2) {
       finalClassification = "growth";
@@ -635,7 +615,6 @@ app.post("/api/check-stock", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────
 // 13) Forecast-based classification for Finder
-// (unchanged except that it calls fetchStockData and classifyStockByForecast for classification)
 // ────────────────────────────────────────────────────────────
 async function classifyStockByForecast(symbol) {
   const data = await fetchStockData(symbol);
@@ -970,7 +949,6 @@ app.listen(PORT, () => {
  * If not, add them or use Mongoose schema extension.
  */
 
-// [MODIFIED] /forgotPassword: If not found in Mongo, try Firebase
 app.post("/forgotPassword", async (req, res) => {
   try {
     const { email } = req.body;
@@ -978,27 +956,16 @@ app.post("/forgotPassword", async (req, res) => {
       return res.status(400).json({ message: "Email is required." });
     }
 
-    // Find user by email in Mongo
-    let user = await UserModel.findOne({ email });
+    // Find user by email
+    const user = await UserModel.findOne({ email });
     if (!user) {
-      // If not found, see if they exist in Firebase
-      try {
-        const userRecord = await admin.auth().getUserByEmail(email);
-        // Create them in Mongo so we can set the reset token
-        user = new UserModel({
-          email,
-          username: userRecord.displayName || email,
-          password: "FIREBASE_USER",
-        });
-        await user.save();
-      } catch (firebaseErr) {
-        return res.status(404).json({ message: "No account with that email found." });
-      }
+      return res.status(404).json({ message: "No account with that email found." });
     }
 
     // Generate token
     const token = crypto.randomBytes(20).toString("hex");
-    const expires = Date.now() + 3600000; // 1 hour
+    // Set expiration to 1 hour from now
+    const expires = Date.now() + 3600000;
 
     // Update user
     user.resetPasswordToken = token;
@@ -1041,6 +1008,7 @@ app.post("/resetPassword", async (req, res) => {
     // Update password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
+    // Clear the token fields
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
     await user.save();
