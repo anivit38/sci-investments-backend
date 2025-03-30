@@ -114,14 +114,6 @@ function getForecastEndTime() {
   const etNow = new Date(
     now.toLocaleString("en-US", { timeZone: "America/New_York" })
   );
-
-  function getForecastEndTime() {
-    const now = new Date();
-    // Convert current time to Eastern Time
-    const etNow = new Date(
-      now.toLocaleString("en-US", { timeZone: "America/New_York" })
-    );
-  
     let forecastDate;
     let label = "";
     
@@ -148,8 +140,8 @@ function getForecastEndTime() {
     
     return `${label}, 4:00pm, ${month}/${day}/${year}`;
   }
-}
-  
+
+
 // yahooFinance request options
 const requestOptions = {
   headers: {
