@@ -111,22 +111,40 @@ function isMarketOpen() {
 
 function getForecastEndTime() {
   const now = new Date();
+  // Convert current time to Eastern Time
   const etNow = new Date(
     now.toLocaleString("en-US", { timeZone: "America/New_York" })
   );
-  if (isMarketOpen()) {
+
+  let forecastDate;
+  let label = "";
+  
+  // If market is open and it's before 4:00pm ET, forecast for today's close.
+  if (isMarketOpen() && etNow.getHours() < 16) {
     etNow.setHours(16, 0, 0, 0);
-    return etNow;
+    forecastDate = etNow;
+    label = "Today";
   } else {
-    let next = new Date(etNow);
-    next.setDate(next.getDate() + 1);
-    while (next.getDay() === 0 || next.getDay() === 6) {
-      next.setDate(next.getDate() + 1);
+    // Otherwise, forecast for the next trading day.
+    forecastDate = new Date(etNow);
+    forecastDate.setDate(forecastDate.getDate() + 1);
+    // Skip weekends
+    while (forecastDate.getDay() === 0 || forecastDate.getDay() === 6) {
+      forecastDate.setDate(forecastDate.getDate() + 1);
     }
-    next.setHours(16, 0, 0, 0);
-    return next;
+    forecastDate.setHours(16, 0, 0, 0);
+    label = "Next Trading Day";
   }
+
+  // Format forecastDate as "Label, 4:00pm, MM/DD/YYYY"
+  const month = String(forecastDate.getMonth() + 1).padStart(2, "0");
+  const day = String(forecastDate.getDate()).padStart(2, "0");
+  const year = forecastDate.getFullYear();
+  
+  return `${label}, 4:00pm, ${month}/${day}/${year}`;
 }
+
+
 // yahooFinance request options
 const requestOptions = {
   headers: {
