@@ -110,24 +110,31 @@ function isMarketOpen() {
 }
 
 function getForecastEndTime() {
-  // create your date
-  // ...
+  const now = new Date();
+  const etNow = new Date(
+    now.toLocaleString("en-US", { timeZone: "America/New_York" })
+  );
+
+  let forecastDate;
+  if (isMarketOpen()) {
+    etNow.setHours(16, 0, 0, 0);
+    forecastDate = etNow;
+  } else {
+    forecastDate = new Date(etNow);
+    forecastDate.setDate(forecastDate.getDate() + 1);
+    while (forecastDate.getDay() === 0 || forecastDate.getDay() === 6) {
+      forecastDate.setDate(forecastDate.getDate() + 1);
+    }
+    forecastDate.setHours(16, 0, 0, 0);
+  }
+
+  // Format forecastDate as "4:00pm, MM/DD/YYYY"
   const month = String(forecastDate.getMonth() + 1).padStart(2, "0");
   const day = String(forecastDate.getDate()).padStart(2, "0");
   const year = forecastDate.getFullYear();
-  // Return a plain string
-  return "4:00pm, ${month}/${day}/${year}";
-}
 
-// Then in /api/check-stock:
-const forecastEndDate = getForecastEndTime();
-// Just send the string—no .toISOString():
-return res.json({
-  // ...
-  forecast: {
-    forecastEndDate, 
-  },
-});
+  return `4:00pm, ${month}/${day}/${year}`;
+}
 
 // yahooFinance request options
 const requestOptions = {
