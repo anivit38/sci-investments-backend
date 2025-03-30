@@ -19,6 +19,9 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
+// Constant for time-series window (now using 90 days)
+const TIME_SERIES_WINDOW = 90;
+
 // ────────────────────────────────────────────────────────────
 //  1) fetchData Helpers
 // ────────────────────────────────────────────────────────────
@@ -83,29 +86,30 @@ function isMarketOpen() {
   return true;
 }
 
-/**
- * getForecastEndTime():
- *   If market is open, returns today's 4:00 PM ET.
- *   Else returns next business day's 4:00 PM ET.
- */
 function getForecastEndTime() {
   const now = new Date();
   const etNow = new Date(
     now.toLocaleString("en-US", { timeZone: "America/New_York" })
   );
+  let forecastDate;
   if (isMarketOpen()) {
     etNow.setHours(16, 0, 0, 0);
-    return etNow;
+    forecastDate = etNow;
   } else {
-    let next = new Date(etNow);
-    next.setDate(next.getDate() + 1);
-    while (next.getDay() === 0 || next.getDay() === 6) {
-      next.setDate(next.getDate() + 1);
+    forecastDate = new Date(etNow);
+    forecastDate.setDate(forecastDate.getDate() + 1);
+    while (forecastDate.getDay() === 0 || forecastDate.getDay() === 6) {
+      forecastDate.setDate(forecastDate.getDate() + 1);
     }
-    next.setHours(16, 0, 0, 0);
-    return next;
+    forecastDate.setHours(16, 0, 0, 0);
   }
+  // Format forecastDate as "4:00pm, MM/DD/YYYY"
+  const month = String(forecastDate.getMonth() + 1).padStart(2, "0");
+  const day = String(forecastDate.getDate()).padStart(2, "0");
+  const year = forecastDate.getFullYear();
+  return `4:00pm, ${month}/${day}/${year}`;
 }
+
 
 // yahooFinance request options
 const requestOptions = {
@@ -290,7 +294,8 @@ async function fetchStockData(symbol) {
   }
 }
 
-async function fetchTimeSeriesData(symbol, days = 30) {
+async function fetchTimeSeriesData(symbol, days = 90) {
+  // Now using the extra days (90 days)
   const historical = getCachedHistoricalData(symbol);
   if (!historical || historical.length === 0) {
     throw new Error(`No daily data available for ${symbol}.`);
@@ -471,21 +476,16 @@ app.post("/api/check-stock", async (req, res) => {
 
     // (A) Compute a "fundamentalRating" for display
     let baseScore = 0;
-    // Volume
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
-    // PE Ratio
     if (metrics.peRatio >= 5 && metrics.peRatio <= 25) baseScore += 2;
     else if (metrics.peRatio > 30) baseScore -= 1;
-    // Earnings Growth
     if (metrics.earningsGrowth > 0.15) baseScore += 4;
     else if (metrics.earningsGrowth > 0.03) baseScore += 2;
     else if (metrics.earningsGrowth < 0) baseScore -= 2;
-    // Debt Ratio
     if (metrics.debtRatio < 0.3) baseScore += 3;
     else if (metrics.debtRatio > 1) baseScore -= 1;
 
-    // Day range
     let dayScore = 0;
     const dayRange = metrics.dayHigh - metrics.dayLow;
     if (dayRange > 0) {
@@ -494,7 +494,6 @@ app.post("/api/check-stock", async (req, res) => {
       else if (dayPos > 0.8) dayScore = -1;
     }
 
-    // 52-week range
     let weekScore = 0;
     const weekRange = metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow;
     if (weekRange > 0) {
@@ -503,7 +502,6 @@ app.post("/api/check-stock", async (req, res) => {
       else if (weekPos > 0.8) weekScore = -2;
     }
 
-    // Industry
     let industryScore = 0;
     const stockIndustry =
       stock.assetProfile?.industry ||
@@ -511,16 +509,13 @@ app.post("/api/check-stock", async (req, res) => {
       "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
-      // Compare PE
       if (metrics.peRatio && ind.peRatio) {
         industryScore += metrics.peRatio < ind.peRatio ? 2 : -2;
       }
-      // Compare earningsGrowth to industry revenueGrowth
       if (metrics.earningsGrowth && ind.revenueGrowth) {
         const stockEG = metrics.earningsGrowth * 100;
         industryScore += stockEG > ind.revenueGrowth ? 2 : -2;
       }
-      // Compare debt ratio
       if (metrics.debtRatio && ind.debtToEquity) {
         industryScore += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
       }
@@ -528,15 +523,15 @@ app.post("/api/check-stock", async (req, res) => {
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
-    // (B) Advanced forecasting attempt using last 30 days
+    // (B) Advanced forecasting attempt using last TIME_SERIES_WINDOW days
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
-      timeSeriesData = await fetchTimeSeriesData(symbol, 30);
+      timeSeriesData = await fetchTimeSeriesData(symbol, TIME_SERIES_WINDOW);
     } catch (e) {
       console.warn(`⚠️ Not enough historical data for advanced forecasting for ${symbol}:`, e.message);
     }
-    if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
+    if (timeSeriesData && timeSeriesData.length === TIME_SERIES_WINDOW && forecastModel && normalizationParams) {
       try {
         const featureKeys = [
           "open",
@@ -555,7 +550,7 @@ app.post("/api/check-stock", async (req, res) => {
             return std !== 0 ? (val - mean) / std : 0;
           })
         );
-        const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
+        const inputTensor = tf.tensor3d([sequence], [1, TIME_SERIES_WINDOW, featureKeys.length]);
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -657,12 +652,12 @@ async function classifyStockByForecast(symbol) {
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
-      timeSeriesData = await fetchTimeSeriesData(symbol, 30);
+      timeSeriesData = await fetchTimeSeriesData(symbol, TIME_SERIES_WINDOW);
     } catch {
       // not enough data
     }
 
-    if (timeSeriesData && timeSeriesData.length === 30 && forecastModel && normalizationParams) {
+    if (timeSeriesData && timeSeriesData.length === TIME_SERIES_WINDOW && forecastModel && normalizationParams) {
       try {
         const featureKeys = [
           "open",
@@ -681,7 +676,7 @@ async function classifyStockByForecast(symbol) {
             return std !== 0 ? (val - mean) / std : 0;
           })
         );
-        const inputTensor = tf.tensor3d([sequence], [1, 30, featureKeys.length]);
+        const inputTensor = tf.tensor3d([sequence], [1, TIME_SERIES_WINDOW, featureKeys.length]);
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -778,29 +773,21 @@ app.use("/finder", finderRouter);
 // ────────────────────────────────────────────────────────────
 app.get("/api/popular-stocks", async (req, res) => {
   try {
-    // 1) Define some "most traded" or "popular" symbols
     const popularSymbols = ["AAPL", "TSLA", "AMZN", "NVDA", "META", "GOOG", "MSFT"];
-
     const results = [];
     for (const symbol of popularSymbols) {
-      // 2) Use your existing fetchStockData() to get Yahoo data
       const stock = await fetchStockData(symbol);
       if (!stock || !stock.price) {
         console.warn(`Skipping ${symbol}: no price data`);
         continue;
       }
-
-      // 3) Build an object with the data your front end needs
       results.push({
         symbol: symbol,
         name: stock.price.longName || symbol,
         price: stock.price.regularMarketPrice || 0,
         volume: stock.price.regularMarketVolume || 0,
-        // add any other fields your front end wants
       });
     }
-
-    // 4) Return them as JSON
     return res.json({ stocks: results });
   } catch (err) {
     console.error("Error fetching popular stocks:", err.message);
