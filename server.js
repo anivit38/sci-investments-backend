@@ -19,8 +19,31 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
-// Constant for time-series window (now using 90 days)
-const TIME_SERIES_WINDOW = 90;
+/**
+ * IMPORTANT: The model expects [?, 30, 13].
+ * So we revert TIME_SERIES_WINDOW to 30
+ * and we use the same 13 features from trainGRU.js
+ */
+
+// Changed from 90 back to 30 to match training window
+const TIME_SERIES_WINDOW = 30;
+
+// These 13 features match your trainGRU.js
+const FORECAST_FEATURE_KEYS = [
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "peRatio",
+  "earningsGrowth",
+  "debtToEquity",
+  "revenue",
+  "netIncome",
+  "SMA20",
+  "RSI14",
+  "MACD",
+];
 
 // ────────────────────────────────────────────────────────────
 //  1) fetchData Helpers
@@ -109,7 +132,6 @@ function getForecastEndTime() {
   const year = forecastDate.getFullYear();
   return `4:00pm, ${month}/${day}/${year}`;
 }
-
 
 // yahooFinance request options
 const requestOptions = {
@@ -294,8 +316,8 @@ async function fetchStockData(symbol) {
   }
 }
 
-async function fetchTimeSeriesData(symbol, days = 90) {
-  // Now using the extra days (90 days)
+async function fetchTimeSeriesData(symbol, days = TIME_SERIES_WINDOW) {
+  // Now using the same default as TIME_SERIES_WINDOW
   const historical = getCachedHistoricalData(symbol);
   if (!historical || historical.length === 0) {
     throw new Error(`No daily data available for ${symbol}.`);
@@ -531,26 +553,25 @@ app.post("/api/check-stock", async (req, res) => {
     } catch (e) {
       console.warn(`⚠️ Not enough historical data for advanced forecasting for ${symbol}:`, e.message);
     }
-    if (timeSeriesData && timeSeriesData.length === TIME_SERIES_WINDOW && forecastModel && normalizationParams) {
+    if (
+      timeSeriesData &&
+      timeSeriesData.length === TIME_SERIES_WINDOW &&
+      forecastModel &&
+      normalizationParams
+    ) {
       try {
-        const featureKeys = [
-          "open",
-          "high",
-          "low",
-          "close",
-          "volume",
-          "peRatio",
-          "earningsGrowth",
-          "debtToEquity",
-        ];
+        // Use the 13 features
         const sequence = timeSeriesData.map((day) =>
-          featureKeys.map((k) => {
+          FORECAST_FEATURE_KEYS.map((k) => {
             const val = day[k] ?? 0;
             const { mean = 0, std = 1 } = normalizationParams[k] || {};
             return std !== 0 ? (val - mean) / std : 0;
           })
         );
-        const inputTensor = tf.tensor3d([sequence], [1, TIME_SERIES_WINDOW, featureKeys.length]);
+        const inputTensor = tf.tensor3d(
+          [sequence],
+          [1, TIME_SERIES_WINDOW, FORECAST_FEATURE_KEYS.length]
+        );
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -560,17 +581,27 @@ app.post("/api/check-stock", async (req, res) => {
         console.error(`Model forecast error for ${symbol}:`, tfErr.message);
       }
     } else {
-      console.log(`Advanced forecasting skipped for ${symbol} (data points: ${timeSeriesData ? timeSeriesData.length : 0}).`);
+      console.log(
+        `Advanced forecasting skipped for ${symbol} (data points: ${
+          timeSeriesData ? timeSeriesData.length : 0
+        }).`
+      );
     }
 
     // (C) Fallback forecast if advanced missing
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
-    if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
+    if (
+      forecastCache[symbol] &&
+      Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+    ) {
       finalForecastPrice = forecastCache[symbol].price;
       console.log(`Using cached forecast for ${symbol}: ${finalForecastPrice}`);
     } else {
-      if (!advancedForecastPrice || Math.abs(advancedForecastPrice - currentPrice) < 0.01) {
+      if (
+        !advancedForecastPrice ||
+        Math.abs(advancedForecastPrice - currentPrice) < 0.01
+      ) {
         finalForecastPrice = await simpleForecastPrice(symbol, currentPrice);
       } else {
         finalForecastPrice = advancedForecastPrice;
@@ -579,7 +610,8 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // (D) Forecast growth
-    const forecastGrowthPercent = ((finalForecastPrice - currentPrice) / currentPrice) * 100;
+    const forecastGrowthPercent =
+      ((finalForecastPrice - currentPrice) / currentPrice) * 100;
 
     // (E) Combined Score (for display only)
     const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
@@ -616,7 +648,9 @@ app.post("/api/check-stock", async (req, res) => {
         forecastPrice: +finalForecastPrice.toFixed(2),
         projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
         forecastPeriod: "End of Day",
-        forecastEndDate: forecastEndDate.toISOString(),
+        // forecastEndDate was originally returning .toISOString(), 
+        // but that won't work on a string. We'll just return the string:
+        forecastEndDate,
       },
       classification: finalClassification,
       advice: finalAdvice,
@@ -635,8 +669,6 @@ app.post("/api/check-stock", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────
 // 13) Forecast-based classification for Finder
-//     (unchanged except that it calls fetchStockData and
-//      classifyStockByForecast for classification)
 // ────────────────────────────────────────────────────────────
 async function classifyStockByForecast(symbol) {
   const data = await fetchStockData(symbol);
@@ -646,7 +678,10 @@ async function classifyStockByForecast(symbol) {
   const currentPrice = data.price.regularMarketPrice ?? 0;
 
   let finalForecastPrice = null;
-  if (forecastCache[symbol] && Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL) {
+  if (
+    forecastCache[symbol] &&
+    Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+  ) {
     finalForecastPrice = forecastCache[symbol].price;
   } else {
     let advancedForecastPrice = null;
@@ -657,26 +692,24 @@ async function classifyStockByForecast(symbol) {
       // not enough data
     }
 
-    if (timeSeriesData && timeSeriesData.length === TIME_SERIES_WINDOW && forecastModel && normalizationParams) {
+    if (
+      timeSeriesData &&
+      timeSeriesData.length === TIME_SERIES_WINDOW &&
+      forecastModel &&
+      normalizationParams
+    ) {
       try {
-        const featureKeys = [
-          "open",
-          "high",
-          "low",
-          "close",
-          "volume",
-          "peRatio",
-          "earningsGrowth",
-          "debtToEquity",
-        ];
         const sequence = timeSeriesData.map((day) =>
-          featureKeys.map((k) => {
+          FORECAST_FEATURE_KEYS.map((k) => {
             const val = day[k] ?? 0;
             const { mean = 0, std = 1 } = normalizationParams[k] || {};
             return std !== 0 ? (val - mean) / std : 0;
           })
         );
-        const inputTensor = tf.tensor3d([sequence], [1, TIME_SERIES_WINDOW, featureKeys.length]);
+        const inputTensor = tf.tensor3d(
+          [sequence],
+          [1, TIME_SERIES_WINDOW, FORECAST_FEATURE_KEYS.length]
+        );
         const predictionTensor = forecastModel.predict(inputTensor);
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
@@ -686,7 +719,10 @@ async function classifyStockByForecast(symbol) {
       }
     }
 
-    if (advancedForecastPrice && Math.abs(advancedForecastPrice - currentPrice) > 0.01) {
+    if (
+      advancedForecastPrice &&
+      Math.abs(advancedForecastPrice - currentPrice) > 0.01
+    ) {
       finalForecastPrice = advancedForecastPrice;
     } else {
       finalForecastPrice = await simpleForecastPrice(symbol, currentPrice);
