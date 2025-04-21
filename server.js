@@ -19,6 +19,14 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
+const RSSParser     = require("rss-parser");
+const Sentiment     = require("sentiment");
+const fetchNative   = require("node-fetch");
+const cheerio       = require("cheerio");
+
+const rssParser     = new RSSParser();
+const sentiment     = new Sentiment()
+
 /**
  * IMPORTANT: The model expects [?, 30, 13].
  * So we revert TIME_SERIES_WINDOW to 30
@@ -478,22 +486,14 @@ app.post("/api/check-stock", async (req, res) => {
   }
   try {
     // 1) Fetch current fundamentals
-    let stock;
-    try {
-      stock = await fetchStockData(symbol);
-    } catch (innerErr) {
-      console.error(`❌ Error fetching stock data for "${symbol}":`, innerErr.message);
-      return res.status(500).json({ message: "Error fetching stock data." });
-    }
+    let stock = await fetchStockData(symbol);
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
 
-    // 2) Calculate metrics for info
+    // 2) Calculate metrics
     const computedAvgVolume =
-      stock.summaryDetail?.averageDailyVolume3Month ||
-      stock.price?.regularMarketVolume ||
-      0;
+      stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
     const metrics = {
       volume: stock.price?.regularMarketVolume ?? 0,
       currentPrice: stock.price?.regularMarketPrice ?? 0,
@@ -508,7 +508,7 @@ app.post("/api/check-stock", async (req, res) => {
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // (A) Compute a "fundamentalRating" for display
+    // (A) fundamentalRating
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
@@ -537,10 +537,7 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     let industryScore = 0;
-    const stockIndustry =
-      stock.assetProfile?.industry ||
-      stock.assetProfile?.sector ||
-      "Unknown";
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
       if (metrics.peRatio && ind.peRatio) {
@@ -557,13 +554,13 @@ app.post("/api/check-stock", async (req, res) => {
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
-    // (B) Advanced forecasting attempt using last TIME_SERIES_WINDOW days
+    // (B) advanced forecasting via GRU
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
       timeSeriesData = await fetchTimeSeriesData(symbol, TIME_SERIES_WINDOW);
-    } catch (e) {
-      console.warn(`⚠️ Not enough historical data for advanced forecasting for ${symbol}:`, e.message);
+    } catch {
+      console.warn(`⚠️ Not enough data for advanced forecast: ${symbol}`);
     }
     if (
       timeSeriesData &&
@@ -572,7 +569,6 @@ app.post("/api/check-stock", async (req, res) => {
       normalizationParams
     ) {
       try {
-        // Use the 13 features
         const sequence = timeSeriesData.map((day) =>
           FORECAST_FEATURE_KEYS.map((k) => {
             const val = day[k] ?? 0;
@@ -584,23 +580,16 @@ app.post("/api/check-stock", async (req, res) => {
           [sequence],
           [1, TIME_SERIES_WINDOW, FORECAST_FEATURE_KEYS.length]
         );
-        const predictionTensor = forecastModel.predict(inputTensor);
-        const predVal = predictionTensor.dataSync()[0];
+        const predTensor = forecastModel.predict(inputTensor);
+        const predVal = predTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
         advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
-        console.log(`Advanced forecast for ${symbol}: ${advancedForecastPrice.toFixed(2)}`);
-      } catch (tfErr) {
-        console.error(`Model forecast error for ${symbol}:`, tfErr.message);
+      } catch (e) {
+        console.error("Model forecast error:", e.message);
       }
-    } else {
-      console.log(
-        `Advanced forecasting skipped for ${symbol} (data points: ${
-          timeSeriesData ? timeSeriesData.length : 0
-        }).`
-      );
     }
 
-    // (C) Fallback forecast if advanced missing
+    // (C) determine final forecastPrice
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
     if (
@@ -608,7 +597,6 @@ app.post("/api/check-stock", async (req, res) => {
       Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
     ) {
       finalForecastPrice = forecastCache[symbol].price;
-      console.log(`Using cached forecast for ${symbol}: ${finalForecastPrice}`);
     } else {
       if (
         !advancedForecastPrice ||
@@ -621,14 +609,9 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // (D) Forecast growth
+    // (D) forecast growth & classification
     const forecastGrowthPercent =
       ((finalForecastPrice - currentPrice) / currentPrice) * 100;
-
-    // (E) Combined Score (for display only)
-    const combinedScore = 0.2 * fundamentalRating + 0.8 * forecastGrowthPercent;
-
-    // (F) Classification based solely on forecastGrowthPercent
     let finalClassification, finalAdvice;
     if (forecastGrowthPercent >= 2) {
       finalClassification = "growth";
@@ -640,28 +623,62 @@ app.post("/api/check-stock", async (req, res) => {
       finalClassification = "unstable";
       finalAdvice = "This stock is projected to decline. Consider selling or avoiding.";
     }
-
     const forecastEndDate = getForecastEndTime();
-    const stockName = stock.price?.longName || symbol;
-    const stockRevenueGrowth =
-      stockIndustry !== "Unknown" &&
-      industryMetrics[stockIndustry] &&
-      industryMetrics[stockIndustry].revenueGrowth
-        ? industryMetrics[stockIndustry].revenueGrowth
-        : 0;
 
+    // ─── News & Event Analysis ─────────────────────────────
+    async function fetchNewsAndEvents(sym) {
+      try {
+        const feed = await rssParser.parseURL(
+          `https://news.google.com/rss/search?q=${sym}`
+        );
+        const items = feed.items.slice(0, 5);
+        const analyses = await Promise.all(
+          items.map(async (item) => {
+            let snippet = item.contentSnippet || item.title;
+            try {
+              const html = await (await fetchNative(item.link)).text();
+              const $ = cheerio.load(html);
+              const p = $("p").first().text();
+              if (p && p.length > snippet.length) snippet = p;
+            } catch {}
+            const score = sentiment.analyze(snippet).score;
+            const text = snippet.toLowerCase();
+            return {
+              title: item.title,
+              link: item.link,
+              snippet: snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
+              sentiment: score,
+              events: {
+                tariffNews: text.includes("tariff"),
+                earnings: text.includes("earnings") || text.includes("revenue"),
+                mergerAcq: text.includes("merger") || text.includes("acqui"),
+                regulation: text.includes("regulator") || text.includes("sec"),
+              },
+            };
+          })
+        );
+        const avgSentiment =
+          analyses.reduce((sum, a) => sum + a.sentiment, 0) / analyses.length;
+        return { avgSentiment, analyses };
+      } catch (e) {
+        console.warn("News fetch error for", sym, e.message);
+        return { avgSentiment: 0, analyses: [] };
+      }
+    }
+    const { avgSentiment, analyses: newsAnalyses } = await fetchNewsAndEvents(symbol);
+    // ────────────────────────────────────────────────────────────
+
+    // (E) Respond with forecast + news
     return res.json({
       symbol,
-      name: stockName,
-      industry: stockIndustry,
+      name: stock.price.longName || symbol,
+      industry: stock.assetProfile?.industry || "Unknown",
       fundamentalRating: fundamentalRating.toFixed(2),
-      combinedScore: combinedScore.toFixed(2),
+      combinedScore: (0.2 * fundamentalRating + 0.8 * forecastGrowthPercent).toFixed(2),
       forecast: {
         forecastPrice: +finalForecastPrice.toFixed(2),
-        projectedGrowthPercent: forecastGrowthPercent.toFixed(2) + "%",
+        projectedGrowthPercent: `${forecastGrowthPercent.toFixed(2)}%`,
         forecastPeriod: "End of Day",
-        // forecastEndDate was originally returning .toISOString(), 
-        // but that won't work on a string. We'll just return the string:
         forecastEndDate,
       },
       classification: finalClassification,
@@ -671,11 +688,18 @@ app.post("/api/check-stock", async (req, res) => {
         dayRange: metrics.dayHigh - metrics.dayLow,
         fiftyTwoWeekRange: metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow,
       },
-      revenueGrowth: stockRevenueGrowth,
+      revenueGrowth:
+        industryMetrics[stock.assetProfile?.industry]?.revenueGrowth || 0,
+      news: {
+        averageSentiment: avgSentiment,
+        topStories: newsAnalyses,
+      },
     });
   } catch (error) {
     console.error("❌ Error in /api/check-stock:", error.message);
-    return res.status(500).json({ message: "Error fetching stock data.", error: error.message });
+    return res
+      .status(500)
+      .json({ message: "Error fetching stock data.", error: error.message });
   }
 });
 

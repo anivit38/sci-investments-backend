@@ -1,325 +1,228 @@
 /*******************************************
- * updateCSV.js
- *
- * This script:
- * 1) Reads symbols from symbols.json
- * 2) Fetches daily data from Yahoo Finance for the specified date range.
- * 3) Fetches up to 8 quarterly income statements from FMP.
- * 4) Date‑aligns fundamentals with each daily record and computes technical indicators:
- *    – SMA20: 20‑day simple moving average of close
- *    – RSI14: 14‑day Relative Strength Index computed from close prices
- *    – MACD: Difference between the 12‑day EMA and the 26‑day EMA of close
- * 5) Keeps only the last MAX_LINES_PER_SYMBOL rows per symbol.
- * 6) Writes out a CSV with columns:
- *    symbol,date,open,high,low,close,volume,peRatio,earningsGrowth,debtToEquity,revenue,netIncome,SMA20,RSI14,MACD
+ * updateCSV.js  (with daily news sentiment)
  *******************************************/
-
 require("dotenv").config({ path: require("path").join(__dirname, "../.env") });
-const fs = require("fs");
-const path = require("path");
-const yahooFinance = require("yahoo-finance2").default;
-const fetch = require("node-fetch");
+const fs        = require("fs");
+const path      = require("path");
+const yahoo     = require("yahoo-finance2").default;
+const fetch     = require("node-fetch");
+const RSSParser = require("rss-parser");
+const Sentiment = require("sentiment");
 
-const CSV_FILE = path.join(__dirname, "historicalData.csv");
-const SYMBOLS_JSON = path.join(__dirname, "../symbols.json");
+const rss        = new RSSParser();
+const sentiment  = new Sentiment();
 
-const ONE_DAY = 24 * 60 * 60 * 1000;
-const TRADING_DAYS_REQUIRED = 30;  
-const LOOKBACK_CALENDAR_DAYS = 45; 
-const MAX_LINES_PER_SYMBOL = 45;    // Keep only the last 60 lines per symbol
+const HIST_CSV   = path.join(__dirname, "historicalData.csv");
+const SYMBOLS_J  = path.join(__dirname, "../symbols.json");
 
-// FMP API key from .env
-const FMP_API_KEY = process.env.FMP_API_KEY || "YOUR_FMP_API_KEY";
+// how many calendar days back to fetch
+const LOOKBACK_DAYS        = 45;
+// after trimming to TRADING_DAYS, we keep only this many per symbol
+const TRADING_DAYS_REQUIRED = 30;
+// and we expire old rows so we never exceed this
+const MAX_LINES_PER_SYMBOL = 60;
 
-/* ---------------------
-   Technical Indicator Helpers
---------------------- */
-// Simple Moving Average (SMA) for the 'close' price
-function calculateSMA(data, period, index) {
-  if (index < period - 1) return 0;
-  let sum = 0;
-  for (let i = index - period + 1; i <= index; i++) {
-    sum += data[i].close;
-  }
-  return sum / period;
+// ─── Helpers for Technical Indicators ─────────────────────────────
+function calculateSMA(data, period, i) {
+  if (i < period-1) return 0;
+  let sum=0;
+  for (let k=i-period+1; k<=i; k++) sum += data[k].close;
+  return sum/period;
 }
-
-// RSI (Relative Strength Index) using period (typically 14)
-function calculateRSI(data, period, index) {
-  if (index < period) return 0;
-  let gains = 0, losses = 0;
-  for (let i = index - period + 1; i <= index; i++) {
-    const change = data[i].close - data[i - 1].close;
-    if (change > 0) gains += change;
-    else losses += Math.abs(change);
+function calculateRSI(data, period, i) {
+  if (i < period) return 0;
+  let gains=0, losses=0;
+  for (let k=i-period+1; k<=i; k++){
+    const d = data[k].close - data[k-1].close;
+    if (d>0) gains+=d; else losses+=(-d);
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  if (losses===0) return 100;
+  const rs = (gains/period)/(losses/period);
+  return 100 - (100/(1+rs));
 }
-
-// Exponential Moving Average (EMA) for the 'close' price over a period
 function calculateEMA(data, period) {
-  const k = 2 / (period + 1);
-  const emaArray = [];
-  let sum = 0;
-  for (let i = 0; i < period; i++) {
-    sum += data[i].close;
+  const k = 2/(period+1);
+  const ema = [];
+  // seed
+  let sum=0;
+  for (let i=0; i<period; i++) sum+=data[i].close;
+  ema[period-1] = sum/period;
+  for (let i=period; i<data.length; i++){
+    ema[i] = data[i].close*k + ema[i-1]*(1-k);
   }
-  emaArray[period - 1] = sum / period;
-  for (let i = period; i < data.length; i++) {
-    const emaYesterday = emaArray[i - 1] || data[i - 1].close;
-    emaArray[i] = data[i].close * k + emaYesterday * (1 - k);
-  }
-  return emaArray;
+  return ema;
 }
-
-// Compute MACD as EMA12 - EMA26 for the 'close' price
 function calculateMACD(data) {
-  if (data.length < 26) return [];
-  const ema12 = calculateEMA(data, 12);
-  const ema26 = calculateEMA(data, 26);
-  const macd = [];
-  for (let i = 0; i < data.length; i++) {
-    if (ema12[i] === undefined || ema26[i] === undefined) {
-      macd.push(0);
-    } else {
-      macd.push(ema12[i] - ema26[i]);
-    }
+  if (data.length<26) return data.map(_=>0);
+  const e12 = calculateEMA(data,12);
+  const e26 = calculateEMA(data,26);
+  return data.map((_,i)=> (e12[i]||0)-(e26[i]||0) );
+}
+
+// ─── News Sentiment Helpers ───────────────────────────────────────
+// Cache each symbol’s feed so we only fetch once
+const rssCache = {};
+async function getFeed(symbol){
+  if (!rssCache[symbol]){
+    const url = `https://news.google.com/rss/search?q=${symbol}`;
+    rssCache[symbol] = await rss.parseURL(url);
   }
-  return macd;
-}
-
-/* ---------------------
-   Basic CSV helper functions
---------------------- */
-function parseCSV(data) {
-  const lines = data.trim().split("\n");
-  const header = lines[0].split(",");
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const values = lines[i].split(",");
-    const row = {};
-    header.forEach((col, index) => {
-      row[col] = values[index];
-    });
-    rows.push(row);
-  }
-  return { header, rows };
-}
-
-function convertToCSV(header, rows) {
-  const lines = [];
-  lines.push(header.join(","));
-  for (const row of rows) {
-    const line = header.map((col) => String(row[col])).join(",");
-    lines.push(line);
-  }
-  return lines.join("\n");
-}
-
-function formatDate(date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
-function getYesterdayDate() {
-  return new Date(Date.now() - ONE_DAY);
+  return rssCache[symbol];
 }
 
 /**
- * Fetch daily historical data from Yahoo Finance.
+ * Given a feed and a daily date (YYYY-MM-DD),
+ * filter feed.items to that calendar day, take up to 3,
+ * compute average sentiment + event flags
  */
-async function fetchHistoricalData(symbol, startDate, endDate) {
+async function sentimentForDate(symbol, dateStr){
   try {
-    const period2 = new Date(endDate.getTime());
-    period2.setDate(period2.getDate() + 1);
-    const data = await yahooFinance.historical(symbol, {
-      period1: startDate,
-      period2: period2,
-      interval: "1d",
-    });
-    return data || [];
-  } catch (error) {
-    console.error(
-      `Error fetching Yahoo data for ${symbol} between ${formatDate(startDate)} and ${formatDate(endDate)}:`,
-      error.message
-    );
-    return [];
-  }
-}
+    const feed = await getFeed(symbol);
+    const dayStart = new Date(dateStr).getTime();
+    const dayEnd   = dayStart + 24*60*60*1000;
+    const todays = feed.items
+      .filter(it => {
+        if (!it.pubDate) return false;
+        const t = new Date(it.pubDate).getTime();
+        return t>=dayStart && t<dayEnd;
+      })
+      .slice(0,3);
 
-/**
- * Fetch up to 8 quarterly income statements from FMP.
- */
-async function fetchStatementsFMP(symbol, limit = 8) {
-  if (!FMP_API_KEY || FMP_API_KEY === "YOUR_FMP_API_KEY") {
-    console.warn("No FMP_API_KEY found. Skipping fundamentals fetch.");
-    return [];
-  }
-  const url = `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?limit=${limit}&apikey=${FMP_API_KEY}`;
-  try {
-    const resp = await fetch(url);
-    const data = await resp.json();
-    if (!Array.isArray(data) || data.length === 0) {
-      console.warn(`No FMP statements for ${symbol}`);
-      return [];
+    if (todays.length===0) {
+      return { dailySentiment: 0, tariffEvent:0, earningsEvent:0, mergerEvent:0, regulationEvent:0 };
     }
-    // Sort ascending by statement date
-    data.sort((a, b) => new Date(a.date) - new Date(b.date));
-    return data;
-  } catch (err) {
-    console.error(`Error fetching fundamentals for ${symbol}:`, err.message);
-    return [];
-  }
-}
 
-/**
- * For a given sorted array of statements and a daily date,
- * return the most recent statement with date <= daily date.
- */
-function findStatementForDate(statements, dailyDate) {
-  let result = null;
-  const dailyTime = new Date(dailyDate).getTime();
-  for (const st of statements) {
-    const stTime = new Date(st.date).getTime();
-    if (stTime <= dailyTime) {
-      result = st;
-    } else {
-      break;
+    let sum=0;
+    let flags = { tariffEvent:0, earningsEvent:0, mergerEvent:0, regulationEvent:0 };
+    for (const it of todays){
+      const txt = (it.contentSnippet||it.title||"").toLowerCase();
+      // basic event keywords
+      if (txt.includes("tariff")) flags.tariffEvent = 1;
+      if (txt.includes("earnings")||txt.includes("revenue")) flags.earningsEvent = 1;
+      if (txt.includes("merger")||txt.includes("acqui")) flags.mergerEvent = 1;
+      if (txt.includes("regulator")||txt.includes("sec")) flags.regulationEvent = 1;
+
+      const score = sentiment.analyze(txt).score;
+      sum += score;
     }
+    const dailySentiment = sum / todays.length;
+    return { dailySentiment, ...flags };
+  } catch (e) {
+    console.warn("News sentiment error:", symbol, dateStr, e.message);
+    return { dailySentiment:0, tariffEvent:0, earningsEvent:0, mergerEvent:0, regulationEvent:0 };
   }
-  return result;
 }
 
-async function updateCSV() {
-  // 1) Load symbols
-  if (!fs.existsSync(SYMBOLS_JSON)) {
-    console.error("❌ symbols.json not found at:", SYMBOLS_JSON);
-    return;
+// ─── Main CSV Updating ─────────────────────────────────────────────
+async function updateCSV(){
+  // load symbols
+  if (!fs.existsSync(SYMBOLS_J)){
+    console.error("❌ symbols.json not found at", SYMBOLS_J);
+    process.exit(1);
   }
-  let symbols = [];
-  try {
-    const rawSymbols = fs.readFileSync(SYMBOLS_JSON, "utf-8");
-    symbols = JSON.parse(rawSymbols);
-  } catch (err) {
-    console.error("❌ Error reading symbols.json:", err.message);
-    return;
-  }
+  const symbols = JSON.parse(fs.readFileSync(SYMBOLS_J,"utf-8"));
 
-  // 2) Prepare CSV header and start with an empty rows array (ignore any old file)
-  const header = [
-    "symbol",
-    "date",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "peRatio",
-    "earningsGrowth",
-    "debtToEquity",
-    "revenue",
-    "netIncome",
-    "SMA20",
-    "RSI14",
-    "MACD"
-  ];
-  let rows = []; // start fresh
-
-  // 3) Determine date range for Yahoo fetch
-  const endDate = getYesterdayDate();
+  // determine date window
+  const today = new Date();
+  const endDate = new Date(today.getTime() - 24*60*60*1000);
   const startDate = new Date(endDate);
-  startDate.setDate(startDate.getDate() - LOOKBACK_CALENDAR_DAYS + 1);
-  console.log(`⏳ Fetching daily data from ${formatDate(startDate)} to ${formatDate(endDate)}...`);
+  startDate.setDate(startDate.getDate() - LOOKBACK_DAYS +1);
+  const sDate = startDate;
+  console.log(`✏️  Fetching data from ${sDate.toISOString().slice(0,10)} → ${endDate.toISOString().slice(0,10)}`);
 
-  // 4) Process each symbol
-  for (const s of symbols) {
-    const symbol = typeof s === "string" ? s : s.symbol;
-    let fetchSymbol = symbol;
-    if (s.exchange && s.exchange.toUpperCase() === "TSX") {
-      fetchSymbol = symbol + ".TO";
-    }
-    console.log(`\n--- Processing ${symbol} (fetching as ${fetchSymbol}) ---`);
+  const header = [
+    "symbol","date","open","high","low","close","volume",
+    "peRatio","earningsGrowth","debtToEquity","revenue","netIncome",
+    "SMA20","RSI14","MACD",
+    "dailySentiment","tariffEvent","earningsEvent","mergerEvent","regulationEvent"
+  ];
+  const outRows = [];
 
-    // A) Fetch daily historical data from Yahoo
-    const historicalData = await fetchHistoricalData(fetchSymbol, startDate, endDate);
-    if (!historicalData || historicalData.length === 0) {
-      console.warn(`No daily data found for ${symbol}. Skipping.`);
+  for (const ent of symbols){
+    const sym = typeof ent==="string" ? ent : ent.symbol;
+    console.log(`\n▶️  Processing ${sym}`);
+    // 1) fetch daily from Yahoo
+    let raw;
+    try {
+      const p2 = new Date(endDate); p2.setDate(p2.getDate()+1);
+      raw = await yahoo.historical(sym, { period1:startDate, period2:p2, interval:"1d" });
+    } catch(err){
+      console.warn(`  ⚠️  No data for ${sym}:`, err.message);
       continue;
     }
-    historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
-
-    // B) Compute technical indicators on the full daily dataset
-    const sma20Array = historicalData.map((_, i) => calculateSMA(historicalData, 20, i));
-    const rsi14Array = historicalData.map((_, i) => calculateRSI(historicalData, 14, i));
-    const macdArray = calculateMACD(historicalData);
-
-    // C) Fetch quarterly income statements from FMP
-    const statements = await fetchStatementsFMP(symbol, 8);
-    
-    // Keep the last TRADING_DAYS_REQUIRED daily records
-    const recentData = historicalData.slice(-TRADING_DAYS_REQUIRED);
-    if (recentData.length < TRADING_DAYS_REQUIRED) {
-      console.warn(`⚠️ ${symbol} has only ${recentData.length} trading days in the last ${LOOKBACK_CALENDAR_DAYS} days.`);
+    if (!raw || raw.length===0) {
+      console.warn(`  ⚠️  ${sym} returned empty`);
+      continue;
     }
-    const recentStartIndex = historicalData.length - recentData.length;
+    raw.sort((a,b)=>new Date(a.date)-new Date(b.date));
 
-    // D) For each day in the recent data, add fundamentals and technical indicators
-    for (let j = 0; j < recentData.length; j++) {
-      const day = recentData[j];
-      const index = recentStartIndex + j;
-      const dateStr = formatDate(new Date(day.date));
-      let st = findStatementForDate(statements, dateStr);
-      if (!st) {
-        st = { revenue: 0, netIncome: 0 };
-      }
-      const newRow = {
-        symbol,
-        date: dateStr,
-        open: day.open,
-        high: day.high,
-        low: day.low,
-        close: day.close,
+    // 2) technicals on full series
+    const sma20 = raw.map((_,i)=> calculateSMA(raw,20,i));
+    const rsi14 = raw.map((_,i)=> calculateRSI(raw,14,i));
+    const macd  = calculateMACD(raw);
+
+    // 3) trim to last TRADING_DAYS_REQUIRED days
+    const recent = raw.slice(-TRADING_DAYS_REQUIRED);
+    const offset = raw.length - recent.length;
+
+    // 4) build each row + sentiment
+    for (let j=0; j<recent.length; j++){
+      const day = recent[j];
+      const idx = offset + j;
+      const dateStr = day.date.toISOString().slice(0,10);
+      // skip any incomplete day
+      if ([day.open,day.close,day.high,day.low,day.volume].some(v=>v==null)) continue;
+
+      const news = await sentimentForDate(sym, dateStr);
+
+      outRows.push({
+        symbol: sym,
+        date:   dateStr,
+        open:   day.open,
+        high:   day.high,
+        low:    day.low,
+        close:  day.close,
         volume: day.volume,
-        peRatio: day.peRatio || 0,
-        earningsGrowth: day.earningsGrowth || 0,
-        debtToEquity: day.debtToEquity || 0,
-        revenue: st.revenue || 0,
-        netIncome: st.netIncome || 0,
-        SMA20: sma20Array[index] || 0,
-        RSI14: rsi14Array[index] || 0,
-        MACD: macdArray[index] || 0
-      };
-
-      // Always add the new row (we are rebuilding the CSV from scratch)
-      rows.push(newRow);
-      console.log(`Added: ${symbol} on ${dateStr}`);
+        peRatio:         day.peRatio||0,
+        earningsGrowth:  day.earningsGrowth||0,
+        debtToEquity:    day.debtToEquity||0,
+        revenue:         day.revenue||0,
+        netIncome:       day.netIncome||0,
+        SMA20:  sma20[idx]||0,
+        RSI14:  rsi14[idx]||0,
+        MACD:   macd[idx]||0,
+        dailySentiment:  news.dailySentiment,
+        tariffEvent:     news.tariffEvent,
+        earningsEvent:   news.earningsEvent,
+        mergerEvent:     news.mergerEvent,
+        regulationEvent: news.regulationEvent
+      });
+      process.stdout.write(".");
     }
+    console.log(`  → ${recent.length} rows added`);
   }
 
-  // 5) Group by symbol and keep only the last MAX_LINES_PER_SYMBOL rows per symbol
+  // 5) enforce MAX_LINES_PER_SYMBOL
   const grouped = {};
-  for (const row of rows) {
-    if (!grouped[row.symbol]) grouped[row.symbol] = [];
-    grouped[row.symbol].push(row);
+  for (const r of outRows){
+    (grouped[r.symbol] ||= []).push(r);
   }
-  const updatedRows = [];
-  for (const sym in grouped) {
-    grouped[sym].sort((a, b) => new Date(a.date) - new Date(b.date));
-    const keep = grouped[sym].slice(-MAX_LINES_PER_SYMBOL);
-    updatedRows.push(...keep);
+  const finalRows = [];
+  for (const sym in grouped){
+    grouped[sym].sort((a,b)=> new Date(a.date)-new Date(b.date));
+    finalRows.push(... grouped[sym].slice(-MAX_LINES_PER_SYMBOL) );
   }
 
-  // 6) Write out the updated CSV file
-  const csvContent = convertToCSV(header, updatedRows);
-  fs.writeFileSync(CSV_FILE, csvContent, "utf-8");
-  console.log("\n✅ CSV file updated successfully!");
+  // 6) write CSV
+  const lines = [
+    header.join(","),
+    ...finalRows.map(r=> header.map(c=> String(r[c]||0)).join(","))
+  ].join("\n");
+  fs.writeFileSync(HIST_CSV, lines,"utf-8");
+  console.log("\n✅ historicalData.csv updated!");
 }
 
-// 7) Run the update
-updateCSV();
+updateCSV().catch(e=>{
+  console.error("Fatal in updateCSV:", e);
+  process.exit(1);
+});
