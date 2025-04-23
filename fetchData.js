@@ -32,7 +32,7 @@ function loadCsvIntoMemory() {
     return;
   }
   console.log(`Loading CSV into memory from: ${CSV_FILE}`);
-  const raw = fs.readFileSync(CSV_FILE, "utf-8").trim();
+  const raw = fs.readFileSync(CSV_FILE, "utf8").trim();
   const lines = raw.split("\n");
   if (lines.length <= 1) {
     console.warn("CSV file is empty or has no data rows.");

@@ -160,3 +160,9 @@ main().catch(err => {
   console.error("❌ Error in training script:", err);
   process.exit(1);
 });
+
+module.exports = {
+  predictNextDay,
+  FEATURE_KEYS,      // your array of feature names, in order
+  TIME_SERIES_WINDOW // your window length (30)
+};

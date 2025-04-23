@@ -10,7 +10,7 @@ try {
   }
 
   // Read & parse file
-  const rawData = fs.readFileSync(filePath, "utf-8");
+  const rawData = fs.readFileSync(filePath, "utf8");
   const symbolsData = JSON.parse(rawData);
 
   if (typeof symbolsData !== "object" || Array.isArray(symbolsData)) {
@@ -49,7 +49,7 @@ try {
 
   // ✅ Write back only if changes are needed
   if (invalidSymbols.length > 0) {
-    fs.writeFileSync(filePath, JSON.stringify(validSymbolsData, null, 2), "utf-8");
+    fs.writeFileSync(filePath, JSON.stringify(validSymbolsData, null, 2), "utf8");
     console.log("✅ Cleaned symbols have been saved to symbols.json");
   } else {
     console.log("✅ No invalid symbols found. No changes made.");
