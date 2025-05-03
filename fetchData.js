@@ -1,190 +1,206 @@
 /*******************************************************
- * fetchData.js
- * 
- * Provides:
- *   - historicalDataCache: an in-memory object 
- *   - loadCsvIntoMemory(): read the CSV, parse, store in memory
- *   - getCachedHistoricalData(symbol)
- *   - storeInMemoryData(symbol, dataArray)
- *   - fetchHistoricalData, fetchAllSymbolsHistoricalData (if you want)
+ * backend/fetchData.js     (Phase‑3 version)
+ *
+ *  ✓ In–memory historicalDataCache
+ *  ✓ loadCsvIntoMemory()          – one‑shot CSV ingest
+ *  ✓ getCachedHistoricalData()    – simple accessor
+ *  ✓ getWindowFromBucket()        – 30 × 17 matrix for GRU
+ *  ✓ fetchHistoricalData()        – Yahoo helper
+ *  ✓ fetchAllSymbolsHistoricalData() – batch Yahoo fetch
+ *
+ *  Stand‑alone test:
+ *      node fetchData.js
  *******************************************************/
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
+const fs          = require("fs");
+const path        = require("path");
+const readline    = require("readline");
 const yahooFinance = require("yahoo-finance2").default;
 
-/** The in-memory object for storing historical data:
- *   historicalDataCache[symbol] = array of daily objects
- */
+/*─────────────────────────────────────────────────────
+  Shared constants (MUST match trainGRU.js & server.js)
+─────────────────────────────────────────────────────*/
+const LOOKBACK = 30;   // window length for the GRU
+const FORECAST_FEATURE_KEYS = [
+  "open","high","low","close","volume",
+  "peRatio","earningsGrowth","debtToEquity","revenue","netIncome",
+  "ATR14","SMA20","STD20","BB_upper","BB_lower","RSI14","MACD"
+];
+
+/*─────────────────────────────────────────────────────
+  1) Simple in‑memory cache of daily rows
+─────────────────────────────────────────────────────*/
 const historicalDataCache = {};
 
-/** The path to your CSV file */
-const CSV_FILE = path.join(__dirname, "data", "historicalData.csv");
+/* The Phase‑3 *monolithic* enriched CSV (all symbols) */
+const ENRICHED_CSV = path.join(__dirname, "data", "historicalData_enriched_full.csv");
 
-/** 
- * Helper to parse CSV lines.
- * We assume the CSV has a header like:
- *   symbol,date,open,high,low,close,volume,peRatio,earningsGrowth,debtToEquity
- */
+/*─────────────────────────────────────────────────────
+  2) Load the big CSV into memory at start‑up
+─────────────────────────────────────────────────────*/
 function loadCsvIntoMemory() {
-  if (!fs.existsSync(CSV_FILE)) {
-    console.warn(`No CSV file found at ${CSV_FILE}. Skipping loadCsvIntoMemory().`);
+  if (!fs.existsSync(ENRICHED_CSV)) {
+    console.warn(`⚠️ ${ENRICHED_CSV} not found – skipping preload`);
     return;
   }
-  console.log(`Loading CSV into memory from: ${CSV_FILE}`);
-  const raw = fs.readFileSync(CSV_FILE, "utf8").trim();
-  const lines = raw.split("\n");
-  if (lines.length <= 1) {
-    console.warn("CSV file is empty or has no data rows.");
-    return;
-  }
-  const header = lines[0].split(",");
-  // We expect something like:
-  //  0: symbol
-  //  1: date
-  //  2: open
-  //  3: high
-  //  4: low
-  //  5: close
-  //  6: volume
-  //  7: peRatio
-  //  8: earningsGrowth
-  //  9: debtToEquity
+  console.time("CSV‑load");
+  console.log(`⏳ Loading ${ENRICHED_CSV} …`);
 
-  // We'll figure out each column index:
+  const raw = fs.readFileSync(ENRICHED_CSV, "utf8").trim().split("\n");
+  const header = raw.shift().split(",");
+
   const colIndex = {};
-  header.forEach((colName, idx) => {
-    colIndex[colName] = idx;
+  header.forEach((h, i) => (colIndex[h] = i));
+
+  raw.forEach((ln) => {
+    const row = ln.split(",");
+    const sym = row[colIndex.symbol];
+    if (!historicalDataCache[sym]) historicalDataCache[sym] = [];
+
+    /* convert only the 17 forecast features to numbers */
+    const daily = { date: row[colIndex.date] };
+    FORECAST_FEATURE_KEYS.forEach((k) => {
+      daily[k] = +row[colIndex[k]] || 0;
+    });
+    historicalDataCache[sym].push(daily);
   });
 
-  // Now parse each data row
-  for (let i = 1; i < lines.length; i++) {
-    const row = lines[i].split(",");
-    if (row.length < 2) continue; // skip blank lines
-
-    const symbol = row[colIndex["symbol"]];
-    const dateStr = row[colIndex["date"]];
-    const open = parseFloat(row[colIndex["open"]]) || 0;
-    const high = parseFloat(row[colIndex["high"]]) || 0;
-    const low = parseFloat(row[colIndex["low"]]) || 0;
-    const close = parseFloat(row[colIndex["close"]]) || 0;
-    const volume = parseFloat(row[colIndex["volume"]]) || 0;
-    const peRatio = parseFloat(row[colIndex["peRatio"]]) || 0;
-    const earningsGrowth = parseFloat(row[colIndex["earningsGrowth"]]) || 0;
-    const debtToEquity = parseFloat(row[colIndex["debtToEquity"]]) || 0;
-
-    if (!historicalDataCache[symbol]) {
-      historicalDataCache[symbol] = [];
-    }
-    historicalDataCache[symbol].push({
-      date: dateStr,
-      open,
-      high,
-      low,
-      close,
-      volume,
-      peRatio,
-      earningsGrowth,
-      debtToEquity,
-    });
+  /* ensure ascending date order */
+  for (const s in historicalDataCache) {
+    historicalDataCache[s].sort((a, b) => new Date(a.date) - new Date(b.date));
   }
 
-  // (Optional) sort each symbol’s array ascending by date
-  for (const sym in historicalDataCache) {
-    historicalDataCache[sym].sort((a, b) => new Date(a.date) - new Date(b.date));
-  }
-
-  console.log("Finished loading CSV into memory. Symbols loaded:", Object.keys(historicalDataCache).length);
+  console.log(`✅ CSV loaded – ${Object.keys(historicalDataCache).length} symbols`);
+  console.timeEnd("CSV‑load");
 }
 
+/*─────────────────────────────────────────────────────
+  3) Phase‑3 window extractor   (30 × 17 numeric matrix)
+─────────────────────────────────────────────────────*/
+const BUCKET = {        // bucket slices generated during Phase‑3 prep
+  NASDAQ: "NASDAQ.csv",
+  NYSE:   "NYSE.csv",
+  TSX:    "TSX.csv"
+};
+
 /**
- * getCachedHistoricalData(symbol)
- * Return the array from memory, or empty if none.
+ * @param {string} symbol  e.g. "AAPL"
+ * @param {Array|object} symbolsList – the same array you use in server.js
+ * @return {Promise<number[][]>}  shape [30,17]
  */
+async function getWindowFromBucket(symbol, symbolsList = []) {
+  /* find exchange first */
+  const entry = symbolsList.find((s) => (s.symbol || s) === symbol);
+  if (!entry) throw new Error(`exchange not found for ${symbol}`);
+
+  const bucketFile = path.join(__dirname, "data", BUCKET[entry.exchange || entry.ex]);
+  if (!fs.existsSync(bucketFile))
+    throw new Error(`${bucketFile} missing – run your Phase‑3 slice script first`);
+
+  const rows = [];
+  await new Promise((resolve) => {
+    readline
+      .createInterface({ input: fs.createReadStream(bucketFile) })
+      .on("line", (ln) => {
+        if (ln.startsWith(symbol + ",")) {
+          rows.push(ln.split(","));
+          if (rows.length > LOOKBACK) rows.shift(); // sliding window keep last 30
+        }
+      })
+      .on("close", resolve);
+  });
+
+  if (rows.length < LOOKBACK) throw new Error("not enough history for window");
+
+  /* project numeric 17‑column feature vector (skip symbol,date → +2 offset) */
+  return rows.map((r) =>
+    FORECAST_FEATURE_KEYS.map((_, i) => +r[i + 2] || 0)
+  );
+}
+
+/*─────────────────────────────────────────────────────
+  4) Simple helpers
+─────────────────────────────────────────────────────*/
 function getCachedHistoricalData(symbol) {
   return historicalDataCache[symbol] || [];
 }
 
-/**
- * storeInMemoryData(symbol, dataArray)
- * Overwrite or merge data in memory for that symbol
- */
-function storeInMemoryData(symbol, dataArray) {
-  // You might want to merge with existing data. 
-  // For simplicity, let's just overwrite:
-  historicalDataCache[symbol] = dataArray;
-  // But if you want to do a merge, you'd do something like:
-  //   combined = existing + dataArray => remove duplicates => sort => store
+function storeInMemoryData(symbol, rows) {
+  historicalDataCache[symbol] = rows;
 }
 
-/** 
- * fetchHistoricalData(symbol, yearsBack = 1)
- * Example function if you want to fetch from Yahoo for up to 'yearsBack'
- */
+/*─────────────────────────────────────────────────────
+  5) Yahoo fall‑back fetchers (optional)
+─────────────────────────────────────────────────────*/
 async function fetchHistoricalData(symbol, yearsBack = 1) {
-  const now = new Date();
+  const now   = new Date();
   const start = new Date(now);
   start.setFullYear(start.getFullYear() - yearsBack);
   try {
-    const results = await yahooFinance.historical(symbol, {
+    return await yahooFinance.historical(symbol, {
       period1: start,
       period2: now,
-      interval: "1d",
+      interval: "1d"
     });
-    return results || [];
   } catch (err) {
-    console.error(`Error in fetchHistoricalData for ${symbol}:`, err.message);
+    console.error(`❌ yahooHistorical ${symbol}:`, err.message);
     return [];
   }
 }
 
-/** 
- * fetchAllSymbolsHistoricalData(symbols, yearsBack = 1)
- * For each symbol in 'symbols', fetch up to 'yearsBack' of data from Yahoo,
- * then store in memory (and optionally append to CSV).
- */
 async function fetchAllSymbolsHistoricalData(symbols, yearsBack = 1) {
   for (const s of symbols) {
-    const symbol = typeof s === "string" ? s : s.symbol;
-    console.log(`fetchAllSymbolsHistoricalData: fetching for ${symbol}...`);
-    const data = await fetchHistoricalData(symbol, yearsBack);
-    if (data && data.length > 0) {
-      // Convert to your shape
-      const shaped = data.map((d) => ({
-        date: d.date.toISOString().substr(0, 10),
-        open: d.open || 0,
-        high: d.high || 0,
-        low: d.low || 0,
-        close: d.close || 0,
-        volume: d.volume || 0,
-        peRatio: 0,
-        earningsGrowth: 0,
-        debtToEquity: 0,
-      }));
-      shaped.sort((a, b) => new Date(a.date) - new Date(b.date));
-      // Store in memory
-      storeInMemoryData(symbol, shaped);
-      // Optionally append to CSV or rewrite CSV
-      // ...
-    } else {
-      console.warn(`No data fetched for ${symbol}.`);
-    }
+    const sym = typeof s === "string" ? s : s.symbol;
+    const raw = await fetchHistoricalData(sym, yearsBack);
+    if (!raw.length) continue;
+
+    const shaped = raw.map((d) => {
+      const out = { date: d.date.toISOString().slice(0, 10) };
+      FORECAST_FEATURE_KEYS.forEach((k) => (out[k] = 0));
+      out.open   = d.open   ?? 0;
+      out.high   = d.high   ?? 0;
+      out.low    = d.low    ?? 0;
+      out.close  = d.close  ?? 0;
+      out.volume = d.volume ?? 0;
+      return out;
+    });
+    shaped.sort((a, b) => new Date(a.date) - new Date(b.date));
+    storeInMemoryData(sym, shaped);
   }
 }
 
-// Export
+/*─────────────────────────────────────────────────────
+  6) Exports
+─────────────────────────────────────────────────────*/
 module.exports = {
+  /* caching / CSV */
   loadCsvIntoMemory,
   getCachedHistoricalData,
   storeInMemoryData,
+
+  /* Phase‑3 helpers */
+  getWindowFromBucket,
+  FORECAST_FEATURE_KEYS,
+
+  /* Yahoo fall‑backs */
   fetchHistoricalData,
-  fetchAllSymbolsHistoricalData,
-  historicalDataCache,
+  fetchAllSymbolsHistoricalData
 };
 
-// If run standalone: node fetchData.js
+/*─────────────────────────────────────────────────────
+  7) Stand‑alone sanity test
+─────────────────────────────────────────────────────*/
 if (require.main === module) {
-  console.log("Running fetchData.js standalone...");
-  loadCsvIntoMemory();
-  console.log("Done. You now have historicalDataCache filled from CSV.");
+  (async () => {
+    try {
+      loadCsvIntoMemory();
+      const symbolsList = JSON.parse(
+        fs.readFileSync(path.join(__dirname, "symbols.json"), "utf8")
+      );
+      const sample = await getWindowFromBucket("AAPL", symbolsList);
+      console.log("Sample AAPL window shape:", sample.length, "×", sample[0].length);
+    } catch (e) {
+      console.error("✘", e.message);
+    }
+  })();
 }

@@ -19,37 +19,36 @@ const nodemailer = require("nodemailer");
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
 
-const RSSParser   = require("rss-parser");
-const Sentiment   = require("sentiment");
-const fetchNative = require("node-fetch");
-const cheerio     = require("cheerio");
+const RSSParser     = require("rss-parser");
+const Sentiment     = require("sentiment");
+const fetchNative   = require("node-fetch");
+const cheerio       = require("cheerio");
 
-const rssParser = new RSSParser();
-const sentiment = new Sentiment();
+const symbolsList = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "symbols.json"), "utf8")
+);
+
+const rssParser     = new RSSParser();
+const sentiment     = new Sentiment()
+
+const { predictNextDay } = require("./data/trainGRU");   // lazy‑loads each symbol’s GRU
+
 
 /**
- * IMPORTANT: The model now expects [?, 30, 16].
- * We’ve added three new features: BB_upper, BB_lower, ATR14.
+ * IMPORTANT: The model expects [?, 30, 13].
+ * So we revert TIME_SERIES_WINDOW to 30
+ * and we use the same 13 features from trainGRU.js
  */
+
+// Changed from 90 back to 30 to match training window
 const TIME_SERIES_WINDOW = 30;
+
+// These 13 features match your trainGRU.js
 const FORECAST_FEATURE_KEYS = [
-  "open",
-  "high",
-  "low",
-  "close",
-  "volume",
-  "peRatio",
-  "earningsGrowth",
-  "debtToEquity",
-  "revenue",
-  "netIncome",
-  "SMA20",
-  "RSI14",
-  "MACD",
-  "BB_upper",
-  "BB_lower",
-  "ATR14",
-];
+  "open","high","low","close","volume",
+  "peRatio","earningsGrowth","debtToEquity","revenue","netIncome",
+  "ATR14","SMA20","STD20","BB_upper","BB_lower",
+  "RSI14","MACD"];
 
 // ────────────────────────────────────────────────────────────
 //  1) fetchData Helpers
@@ -117,29 +116,41 @@ function isMarketOpen() {
 
 function getForecastEndTime() {
   const now = new Date();
-  const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  // Convert current time to Eastern Time
+  const etNow = new Date(
+    now.toLocaleString("en-US", { timeZone: "America/New_York" })
+  );
 
-  let forecastDate, label;
+  let forecastDate;
+  let label = "";
+  
+  // If market is open and it's before 4:00pm ET, forecast for today's close.
   if (isMarketOpen() && etNow.getHours() < 16) {
-    etNow.setHours(16,0,0,0);
+    etNow.setHours(16, 0, 0, 0);
     forecastDate = etNow;
     label = "Today";
   } else {
+    // Otherwise, forecast for the next trading day.
     forecastDate = new Date(etNow);
-    forecastDate.setDate(forecastDate.getDate()+1);
-    while (forecastDate.getDay()===0||forecastDate.getDay()===6) {
-      forecastDate.setDate(forecastDate.getDate()+1);
+    forecastDate.setDate(forecastDate.getDate() + 1);
+    // Skip weekends
+    while (forecastDate.getDay() === 0 || forecastDate.getDay() === 6) {
+      forecastDate.setDate(forecastDate.getDate() + 1);
     }
-    forecastDate.setHours(16,0,0,0);
+    forecastDate.setHours(16, 0, 0, 0);
     label = "Next Trading Day";
   }
 
-  const mm = String(forecastDate.getMonth()+1).padStart(2,'0');
-  const dd = String(forecastDate.getDate()).padStart(2,'0');
-  const yyyy = forecastDate.getFullYear();
-  return `${label}, 4:00pm, ${mm}/${dd}/${yyyy}`;
+  // Format forecastDate as "Label, 4:00pm, MM/DD/YYYY"
+  const month = String(forecastDate.getMonth() + 1).padStart(2, "0");
+  const day = String(forecastDate.getDate()).padStart(2, "0");
+  const year = forecastDate.getFullYear();
+  
+  return `${label}, 4:00pm, ${month}/${day}/${year}`;
 }
 
+
+// yahooFinance request options
 const requestOptions = {
   headers: {
     "User-Agent":
@@ -160,6 +171,7 @@ const communityPostSchema = new mongoose.Schema({
 });
 const CommunityPost = mongoose.model("CommunityPost", communityPostSchema);
 
+// 2.1) Load industry metrics
 let industryMetrics = {};
 try {
   industryMetrics = require("./industryMetrics.json");
@@ -172,29 +184,34 @@ try {
 // ────────────────────────────────────────────────────────────
 const app = express();
 
-app.use(cors({
-  origin: [
-    "https://sci-investments.web.app",
-    "http://localhost:3000"
-  ],
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","Accept"],
-}));
+// Expand CORS origins to allow both your frontend & localhost
+app.use(
+  cors({
+    origin: [
+      "https://sci-investments.web.app",
+      "http://localhost:3000"
+    ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  })
+);
 app.options("*", cors());
 app.use(bodyParser.json());
 
 // ────────────────────────────────────────────────────────────
 //  6) MongoDB Connection
 // ────────────────────────────────────────────────────────────
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-})
+const MONGODB_URI =
+  process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/sci_investments";
+mongoose
+  .connect(MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+  })
   .then(() => console.log("✅ Connected to MongoDB"))
-  .catch(err => console.error("❌ MongoDB Connection Error:", err.message));
+  .catch((err) => console.error("❌ MongoDB Connection Error:", err.message));
 mongoose.set("debug", true);
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
@@ -202,8 +219,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
 // ────────────────────────────────────────────────────────────
 //  7) Forecast Model Setup
 // ────────────────────────────────────────────────────────────
-let forecastModel = null;
-let normalizationParams = null;
+
 
 async function loadForecastResources() {
   try {
@@ -211,9 +227,15 @@ async function loadForecastResources() {
     forecastModel = await tf.loadLayersModel(modelPath);
     console.log("✅ Forecast model loaded from", modelPath);
 
-    const normPath = path.join(__dirname, "model", "forecast_model", "normalization.json");
+    const normPath = path.join(
+      __dirname,
+      "model",
+      "forecast_model",
+      "normalization.json"
+    );
     if (fs.existsSync(normPath)) {
-      normalizationParams = JSON.parse(fs.readFileSync(normPath,"utf8"));
+      const normData = fs.readFileSync(normPath, "utf-8");
+      normalizationParams = JSON.parse(normData);
       console.log("✅ Normalization parameters loaded.");
     } else {
       console.warn("⚠️ No normalization.json found. Advanced forecasting may be skipped.");
@@ -228,7 +250,7 @@ async function loadForecastResources() {
 loadForecastResources();
 
 const forecastCache = {};
-const FORECAST_CACHE_TTL = 24*60*60*1000; // 24h
+const FORECAST_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 // ────────────────────────────────────────────────────────────
 //  8) Simple Forecast Fallback
@@ -236,53 +258,173 @@ const FORECAST_CACHE_TTL = 24*60*60*1000; // 24h
 async function simpleForecastPrice(symbol, currentPrice) {
   try {
     const historicalData = getCachedHistoricalData(symbol);
-    if (!historicalData || historicalData.length<5) return currentPrice;
-    historicalData.sort((a,b)=>new Date(a.date)-new Date(b.date));
-    const recent = historicalData.slice(-10);
-    let sum=0, count=0;
-    for (const day of recent) {
+    if (!historicalData || historicalData.length < 5) {
+      return currentPrice;
+    }
+    historicalData.sort((a, b) => new Date(a.date) - new Date(b.date));
+    const recentData = historicalData.slice(-10);
+    let sumPct = 0;
+    let count = 0;
+    for (const day of recentData) {
       if (day.open && day.close) {
-        sum += (day.close - day.open)/day.open;
+        const pctChange = (day.close - day.open) / day.open;
+        sumPct += pctChange;
         count++;
       }
     }
-    const avg = count ? sum/count : 0;
-    return currentPrice * (1+avg);
-  } catch {
+    const avgDailyReturn = count ? sumPct / count : 0;
+    const forecast = currentPrice * (1 + avgDailyReturn);
+    console.log(
+      `Simple forecast for ${symbol}: currentPrice=${currentPrice}, avgDailyReturn=${(avgDailyReturn * 100).toFixed(2)}%, forecast=${forecast.toFixed(2)}`
+    );
+    return forecast;
+  } catch (err) {
+    console.error(`Error in simpleForecastPrice for ${symbol}:`, err.message);
     return currentPrice;
   }
 }
 
+
+
+/*───────── Phase‑3 window extractor ─────────
+  Returns the last 30 rows (newest last) as a
+  30 × 17 numeric matrix in feature‑order.
+──────────────────────────────────────────────*/
+const BUCKET = {
+  NASDAQ: "NASDAQ.csv",
+  NYSE:   "NYSE.csv",
+  TSX:    "TSX.csv"
+};
+
+async function getWindowFromBucket(symbol) {
+  // find which exchange the ticker lives on
+  const entry = symbolsList.find(s => (s.symbol || s) === symbol);
+  if (!entry) throw new Error(`exchange not found for ${symbol}`);
+
+  const bucketFile = path.join(__dirname, "data", BUCKET[entry.exchange || entry.ex]);
+  if (!fs.existsSync(bucketFile))
+    throw new Error(`${bucketFile} missing - generate the Phase-3 CSV slices first`);
+
+  const rows = [];
+  await new Promise(res => {
+    require("readline")
+      .createInterface({ input: fs.createReadStream(bucketFile) })
+      .on("line", ln => {
+        if (!ln.startsWith(symbol + ",")) return;
+        rows.push(ln.split(","));              // keep raw split row
+        if (rows.length > 30) rows.shift();    // sliding window
+      })
+      .on("close", res);
+  });
+
+  if (rows.length < 30) throw new Error("not enough history");
+
+  /* project the 17 columns — skip   symbol,date  */
+  return rows.map(r =>
+    FORECAST_FEATURE_KEYS.map((_, i) => +r[i + 2] || 0)   // 30 × 17
+  );
+}
+
+
+/*──────────────────────────────────────────
+  Helper – returns a price forecast (cached)
+──────────────────────────────────────────*/
+async function buildForecastPrice(symbol, currentPrice) {
+  /* honour cache first */
+  if (
+    forecastCache[symbol] &&
+    Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+  ) {
+    return forecastCache[symbol].price;
+  }
+
+  // ---------- NEW Phase‑3 logic ----------
+  let advanced = null;
+  try {
+    // 30 × 17 matrix from the monolithic CSV
+    const window = await getWindowFromBucket(symbol);
+
+    // predictNextDay comes from backend/data/trainGRU.js
+    advanced = await predictNextDay(symbol, window);
+  } catch (e) {
+    console.warn(`⚠️  forecast skip ${symbol}: ${e.message}`);
+  }
+
+  // always fall back to the simple statistical forecast
+  const simple = await simpleForecastPrice(symbol, currentPrice);
+
+  const final =
+    advanced && Math.abs(advanced - currentPrice) > 0.01
+      ? advanced
+      : simple;
+
+  /* cache & return */
+  forecastCache[symbol] = { price: final, timestamp: Date.now() };
+  return final;
+}
+
+
+
 // ────────────────────────────────────────────────────────────
-//  9) Stock Data Caching
+//  9) Stock Data Caching for "quoteSummary"
 // ────────────────────────────────────────────────────────────
 const stockDataCache = {};
-const CACHE_TTL = 15*60*1000;
+const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
 async function fetchStockData(symbol) {
   const now = Date.now();
-  if (!isMarketOpen() && stockDataCache[symbol]) {
+  const marketOpen = isMarketOpen();
+
+  if (!marketOpen && stockDataCache[symbol]) {
+    console.log(`Market closed, using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
   if (stockDataCache[symbol] && now - stockDataCache[symbol].timestamp < CACHE_TTL) {
+    console.log(`Using cached data for ${symbol}`);
     return stockDataCache[symbol].data;
   }
-  const modules = ["financialData","price","summaryDetail","defaultKeyStatistics","assetProfile"];
-  const data = await yahooFinance.quoteSummary(symbol, { modules, validateResult:false }, { fetchOptions: requestOptions });
-  if (!data || !data.price) throw new Error("Invalid data");
-  stockDataCache[symbol] = { data, timestamp: now };
-  return data;
+
+  console.log(`Fetching fresh data for ${symbol}`);
+  const modules = [
+    "financialData",
+    "price",
+    "summaryDetail",
+    "defaultKeyStatistics",
+    "assetProfile",
+  ];
+  try {
+    const data = await yahooFinance.quoteSummary(
+      symbol,
+      { modules, validateResult: false },
+      { fetchOptions: requestOptions }
+    );
+    if (!data || !data.price) {
+      throw new Error("Missing or invalid data from quoteSummary");
+    }
+    stockDataCache[symbol] = { data, timestamp: now };
+    return data;
+  } catch (err) {
+    if (err.message.includes("Unexpected token")) {
+      console.error(`❌ Possibly rate-limited or captcha from Yahoo for ${symbol}:`, err.message);
+    } else {
+      console.error(`❌ Error fetching data for ${symbol}:`, err.message);
+    }
+    return null;
+  }
 }
 
-async function fetchTimeSeriesData(symbol, days=TIME_SERIES_WINDOW) {
-  const hist = getCachedHistoricalData(symbol);
-  if (!hist || hist.length===0) throw new Error("No data");
-  hist.sort((a,b)=>new Date(a.date)-new Date(b.date));
-  return hist.slice(-days);
+async function fetchTimeSeriesData(symbol, days = TIME_SERIES_WINDOW) {
+  // Now using the same default as TIME_SERIES_WINDOW
+  const historical = getCachedHistoricalData(symbol);
+  if (!historical || historical.length === 0) {
+    throw new Error(`No daily data available for ${symbol}.`);
+  }
+  historical.sort((a, b) => new Date(a.date) - new Date(b.date));
+  return historical.slice(-days);
 }
 
 // ────────────────────────────────────────────────────────────
-// 10) Stock History Route
+// 10) Historical Data for Charting (live route)
 // ────────────────────────────────────────────────────────────
 app.post("/api/stock-history", async (req, res) => {
   const { symbol, range } = req.body;
@@ -348,6 +490,7 @@ app.post("/api/stock-history", async (req, res) => {
 // ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("✅ Combined Server is running!"));
 
+// SIGNUP uses email, username, and password
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
   if (!email || !username || !password) {
@@ -369,13 +512,14 @@ app.post("/signup", async (req, res) => {
   }
 });
 
+// LOGIN now uses email (instead of username)
 app.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body; // CHANGED: using email instead of username
   if (!email || !password) {
     return res.status(400).json({ message: "Email and password are required." });
   }
   try {
-    const user = await UserModel.findOne({ email });
+    const user = await UserModel.findOne({ email }); // lookup by email
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials." });
     }
@@ -418,10 +562,13 @@ app.post("/api/check-stock", async (req, res) => {
       .json({ message: "Stock symbol and intent (buy/sell) are required." });
   }
   try {
+    // 1) Fetch current fundamentals
     let stock = await fetchStockData(symbol);
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
+
+    // 2) Calculate metrics
     const computedAvgVolume =
       stock.summaryDetail?.averageDailyVolume3Month || stock.price?.regularMarketVolume || 0;
     const metrics = {
@@ -438,7 +585,7 @@ app.post("/api/check-stock", async (req, res) => {
       fiftyTwoWeekLow: stock.summaryDetail?.fiftyTwoWeekLow ?? 0,
     };
 
-    // Compute fundamentalRating
+    // (A) fundamentalRating
     let baseScore = 0;
     if (metrics.volume > computedAvgVolume * 1.2) baseScore += 3;
     else if (metrics.volume < computedAvgVolume * 0.8) baseScore -= 2;
@@ -467,8 +614,7 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     let industryScore = 0;
-    const stockIndustry =
-      stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
+    const stockIndustry = stock.assetProfile?.industry || stock.assetProfile?.sector || "Unknown";
     if (stockIndustry !== "Unknown" && industryMetrics[stockIndustry]) {
       const ind = industryMetrics[stockIndustry];
       if (metrics.peRatio && ind.peRatio) {
@@ -485,7 +631,7 @@ app.post("/api/check-stock", async (req, res) => {
 
     const fundamentalRating = baseScore + dayScore + weekScore + industryScore;
 
-    // Advanced forecasting via GRU
+    // (B) advanced forecasting via GRU
     let advancedForecastPrice = null;
     let timeSeriesData;
     try {
@@ -520,7 +666,7 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // Determine final forecastPrice
+    // (C) determine final forecastPrice
     let finalForecastPrice = null;
     const currentPrice = metrics.currentPrice;
     if (
@@ -540,7 +686,7 @@ app.post("/api/check-stock", async (req, res) => {
       forecastCache[symbol] = { price: finalForecastPrice, timestamp: Date.now() };
     }
 
-    // Forecast growth & classification
+    // (D) forecast growth & classification
     const forecastGrowthPercent =
       ((finalForecastPrice - currentPrice) / currentPrice) * 100;
     let finalClassification, finalAdvice;
@@ -556,7 +702,7 @@ app.post("/api/check-stock", async (req, res) => {
     }
     const forecastEndDate = getForecastEndTime();
 
-    // News & Event Analysis
+    // ─── News & Event Analysis ─────────────────────────────
     async function fetchNewsAndEvents(sym) {
       try {
         const feed = await rssParser.parseURL(
@@ -597,8 +743,9 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
     const { avgSentiment, analyses: newsAnalyses } = await fetchNewsAndEvents(symbol);
+    // ────────────────────────────────────────────────────────────
 
-    // Respond with forecast + news
+    // (E) Respond with forecast + news
     return res.json({
       symbol,
       name: stock.price.longName || symbol,
@@ -654,7 +801,10 @@ async function classifyStockByForecast(symbol) {
     let timeSeriesData;
     try {
       timeSeriesData = await fetchTimeSeriesData(symbol, TIME_SERIES_WINDOW);
-    } catch {}
+    } catch {
+      // not enough data
+    }
+
     if (
       timeSeriesData &&
       timeSeriesData.length === TIME_SERIES_WINDOW &&
@@ -677,7 +827,9 @@ async function classifyStockByForecast(symbol) {
         const predVal = predictionTensor.dataSync()[0];
         const closeStats = normalizationParams["close"] || { mean: 0, std: 1 };
         advancedForecastPrice = predVal * closeStats.std + closeStats.mean;
-      } catch {}
+      } catch {
+        // advanced forecast error
+      }
     }
 
     if (
@@ -704,7 +856,64 @@ async function classifyStockByForecast(symbol) {
 
 const finderRouter = express.Router();
 finderRouter.post("/api/find-stocks", async (req, res) => {
-  // ...unchanged finder logic...
+  try {
+    let { stockType, exchange, minPrice, maxPrice } = req.body;
+    if (typeof stockType === "string") stockType = stockType.toLowerCase();
+    if (typeof exchange === "string") exchange = exchange.toUpperCase();
+    if (
+      !stockType ||
+      !exchange ||
+      typeof minPrice !== "number" ||
+      typeof maxPrice !== "number"
+    ) {
+      return res.status(400).json({ message: "Invalid finder parameters." });
+    }
+
+    const filtered = [];
+    for (const s of allStocks) {
+      const sym = typeof s === "string" ? s : s.symbol;
+      const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
+      if (exch.toUpperCase() !== exchange) continue;
+
+      let data = null;
+      try {
+        data = await fetchStockData(sym);
+      } catch (err) {
+        console.warn(`Finder: skipping ${sym} due to fetch error: ${err.message}`);
+        continue;
+      }
+      if (!data || !data.price) {
+        console.warn(`Finder: skipping ${sym} (no data.price)`);
+        continue;
+      }
+      const currentPrice = data.price.regularMarketPrice;
+      if (!currentPrice) continue;
+      if (currentPrice < minPrice || currentPrice > maxPrice) continue;
+
+      // Classify by forecast
+      try {
+        const { classification } = await classifyStockByForecast(sym);
+        if (classification !== stockType) {
+          continue;
+        }
+        filtered.push({ symbol: sym, exchange: exch });
+      } catch (err) {
+        console.warn(`Finder classification error for ${sym}: ${err.message}`);
+        continue;
+      }
+    }
+
+    return res.json({ stocks: filtered });
+  } catch (error) {
+    console.error("Finder error:", error.message);
+    return res.status(500).json({ message: "Error finding stocks." });
+  }
+});
+finderRouter.post("/signup", async (req, res) => {
+  return res.json({ message: "Signup from finder not used." });
+});
+finderRouter.post("/login", async (req, res) => {
+  return res.json({ message: "Login from finder not used." });
 });
 app.use("/finder", finderRouter);
 
@@ -712,8 +921,78 @@ app.use("/finder", finderRouter);
 // 15) Other endpoints (Popular Stocks, Forecast-stock, etc.)
 // ────────────────────────────────────────────────────────────
 app.get("/api/popular-stocks", async (req, res) => {
-  // ...unchanged...
+  try {
+    const popularSymbols = ["AAPL", "TSLA", "AMZN", "NVDA", "META", "GOOG", "MSFT"];
+    const results = [];
+    for (const symbol of popularSymbols) {
+      const stock = await fetchStockData(symbol);
+      if (!stock || !stock.price) {
+        console.warn(`Skipping ${symbol}: no price data`);
+        continue;
+      }
+      results.push({
+        symbol: symbol,
+        name: stock.price.longName || symbol,
+        price: stock.price.regularMarketPrice || 0,
+        volume: stock.price.regularMarketVolume || 0,
+      });
+    }
+    return res.json({ stocks: results });
+  } catch (err) {
+    console.error("Error fetching popular stocks:", err.message);
+    return res.status(500).json({ message: "Error fetching popular stocks." });
+  }
 });
+
+/*──────────────────────────────────────────
+  /api/top-forecasted  –  Top 5 upside picks
+──────────────────────────────────────────*/
+app.get("/api/top-forecasted", async (req, res) => {
+  try {
+    /* first 200 tickers for speed */
+    const sample = symbolsList.slice(0, 200).map((s) =>
+      typeof s === "string" ? s : s.symbol
+    );
+
+    const rows = [];
+    for (const sym of sample) {
+      try {
+        const q = await fetchStockData(sym);
+        const price = q.price?.regularMarketPrice;
+        if (!price) continue;
+
+        const fc = await buildForecastPrice(sym, price);
+        rows.push({ symbol: sym, gain: ((fc - price) / price) * 100 });
+      } catch {}
+    }
+    rows.sort((a, b) => b.gain - a.gain);
+    return res.json({ forecasts: rows.slice(0, 5) });
+  } catch (err) {
+    console.error("top‑forecasted:", err.message);
+    return res.status(500).json({ forecasts: [] });
+  }
+});
+
+/*──────────────────────────────────────────
+  /api/top-news  –  five latest market headlines
+──────────────────────────────────────────*/
+app.get("/api/top-news", async (req, res) => {
+  try {
+    const feed = await rssParser.parseURL(
+      "https://news.google.com/rss/search?q=stock+market"
+    );
+    const headlines = (feed.items || []).slice(0, 5).map((i) => ({
+      title: i.title,
+      url: i.link,
+    }));
+    return res.json({ headlines });
+  } catch (err) {
+    console.error("top‑news:", err.message);
+    return res.status(500).json({ headlines: [] });
+  }
+});
+
+
 app.post("/api/forecast-stock", async (req, res) => {
   return res.json({ message: "Forecast-stock not fully implemented." });
 });
@@ -722,10 +1001,27 @@ app.post("/api/forecast-stock", async (req, res) => {
 // 16) Community Endpoints
 // ────────────────────────────────────────────────────────────
 app.get("/api/community-posts", async (req, res) => {
-  // ...unchanged...
+  try {
+    const posts = await CommunityPost.find().sort({ createdAt: -1 });
+    return res.json({ posts });
+  } catch (err) {
+    console.error("Error fetching community posts:", err.message);
+    return res.status(500).json({ message: "Error fetching community posts." });
+  }
 });
 app.post("/api/community-posts", async (req, res) => {
-  // ...unchanged...
+  const { username, message } = req.body;
+  if (!username || !message) {
+    return res.status(400).json({ message: "Username and message are required." });
+  }
+  try {
+    const newPost = new CommunityPost({ username, message });
+    await newPost.save();
+    return res.status(201).json({ message: "Post created successfully." });
+  } catch (error) {
+    console.error("Error creating post:", error.message);
+    return res.status(500).json({ message: "Error creating post." });
+  }
 });
 
 // ────────────────────────────────────────────────────────────
@@ -738,13 +1034,14 @@ app.get("/api/notifications", (req, res) => {
 // ────────────────────────────────────────────────────────────
 // 18) AUTOMATED INVESTOR SECTION
 // ────────────────────────────────────────────────────────────
-const SYMBOLS_JSON_PATH   = path.join(__dirname, "symbols.json");
+const SYMBOLS_JSON_PATH = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON_PATH = path.join(__dirname, "portfolio.json");
 
 let allStocks = [];
 if (fs.existsSync(SYMBOLS_JSON_PATH)) {
   try {
-    allStocks = JSON.parse(fs.readFileSync(SYMBOLS_JSON_PATH, "utf8"));
+    const rawContent = fs.readFileSync(SYMBOLS_JSON_PATH, "utf-8");
+    allStocks = JSON.parse(rawContent);
     console.log(`✅ Loaded ${allStocks.length} stocks from symbols.json`);
   } catch (err) {
     console.error("Error parsing symbols.json:", err);
@@ -755,25 +1052,152 @@ if (fs.existsSync(SYMBOLS_JSON_PATH)) {
 }
 
 let portfolio = fs.existsSync(PORTFOLIO_JSON_PATH)
-  ? JSON.parse(fs.readFileSync(PORTFOLIO_JSON_PATH, "utf8"))
+  ? JSON.parse(fs.readFileSync(PORTFOLIO_JSON_PATH, "utf-8"))
   : [];
 function savePortfolio() {
   fs.writeFileSync(PORTFOLIO_JSON_PATH, JSON.stringify(portfolio, null, 2));
 }
 
-// ...autoBuy, autoSell, simulate-trades, execute-trade unchanged...
+async function getFilteredSymbols(stockType, exchange, minPrice, maxPrice) {
+  const filteredSymbols = [];
+  const batchSize = 10;
+  for (let i = 0; i < allStocks.length; i += batchSize) {
+    const batch = allStocks.slice(i, i + batchSize);
+    for (const s of batch) {
+      const symbol = typeof s === "string" ? s : s.symbol;
+      if (s.exchange && s.exchange !== exchange) continue;
+      try {
+        const data = await fetchStockData(symbol);
+        if (!data) {
+          console.error(`Filtering: Skipping ${symbol} due to error or null data`);
+          continue;
+        }
+        const currentPrice = data?.price?.regularMarketPrice;
+        if (!currentPrice) continue;
+        if (currentPrice < minPrice || currentPrice > maxPrice) continue;
+        filteredSymbols.push(symbol);
+      } catch (err) {
+        console.error(`Filtering: Skipping ${symbol} due to error:`, err.message);
+        continue;
+      }
+    }
+    await delay(5000);
+  }
+  console.log(`Filtered symbols count: ${filteredSymbols.length}`);
+  return filteredSymbols;
+}
+
+async function autoBuyStocks() {
+  if (!isMarketOpen()) return;
+  const stockType = "growth";
+  const exchange = "NASDAQ";
+  const minPrice = 10;
+  const maxPrice = 100;
+  const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
+  for (const symbol of filteredSymbols) {
+    try {
+      console.log(`autoBuyStocks would analyze ${symbol} here...`);
+      // Additional logic or forecasting calls if desired
+    } catch (error) {
+      console.error(`Error analyzing stock ${symbol}:`, error.message);
+    }
+  }
+}
+
+async function autoSellStocks() {
+  if (!isMarketOpen()) return;
+  // Implement your autoSell logic here
+}
+
+setInterval(async () => {
+  try {
+    await autoBuyStocks();
+    await autoSellStocks();
+  } catch (err) {
+    console.error("Error running automated investor tasks:", err.message);
+  }
+}, 60_000);
+
+app.get("/api/simulate-trades", async (req, res) => {
+  try {
+    let simulatedPortfolio = JSON.parse(JSON.stringify(portfolio));
+    let simulationLog = [];
+    const stockType = "growth";
+    const exchange = "NASDAQ";
+    const minPrice = 10;
+    const maxPrice = 100;
+    const filteredSymbols = await getFilteredSymbols(stockType, exchange, minPrice, maxPrice);
+    for (const symbol of filteredSymbols) {
+      try {
+        console.log(`Simulating buy for symbol: ${symbol}`);
+        const data = await fetchStockData(symbol);
+        if (!data || !data.price) continue;
+        let rating = 0;
+        const avgVol =
+          data.summaryDetail?.averageDailyVolume3Month ||
+          data.price?.regularMarketVolume ||
+          0;
+        const currPrice = data.price?.regularMarketPrice || 0;
+        if (data.price?.regularMarketVolume > avgVol * 1.2) rating += 3;
+        if (currPrice < 100) rating += 2;
+        if (rating >= 2 && currPrice < 100) {
+          simulationLog.push(`Simulated Buy: ${symbol} at $${currPrice} (Rating: ${rating})`);
+          simulatedPortfolio.push({
+            symbol,
+            buyPrice: currPrice,
+            quantity: 10,
+            buyDate: new Date().toISOString(),
+          });
+        }
+      } catch (err) {
+        console.error(`Simulation: Skipping ${symbol} due to error: ${err.message}`);
+        continue;
+      }
+    }
+    return res.json({
+      message: "Simulation complete.",
+      simulationLog,
+      simulatedPortfolio,
+    });
+  } catch (error) {
+    console.error("Simulation error:", error.message);
+    return res.status(500).json({ message: "Simulation error.", error: error.message });
+  }
+});
+
+app.post("/api/execute-trade", async (req, res) => {
+  const { symbol, quantity, action } = req.body;
+  try {
+    res.json({ message: `Trade executed: ${action} ${quantity} shares of ${symbol}` });
+  } catch (error) {
+    console.error("Trade execution error:", error.message);
+    res.status(500).json({ message: "Trade execution failed", error: error.message });
+  }
+});
 
 // ────────────────────────────────────────────────────────────
 // 18) Daily Job: Refresh All Historical Data
 // ────────────────────────────────────────────────────────────
 const ONE_DAY = 24 * 60 * 60 * 1000;
 async function refreshAllHistoricalData() {
-  if (!fs.existsSync(SYMBOLS_JSON_PATH)) return;
-  const symbols = JSON.parse(fs.readFileSync(SYMBOLS_JSON_PATH, "utf8"));
-  await fetchAllSymbolsHistoricalData(symbols, 1);
+  try {
+    if (!fs.existsSync(SYMBOLS_JSON_PATH)) {
+      console.log("No symbols.json found, skipping daily historical fetch.");
+      return;
+    }
+    const raw = fs.readFileSync(SYMBOLS_JSON_PATH, "utf-8");
+    const symbols = JSON.parse(raw);
+    await fetchAllSymbolsHistoricalData(symbols, 1);
+    // Optionally, update CSV here
+  } catch (err) {
+    console.error("Error in refreshAllHistoricalData:", err.message);
+  }
 }
 refreshAllHistoricalData();
-setInterval(refreshAllHistoricalData, ONE_DAY);
+setInterval(() => {
+  console.log("⏰ Running daily refreshAllHistoricalData...");
+  refreshAllHistoricalData();
+}, ONE_DAY);
 
 // ────────────────────────────────────────────────────────────
 // 19) Start the Server
@@ -784,7 +1208,7 @@ app.listen(PORT, () => {
 });
 
 // ────────────────────────────────────────────────────────────
-// 20) FORGOT/RESET PASSWORD LOGIC
+// 20) FORGOT/RESET PASSWORD LOGIC (Appended at the bottom)
 // ────────────────────────────────────────────────────────────
 
 /**

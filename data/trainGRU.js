@@ -1,168 +1,194 @@
-/**
- * trainGRU.js
+/*****************************************************************
+ * backend/data/trainGRU.js   Phase‑3 monolithic CSV version
  *
- * Loads data/historicalData.csv (with your 18 columns: 13 price/fundamental +
- * 5 news features), normalizes each feature, creates 30‑day sequences,
- * trains a 2‑layer GRU with early stopping, and writes model + normalization.json.
- */
+ *  • node trainGRU.js AAPL MSFT   ← train a few symbols
+ *  • node trainGRU.js            ← train every symbol in the CSV
+ *
+ *  Exports:
+ *      predictNextDay(symbol, windowData)
+ *****************************************************************/
+const fs   = require('fs');
+const path = require('path');
+const tf   = require('@tensorflow/tfjs-node');
+const csv  = require('csv-parser');
 
-const fs = require("fs");
-const path = require("path");
-const tf = require("@tensorflow/tfjs-node");
+const LOOKBACK     = 30;    // rolling‑window length
+const TEST_SPLIT   = 0.20;  // 20 % validation
+const MODEL_ROOT   = path.join(__dirname, '..', 'model', 'forecast_model_phase3');
+const ENRICHED_CSV = path.join(__dirname, 'historicalData_enriched_full.csv');
 
-const CSV_PATH = path.join(__dirname, "historicalData.csv");
-const MODEL_DIR = path.join(__dirname, "..", "model", "forecast_model");
-const NORM_PATH = path.join(MODEL_DIR, "normalization.json");
-const WINDOW_SIZE = 30;
-const TEST_SPLIT = 0.2;
-
-// 1) Read & parse CSV
-function parseCSV(filepath) {
-  const raw = fs.readFileSync(filepath, "utf8");
-  const lines = raw.trim().split("\n");
-  const header = lines[0].split(",");
-  const rows = lines.slice(1).map(line => {
-    const parts = line.split(",");
-    const obj = {};
-    header.forEach((col, i) => {
-      obj[col] = parseFloat(parts[i]);
-    });
-    return obj;
-  });
-  return { header, rows };
-}
-
-// 2) Compute mean/std for each feature column
-function computeStats(rows, numericCols) {
-  const stats = {};
-  numericCols.forEach(col => {
-    const vals = rows.map(r => r[col]);
-    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const std = Math.sqrt(vals.map(v => (v - mean) ** 2).reduce((a, b) => a + b, 0) / vals.length);
-    stats[col] = { mean, std: std || 1 };
-  });
-  return stats;
-}
-
-// 3) Normalize rows
-function normalizeRows(rows, stats, numericCols) {
-  return rows.map(r => {
-    const norm = {};
-    numericCols.forEach(col => {
-      norm[col] = (r[col] - stats[col].mean) / stats[col].std;
-    });
-    return norm;
+// ───────────────────────────────────────────────────────────────
+// 1)  Read the big CSV into memory
+// ───────────────────────────────────────────────────────────────
+async function loadAllData () {
+  return new Promise((resolve, reject) => {
+    const rows = [];
+    fs.createReadStream(ENRICHED_CSV)
+      .pipe(csv())
+      .on('data', r => rows.push(r))
+      .on('end', ()  => resolve(rows))
+      .on('error', reject);
   });
 }
 
-// 4) Create sequences of shape [n‑samples, WINDOW_SIZE, nFeatures] and labels
-function createSequences(data, numericCols) {
-  const X = [];
-  const Y = [];
-  for (let i = 0; i + WINDOW_SIZE < data.length; i++) {
-    const seq = [];
-    for (let j = 0; j < WINDOW_SIZE; j++) {
-      seq.push(numericCols.map(col => data[i + j][col]));
-    }
-    X.push(seq);
-    // predict next-day close (we assume 'close' is in numericCols)
-    Y.push([ data[i + WINDOW_SIZE]["close"] ]);
-  }
-  return { X, Y };
+// ───────────────────────────────────────────────────────────────
+// 2)  Group rows by symbol & sort by date
+// ───────────────────────────────────────────────────────────────
+function groupBySymbol (allRows) {
+  const by = {};
+  allRows.forEach(r => {
+    by[r.symbol] ||= [];
+    by[r.symbol].push(r);
+  });
+  Object.keys(by).forEach(sym =>
+    by[sym].sort((a, b) => new Date(a.date) - new Date(b.date))
+  );
+  return by;
 }
 
-async function main() {
-  console.log("📖 Loading CSV...");
-  const { header, rows: rawRows } = parseCSV(CSV_PATH);
+// ───────────────────────────────────────────────────────────────
+// 3)  Convert a symbol’s rows into tensors
+// ───────────────────────────────────────────────────────────────
+function prepareSymbolData (rows) {
+  if (!rows || rows.length <= LOOKBACK)
+    throw new Error('Not enough rows for training');
 
-  // Identify numeric columns (everything except 'symbol'/'date', which we dropped)
-  const numericCols = header.filter(c => c !== "symbol" && c !== "date");
-  console.log("ℹ️  Numeric features:", numericCols);
+  const featureKeys = Object.keys(rows[0]).filter(k => k !== 'symbol' && k !== 'date');
 
-  if (rawRows.length < WINDOW_SIZE * 2) {
-    throw new Error("Not enough rows for training!");
+  const raw = rows.map(r => featureKeys.map(k => +r[k] || 0));
+
+  // Min‑max scaler (per feature, per symbol)
+  const scaler = {};
+  featureKeys.forEach((k, i) => {
+    const col = raw.map(r => r[i]);
+    scaler[k] = { min: Math.min(...col), max: Math.max(...col) };
+  });
+
+  const scaled = raw.map(r =>
+    r.map((v, i) => {
+      const { min, max } = scaler[featureKeys[i]];
+      return max === min ? 0 : (v - min) / (max - min);
+    })
+  );
+
+  const X = [], Y = [];
+  const closeIdx = featureKeys.indexOf('close');
+  for (let i = LOOKBACK; i < scaled.length; i++) {
+    X.push(scaled.slice(i - LOOKBACK, i));
+    Y.push([raw[i][closeIdx]]);          // predict *un‑scaled* closing price
   }
 
-  console.log("⚖️  Computing normalization stats...");
-  const stats = computeStats(rawRows, numericCols);
+  if (!X.length) throw new Error('No training samples generated');
 
-  console.log("🔄 Normalizing data...");
-  const normRows = normalizeRows(rawRows, stats, numericCols);
+  return {
+    featureKeys,
+    scaler,
+    xs: tf.tensor3d(X),
+    ys: tf.tensor2d(Y)
+  };
+}
 
-  console.log(`🔢 Creating sequences (window=${WINDOW_SIZE})...`);
-  const { X, Y } = createSequences(normRows, numericCols);
+// ───────────────────────────────────────────────────────────────
+// 4)  Train GRU for one symbol & save it
+// ───────────────────────────────────────────────────────────────
+async function trainSymbol (sym, rows) {
+  console.log(`\n📘  Preparing data for ${sym}`);
+  let featureKeys, scaler, xs, ys;
+  ({ featureKeys, scaler, xs, ys } = prepareSymbolData(rows));
 
-  const total = X.length;
-  const testCount = Math.floor(total * TEST_SPLIT);
-  const trainCount = total - testCount;
+  const total    = xs.shape[0];
+  const valLen   = Math.floor(total * TEST_SPLIT);
+  const trainLen = total - valLen;
 
-  console.log(`🏷️  Train/test split: ${trainCount}/${testCount} samples`);
+  const xTrain = xs.slice([0, 0, 0], [trainLen, LOOKBACK, featureKeys.length]);
+  const yTrain = ys.slice([0, 0],    [trainLen, 1]);
+  const xVal   = xs.slice([trainLen, 0, 0], [valLen, LOOKBACK, featureKeys.length]);
+  const yVal   = ys.slice([trainLen, 0],    [valLen, 1]);
 
-  const Xtensor = tf.tensor3d(X);
-  const Ytensor = tf.tensor2d(Y);
-
-  const Xtrain = Xtensor.slice([0, 0, 0], [trainCount, WINDOW_SIZE, numericCols.length]);
-  const Ytrain = Ytensor.slice([0, 0], [trainCount, 1]);
-  const Xtest  = Xtensor.slice([trainCount, 0, 0], [testCount, WINDOW_SIZE, numericCols.length]);
-  const Ytest  = Ytensor.slice([trainCount, 0], [testCount, 1]);
-
-  // 5) Build the model
-  console.log("🛠️  Building model...");
   const model = tf.sequential();
-  model.add(tf.layers.gru({
-    units: 64,
-    returnSequences: true,
-    inputShape: [WINDOW_SIZE, numericCols.length]
-  }));
+  model.add(tf.layers.gru({ units: 64, returnSequences: true,
+                            inputShape: [LOOKBACK, featureKeys.length] }));
   model.add(tf.layers.dropout({ rate: 0.2 }));
   model.add(tf.layers.gru({ units: 32 }));
   model.add(tf.layers.dropout({ rate: 0.2 }));
   model.add(tf.layers.dense({ units: 1 }));
+  model.compile({ optimizer: tf.train.adam(), loss: 'meanSquaredError', metrics: ['mse'] });
 
-  model.compile({
-    optimizer: tf.train.adam(),
-    loss: "meanSquaredError",
-    metrics: ["mse"]
-  });
-
-  model.summary();
-
-  // 6) Train with early stopping
-  console.log("🏋️  Starting training...");
-  const esCallback = tf.callbacks.earlyStopping({
-    monitor: "val_loss",
-    patience: 5,
-    restoreBestWeight: true
-  });
-
-  await model.fit(Xtrain, Ytrain, {
-    epochs: 50,
+  console.log(`🏋️‍♂️  Training ${sym}: ${trainLen} train → ${valLen} val`);
+  await model.fit(xTrain, yTrain, {
+    epochs: 7,
     batchSize: 32,
-    validationData: [Xtest, Ytest],
-    callbacks: [esCallback]
+    validationData: [xVal, yVal],
+    callbacks: tf.callbacks.earlyStopping({
+      monitor: 'val_loss',
+      patience: 2,
+      restoreBestWeight: true
+    })
   });
 
-  // 7) Evaluate
-  console.log("🔍 Evaluating on test set...");
-  const evalResult = model.evaluate(Xtest, Ytest);
-  console.log("Test MSE:", (await evalResult[0].data())[0].toFixed(6));
+  // save artefacts
+  const outDir = path.join(MODEL_ROOT, sym);
+  fs.mkdirSync(outDir, { recursive: true });
+  await model.save(`file://${outDir}`);
+  fs.writeFileSync(path.join(outDir, 'scaler.json'),
+                   JSON.stringify({ scaler, featureKeys }, null, 2));
 
-  // 8) Save model & stats
-  console.log("💾 Saving model to", MODEL_DIR);
-  await model.save(`file://${MODEL_DIR}`);
-
-  if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
-  fs.writeFileSync(NORM_PATH, JSON.stringify(stats, null, 2), "utf8");
-  console.log("✅ Saved normalization stats to", NORM_PATH);
+  tf.dispose([xs, ys, xTrain, yTrain, xVal, yVal, model]);
+  console.log(`✅  ${sym} saved → ${outDir}`);
 }
 
-main().catch(err => {
-  console.error("❌ Error in training script:", err);
-  process.exit(1);
-});
+// ───────────────────────────────────────────────────────────────
+// 5)  CLI training loop (only when run directly)
+// ───────────────────────────────────────────────────────────────
+if (require.main === module) {
+  (async () => {
+    try {
+      console.log('⏳  Loading CSV …');
+      const allRows = await loadAllData();
+      const bySym   = groupBySymbol(allRows);
 
-module.exports = {
-  predictNextDay,
-  FEATURE_KEYS,      // your array of feature names, in order
-  TIME_SERIES_WINDOW // your window length (30)
+      const cliSyms = process.argv.slice(2);
+      const symbols = cliSyms.length ? cliSyms.filter(s => bySym[s]) : Object.keys(bySym);
+
+      console.log('⚙️   Symbols to train ⇒', symbols.join(', '));
+      for (const sym of symbols) await trainSymbol(sym, bySym[sym]);
+
+      console.log('\n🎉  All requested symbols processed.');
+    } catch (e) {
+      console.error('💥  Fatal:', e.message);
+      console.error(e.stack);
+    }
+  })();
+}
+
+// ───────────────────────────────────────────────────────────────
+// 6)  Inference helper  (used by server.js)
+// ───────────────────────────────────────────────────────────────
+const _models  = {};
+const _scalers = {};
+
+module.exports.predictNextDay = async function predictNextDay (symbol, windowData) {
+  if (!_models[symbol]) {
+    _models[symbol] = await tf.loadLayersModel(`file://${path.join(MODEL_ROOT, symbol, 'model.json')}`);
+    const sc        = require(path.join(MODEL_ROOT, symbol, 'scaler.json'));
+    _scalers[symbol] = sc.scaler;
+  }
+  const model  = _models[symbol];
+  const scaler = _scalers[symbol];
+
+  const scaledWindow = windowData.map(row =>
+    row.map((v, i) => {
+      const key = Object.keys(scaler)[i];
+      const { min, max } = scaler[key];
+      return max === min ? 0 : (v - min) / (max - min);
+    })
+  );
+
+  const input = tf.tensor3d([scaledWindow]);          // [1, 30, D]
+  const out   = model.predict(input);
+  const pred  = out.dataSync()[0];
+  input.dispose(); out.dispose();
+
+  const { min, max } = scaler.close;                  // rescale prediction
+  return pred * (max - min) + min;
 };
