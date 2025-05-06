@@ -15,6 +15,7 @@ const fs = require("fs");
 const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
 const nodemailer = require("nodemailer");
+const app = express();
 
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
@@ -185,7 +186,7 @@ try {
 // ────────────────────────────────────────────────────────────
 //  5) Express App
 // ────────────────────────────────────────────────────────────
-const app = express();
+
 
 // Expand CORS origins to allow both your frontend & localhost
 app.use(
