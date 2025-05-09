@@ -36,6 +36,8 @@ const sentiment     = new Sentiment()
 
 const { predictNextDay } = require("./data/trainGRU");   // lazy‑loads each symbol’s GRU
 
+// app.options("*", cors());
+
 app.use(cors({
   origin: [
     "https://sci-investments.web.app",
@@ -46,7 +48,7 @@ app.use(cors({
   credentials: true,
   optionsSuccessStatus: 200
 }));
-app.options("*", cors());
+
 
 
 /**
