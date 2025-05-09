@@ -16,6 +16,8 @@ const tf = require("@tensorflow/tfjs-node");
 const yahooFinance = require("yahoo-finance2").default;
 const nodemailer = require("nodemailer");
 const app = express();
+const rateLimit = require("express-rate-limit");
+
 
 // ADD CRYPTO FOR RESET TOKEN GENERATION
 const crypto = require("crypto");
@@ -567,6 +569,13 @@ app.get("/protected", (req, res) => {
 // ────────────────────────────────────────────────────────────
 // 12) ADVANCED END-OF-DAY FORECASTING / STOCK CHECKER
 // ────────────────────────────────────────────────────────────
+const stockCheckerLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // limit each IP to 5 requests per minute
+  message: { message: "Too many requests, please try again shortly." }
+});
+app.use("/api/check-stock", stockCheckerLimiter);
+
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
   console.log("➡️  /api/check-stock body:", req.body); // <— ADD THIS LINE
@@ -869,6 +878,14 @@ async function classifyStockByForecast(symbol) {
 }
 
 const finderRouter = express.Router();
+
+stockCheckerLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // limit each IP to 5 requests per minute
+  message: { message: "Too many requests, please try again shortly." }
+});
+app.use("/api/find-stock", stockCheckerLimiter);
+
 finderRouter.post("/api/find-stocks", async (req, res) => {
   try {
     let { stockType, exchange, minPrice, maxPrice } = req.body;
@@ -1123,14 +1140,15 @@ async function autoSellStocks() {
   // Implement your autoSell logic here
 }
 
-setInterval(async () => {
-  try {
-    await autoBuyStocks();
-    await autoSellStocks();
-  } catch (err) {
-    console.error("Error running automated investor tasks:", err.message);
-  }
-}, 60_000);
+// setInterval(async () => {
+//   try {
+//     await autoBuyStocks();
+//     await autoSellStocks();
+//   } catch (err) {
+//     console.error("Error running automated investor tasks:", err.message);
+//   }
+// }, 60_000);
+
 
 app.get("/api/simulate-trades", async (req, res) => {
   try {
