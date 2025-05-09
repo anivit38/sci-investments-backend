@@ -569,6 +569,7 @@ app.get("/protected", (req, res) => {
 // ────────────────────────────────────────────────────────────
 app.post("/api/check-stock", async (req, res) => {
   const { symbol, intent } = req.body;
+  console.log("➡️  /api/check-stock body:", req.body); // <— ADD THIS LINE
   if (!symbol || !intent) {
     return res
       .status(400)
