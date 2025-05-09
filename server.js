@@ -879,12 +879,12 @@ async function classifyStockByForecast(symbol) {
 
 const finderRouter = express.Router();
 
-stockCheckerLimiter = rateLimit({
+const findStockLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
   max: 5, // limit each IP to 5 requests per minute
   message: { message: "Too many requests, please try again shortly." }
 });
-app.use("/api/find-stock", stockCheckerLimiter);
+app.use("/api/find-stock", findStockLimiter);
 
 finderRouter.post("/api/find-stocks", async (req, res) => {
   try {
