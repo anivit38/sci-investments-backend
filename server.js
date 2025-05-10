@@ -159,28 +159,68 @@ const CACHE_TTL=60*60*1000;               // 60 min (was 15)
 /*──────────────────────────────────────────
 |  Yahoo fetch wrapper                     |
 └──────────────────────────────────────────*/
-const requestOptions={
-  headers:{"User-Agent":"Mozilla/5.0"},
-  redirect:"follow",
+
+const requestOptions = {
+  headers: { "User-Agent": "Mozilla/5.0" },
+  redirect: "follow",
 };
-async function fetchStockData(symbol){
-  const now=Date.now();
-  if(stockDataCache[symbol] && now-stockDataCache[symbol].timestamp<CACHE_TTL)
+
+async function fetchStockData(symbol) {
+  const now = Date.now();
+
+  /* use cache if still fresh */
+  if (
+    stockDataCache[symbol] &&
+    now - stockDataCache[symbol].timestamp < CACHE_TTL
+  ) {
     return stockDataCache[symbol].data;
-  console.log("Fetching fresh data for",symbol);
-  try{
-    const data=await yahooFinance.quoteSummary(
-      symbol,
-      {modules:["financialData","price","summaryDetail","defaultKeyStatistics","assetProfile"],validateResult:false},
-      {fetchOptions:requestOptions}
-    );
-    if(!data||!data.price) throw new Error("Invalid data from Yahoo");
-    stockDataCache[symbol]={data,timestamp:now};
-    return data;
-  }catch(e){
-    console.error(`❌ Yahoo fetch ${symbol}:`,e.message);
-    return null;
   }
+
+  /* 1️⃣ try the rich quoteSummary call first */
+  try {
+    const modules = [
+      "financialData",
+      "price",
+      "summaryDetail",
+      "defaultKeyStatistics",
+      "assetProfile",
+    ];
+    const data = await yahooFinance.quoteSummary(
+      symbol,
+      { modules, validateResult: false },
+      { fetchOptions: requestOptions }
+    );
+    if (data && data.price) {
+      stockDataCache[symbol] = { data, timestamp: now };
+      return data;
+    }
+  } catch (_) { /* silent — fall through */ }
+
+  /* 2️⃣ fallback: light quote() call just for price/volume so UI never shows N/A */
+  try {
+    const q = await yahooFinance.quote(
+      symbol,
+      {
+        fields: [
+          "regularMarketPrice",
+          "regularMarketVolume",
+          "fiftyTwoWeekHigh",
+          "fiftyTwoWeekLow",
+          "regularMarketDayHigh",
+          "regularMarketDayLow",
+        ],
+      },
+      { fetchOptions: requestOptions }
+    );
+    if (q) {
+      const data = { price: q };                 // wrap to mimic quoteSummary shape
+      stockDataCache[symbol] = { data, timestamp: now };
+      return data;
+    }
+  } catch (e) {
+    console.error(`❌ Yahoo fetch ${symbol}:`, e.message);
+  }
+  return null;
 }
 
 /*──────────────────────────────────────────
@@ -302,121 +342,196 @@ app.get("/protected", (req, res) => {
 |  12) STOCK CHECKER                       |
 └──────────────────────────────────────────*/
 app.post("/api/check-stock", async (req, res) => {
-  const { symbol, intent } = req.body;
-  if (!symbol || !intent)
-    return res.status(400).json({ message: "symbol & intent required." });
+  try {
+    const { symbol, intent } = req.body;
+    if (!symbol || !intent) {
+      return res.status(400).json({ message: "symbol & intent required." });
+    }
+    const upper = symbol.toUpperCase();
 
-  /* fetch current fundamentals (with 1‑hour cache) */
-  const stock = await fetchStockData(symbol.toUpperCase());
-  if (!stock || !stock.price)
-    return res.status(404).json({ message: "Stock not found or data unavailable." });
+    /* 1. fundamentals */
+    const stock = await fetchStockData(upper);
+    if (!stock || !stock.price) {
+      return res
+        .status(404)
+        .json({ message: "Stock not found or data unavailable." });
+    }
 
-  const metrics = {
-    volume:            stock.price.regularMarketVolume ?? 0,
-    currentPrice:      stock.price.regularMarketPrice ?? 0,
-    peRatio:           stock.summaryDetail.trailingPE ?? 0,
-    pbRatio:           stock.summaryDetail.priceToBook ?? 0,
-    dividendYield:     stock.summaryDetail.dividendYield ?? 0,
-    earningsGrowth:    stock.financialData.earningsGrowth ?? 0,
-    debtRatio:         stock.financialData.debtToEquity ?? 0,
-    dayHigh:           stock.price.regularMarketDayHigh ?? 0,
-    dayLow:            stock.price.regularMarketDayLow ?? 0,
-    fiftyTwoWeekHigh:  stock.summaryDetail.fiftyTwoWeekHigh ?? 0,
-    fiftyTwoWeekLow:   stock.summaryDetail.fiftyTwoWeekLow ?? 0,
-  };
-  const avgVol = stock.summaryDetail.averageDailyVolume3Month ?? metrics.volume;
+    const metrics = {
+      volume:           stock.price.regularMarketVolume ?? null,
+      currentPrice:     stock.price.regularMarketPrice ?? null,
+      peRatio:          stock.summaryDetail?.trailingPE ?? null,
+      pbRatio:          stock.summaryDetail?.priceToBook ?? null,
+      dividendYield:    stock.summaryDetail?.dividendYield ?? null,
+      earningsGrowth:   stock.financialData?.earningsGrowth ?? null,
+      debtRatio:        stock.financialData?.debtToEquity ?? null,
+      dayHigh:          stock.price.regularMarketDayHigh ?? null,
+      dayLow:           stock.price.regularMarketDayLow ?? null,
+      fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? null,
+      fiftyTwoWeekLow:  stock.summaryDetail?.fiftyTwoWeekLow ?? null,
+    };
+    const avgVol =
+      stock.summaryDetail?.averageDailyVolume3Month ?? metrics.volume ?? 0;
 
-  /* fundamental rating (unchanged formula) */
-  let rating = 0;
-  if (metrics.volume > avgVol * 1.2) rating += 3;
-  else if (metrics.volume < avgVol * 0.8) rating -= 2;
-  if (metrics.peRatio >= 5 && metrics.peRatio <= 25) rating += 2;
-  else if (metrics.peRatio > 30) rating -= 1;
-  if (metrics.earningsGrowth > 0.15) rating += 4;
-  else if (metrics.earningsGrowth > 0.03) rating += 2;
-  else if (metrics.earningsGrowth < 0) rating -= 2;
-  if (metrics.debtRatio < 0.3) rating += 3;
-  else if (metrics.debtRatio > 1) rating -= 1;
+    /* 2. quick fundamental rating */
+    let rating = 0;
+    if (metrics.volume && metrics.volume > avgVol * 1.2) rating += 3;
+    else if (metrics.volume && metrics.volume < avgVol * 0.8) rating -= 2;
+    if (metrics.peRatio !== null) {
+      if (metrics.peRatio >= 5 && metrics.peRatio <= 25) rating += 2;
+      else if (metrics.peRatio > 30) rating -= 1;
+    }
+    if (metrics.earningsGrowth !== null) {
+      if (metrics.earningsGrowth > 0.15) rating += 4;
+      else if (metrics.earningsGrowth > 0.03) rating += 2;
+      else if (metrics.earningsGrowth < 0) rating -= 2;
+    }
+    if (metrics.debtRatio !== null) {
+      if (metrics.debtRatio < 0.3) rating += 3;
+      else if (metrics.debtRatio > 1) rating -= 1;
+    }
 
-  /* quick min/max positioning */
-  const dayPos   = (metrics.currentPrice - metrics.dayLow) /
-                   (metrics.dayHigh - metrics.dayLow || 1);
-  const weekPos  = (metrics.currentPrice - metrics.fiftyTwoWeekLow) /
-                   (metrics.fiftyTwoWeekHigh - metrics.fiftyTwoWeekLow || 1);
-  if (dayPos < 0.2)  rating += 1;
-  if (dayPos > 0.8)  rating -= 1;
-  if (weekPos < 0.3) rating += 2;
-  if (weekPos > 0.8) rating -= 2;
+    const dayRange =
+      (metrics.dayHigh ?? 0) - (metrics.dayLow ?? 0);
+    if (dayRange > 0) {
+      const dayPos =
+        (metrics.currentPrice - metrics.dayLow) / dayRange;
+      if (dayPos < 0.2) rating += 1;
+      if (dayPos > 0.8) rating -= 1;
+    }
 
-  /* industry comparison (if available) */
-  const ind = industryMetrics[stock.assetProfile?.industry];
-  if (ind) {
-    if (metrics.peRatio && ind.peRatio)
-      rating += metrics.peRatio < ind.peRatio ? 2 : -2;
-    if (metrics.earningsGrowth && ind.revenueGrowth)
-      rating += metrics.earningsGrowth * 100 > ind.revenueGrowth ? 2 : -2;
-    if (metrics.debtRatio && ind.debtToEquity)
-      rating += metrics.debtRatio < ind.debtToEquity ? 2 : -2;
+    const weekRange =
+      (metrics.fiftyTwoWeekHigh ?? 0) - (metrics.fiftyTwoWeekLow ?? 0);
+    if (weekRange > 0) {
+      const weekPos =
+        (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+      if (weekPos < 0.3) rating += 2;
+      if (weekPos > 0.8) rating -= 2;
+    }
+
+    /* 3. build forecast */
+    const forecastPrice = await buildForecastPrice(
+      upper,
+      metrics.currentPrice
+    );
+    let growthPct = 0;
+    if (metrics.currentPrice && metrics.currentPrice !== 0) {
+      growthPct =
+        ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
+    }
+    
+    const combinedScore = (
+      0.2 * rating +
+      0.8 * growthPct
+    ).toFixed(2);
+
+    const classification =
+      growthPct >= 2
+        ? "growth"
+        : growthPct >= 0
+        ? "stable"
+        : "unstable";
+
+    const advice =
+      classification === "growth"
+        ? "Projected to grow. Consider buying."
+        : classification === "stable"
+        ? "Minimal growth expected. Hold or monitor."
+        : "Projected to decline. Consider selling or avoiding.";
+
+    /* 4. quick news sentiment (unchanged) */
+    let news = { averageSentiment: 0, topStories: [] };
+    try {
+      const feed = await rssParser.parseURL(
+        `https://news.google.com/rss/search?q=${upper}`
+      );
+      const items = feed.items.slice(0, 5);
+      const analyses = await Promise.all(
+        items.map(async (item) => {
+          let snippet = item.contentSnippet || item.title;
+          try {
+            const html = await (await fetchNative(item.link)).text();
+            snippet = cheerio.load(html)("p").first().text() || snippet;
+          } catch (_) {}
+          return {
+            title: item.title,
+            link: item.link,
+            snippet:
+              snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
+            sentiment: sentiment.analyze(snippet).score,
+          };
+        })
+      );
+      news = {
+        averageSentiment:
+          analyses.reduce((s, a) => s + a.sentiment, 0) /
+            analyses.length || 0,
+        topStories: analyses,
+      };
+    } catch (e) {
+      console.warn("News fetch failed:", e.message);
+    }
+
+    /* 5. send response that matches your front‑end */
+    return res.json({
+      symbol: upper,
+      name: stock.price.longName || upper,
+      industry: stock.assetProfile?.industry || "Unknown",
+      fundamentalRating: rating.toFixed(2),
+      combinedScore,
+      classification,
+      advice,
+      forecast: {
+        forecastPrice: +forecastPrice.toFixed(2),
+        projectedGrowthPercent: `${growthPct.toFixed(2)}%`,
+        forecastPeriod: "Close",
+        forecastEndDate: getForecastEndTime(),
+      },
+      metrics: {
+        currentPrice: metrics.currentPrice ?? "N/A",
+        peRatio: metrics.peRatio ?? "N/A",
+        earningsGrowth: metrics.earningsGrowth ?? "N/A",
+        debtRatio: metrics.debtRatio ?? "N/A",
+        volume: metrics.volume ?? "N/A",
+        dayRange: dayRange || "N/A",
+        fiftyTwoWeekRange: weekRange || "N/A",
+      },
+      news,
+    });
+  } catch (err) {
+    console.error("check-stock:", err.message);
+    return res.status(500).json({ message: "Server error." });
+  }
+});
+
+/*──────────────────────────────────────────
+|  Helper – classifyStockByForecast()      |
+└──────────────────────────────────────────*/
+async function classifyStockByForecast(symbol) {
+  const data = await fetchStockData(symbol);
+  if (!data || !data.price) return { classification: "unstable" };
+
+  const current = data.price.regularMarketPrice ?? 0;
+  if (!current) return { classification: "unstable" };
+
+  /* forecast (cached) */
+  let forecast;
+  if (
+    forecastCache[symbol] &&
+    Date.now() - forecastCache[symbol].timestamp < FORECAST_CACHE_TTL
+  ) {
+    forecast = forecastCache[symbol].price;
+  } else {
+    forecast = await buildForecastPrice(symbol, current);
   }
 
-  /* forecast price (cached / GRU / fallback) */
-  const forecastPrice = await buildForecastPrice(
-    symbol.toUpperCase(),
-    metrics.currentPrice
-  );
-  const growthPct = ((forecastPrice - metrics.currentPrice) /
-                     metrics.currentPrice) * 100;
-  const classification =
-    growthPct >= 2  ? "growth"   :
-    growthPct >= 0  ? "stable"   :
-                      "unstable";
-  const advice = classification === "growth"
-    ? "Projected to grow. Consider buying."
-    : classification === "stable"
-    ? "Minimal growth expected. Hold or monitor."
-    : "Projected to decline. Consider selling or avoiding.";
+  const growth = ((forecast - current) / current) * 100;
 
-  /* news sentiment (unchanged) */
-  let news = { averageSentiment: 0, topStories: [] };
-  try {
-    const feed = await rssParser.parseURL(
-      `https://news.google.com/rss/search?q=${symbol}`
-    );
-    const stories = feed.items.slice(0, 5);
-    const analyses = await Promise.all(stories.map(async item => {
-      let snippet = item.contentSnippet || item.title;
-      try {
-        const html = await (await fetchNative(item.link)).text();
-        snippet = cheerio.load(html)("p").first().text() || snippet;
-      } catch {}
-      return {
-        title: item.title,
-        link : item.link,
-        snippet: snippet.slice(0,200) + (snippet.length>200 ? "…" : ""),
-        sentiment: sentiment.analyze(snippet).score,
-      };
-    }));
-    news = {
-      averageSentiment: analyses.reduce((s,a)=>s+a.sentiment,0)/analyses.length || 0,
-      topStories: analyses,
-    };
-  } catch(e){ console.warn("News fetch failed:", e.message); }
+  if (growth >= 2) return { classification: "growth" };
+  if (growth >= 0) return { classification: "stable" };
+  return { classification: "unstable" };
+}
 
-  return res.json({
-    symbol: symbol.toUpperCase(),
-    name  : stock.price.longName || symbol.toUpperCase(),
-    industry: stock.assetProfile?.industry || "Unknown",
-    fundamentalRating: rating.toFixed(2),
-    forecast: {
-      forecastPrice: +forecastPrice.toFixed(2),
-      projectedGrowthPercent: `${growthPct.toFixed(2)}%`,
-      forecastEndDate: getForecastEndTime(),
-    },
-    classification,
-    advice,
-    news,
-  });
-});
 
 /*──────────────────────────────────────────
 |  13) FINDER (rate‑limited)               |
