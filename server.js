@@ -534,75 +534,75 @@ async function classifyStockByForecast(symbol) {
 
 
 /*──────────────────────────────────────────
-|  13) FINDER (rate‑limited)               |
+|  13) FINDER (batched / rate‑limited)     |
 └──────────────────────────────────────────*/
 const finderRouter = express.Router();
+finderRouter.use("/api/find-stocks", findStockLimiter);   // keep limiter
+
+/* helper – fetch quotes in parallel, max 10 at once */
+async function fetchBatch(symbols, maxParallel = 10) {
+  const out = [];
+  let active = [];
+  for (const sym of symbols) {
+    active.push(
+      fetchStockData(sym).then((d) => ({ sym, data: d })).catch(() => null)
+    );
+    if (active.length >= maxParallel) {
+      out.push(...(await Promise.all(active)));
+      active = [];
+    }
+  }
+  if (active.length) out.push(...(await Promise.all(active)));
+  return out.filter(Boolean);
+}
 
 finderRouter.post("/api/find-stocks", async (req, res) => {
-  let { stockType, exchange, minPrice, maxPrice } = req.body;
-  if (!stockType || !exchange) return res.status(400).json({ message:"Bad params" });
-  stockType = stockType.toLowerCase();
-  exchange  = exchange.toUpperCase();
+  try {
+    let { stockType, exchange, minPrice, maxPrice } = req.body;
+    if (
+      typeof stockType !== "string" ||
+      typeof exchange !== "string" ||
+      typeof minPrice !== "number" ||
+      typeof maxPrice !== "number"
+    ) {
+      return res.status(400).json({ message: "Bad finder parameters." });
+    }
+    stockType = stockType.toLowerCase();
+    exchange = exchange.toUpperCase();
 
-  const out=[];
-  for (const s of symbolsList){
-    const sym  = typeof s === "string" ? s : s.symbol;
-    const exch = typeof s === "string" ? "N/A" : s.exchange || "N/A";
-    if (exch.toUpperCase()!==exchange) continue;
+    /* take only the symbols on the requested exchange */
+    const tickers = symbolsList
+      .filter((s) => {
+        const ex = (typeof s === "string" ? "N/A" : s.exchange || "N/A").toUpperCase();
+        return ex === exchange;
+      })
+      .map((s) => (typeof s === "string" ? s : s.symbol));
 
-    const data = await fetchStockData(sym);
-    if (!data||!data.price) continue;
-    const price=data.price.regularMarketPrice;
-    if (price<minPrice||price>maxPrice) continue;
+    /* grab yahoo quotes in batches of 10 */
+    const batchResults = await fetchBatch(tickers, 10);
 
-    const { classification } = await classifyStockByForecast(sym);
-    if (classification===stockType) out.push({ symbol:sym, exchange:exch });
+    const filtered = [];
+    for (const { sym, data } of batchResults) {
+      if (!data || !data.price) continue;
+      const price = data.price.regularMarketPrice;
+      if (!price || price < minPrice || price > maxPrice) continue;
+
+      /* forecast classification (cached, fast) */
+      const { classification } = await classifyStockByForecast(sym);
+      if (classification === stockType) {
+        filtered.push({ symbol: sym, exchange });
+      }
+    }
+
+    return res.json({ stocks: filtered });
+  } catch (err) {
+    console.error("Finder error:", err.message);
+    return res.status(500).json({ message: "Finder server error." });
   }
-  return res.json({ stocks: out });
 });
 
 app.use("/finder", finderRouter);
 
-/*──────────────────────────────────────────
-|  14) Popular / top‑forecast / news       |
-└──────────────────────────────────────────*/
-app.get("/api/popular-stocks", async (_req,res)=>{
-  const popular=["AAPL","TSLA","AMZN","NVDA","META","GOOG","MSFT"];
-  const rows=[];
-  for (const sym of popular){
-    const d=await fetchStockData(sym);
-    if(d&&d.price) rows.push({
-      symbol:sym,
-      name  :d.price.longName||sym,
-      price :d.price.regularMarketPrice,
-      volume:d.price.regularMarketVolume,
-    });
-  }
-  return res.json({ stocks: rows });
-});
-
-app.get("/api/top-forecasted", async (_req,res)=>{
-  const sample = symbolsList.slice(0,200).map(s=>typeof s==="string"?s:s.symbol);
-  const rows=[];
-  for (const sym of sample){
-    const d=await fetchStockData(sym);
-    const p=d?.price?.regularMarketPrice;
-    if(!p) continue;
-    const fc=await buildForecastPrice(sym,p);
-    rows.push({symbol:sym,gain:((fc-p)/p)*100});
-  }
-  rows.sort((a,b)=>b.gain-a.gain);
-  res.json({ forecasts: rows.slice(0,5) });
-});
-
-app.get("/api/top-news", async (_req,res)=>{
-  try{
-    const feed=await rssParser.parseURL("https://news.google.com/rss/search?q=stock+market");
-    res.json({ headlines: feed.items.slice(0,5).map(i=>({title:i.title,url:i.link})) });
-  }catch(e){
-    res.status(500).json({ headlines: [] });
-  }
-});
 
 /*──────────────────────────────────────────
 |  15) Community                           |
