@@ -277,10 +277,10 @@ async function buildForecastPrice(symbol,price){
 /*──────────────────────────────────────────
 |  Rate‑limits                             |
 └──────────────────────────────────────────*/
-const stockCheckerLimiter = rateLimit({windowMs:60*1000,max:5,message:{message:"Too many requests, please try again shortly."}});
+const stockCheckerLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
 app.use("/api/check-stock", stockCheckerLimiter);
 
-const findStockLimiter = rateLimit({windowMs:60*1000,max:5,message:{message:"Too many requests, please try again shortly."}});
+const findStockLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
 app.use("/finder/api/find-stocks", findStockLimiter); // correct path
 
 /*──────────────────────────────────────────
@@ -419,11 +419,8 @@ app.post("/api/check-stock", async (req, res) => {
       growthPct =
         ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
     }
-    
-    const combinedScore = (
-      0.2 * rating +
-      0.8 * growthPct
-    ).toFixed(2);
+  
+    const combinedScoreNum = 0.2 * rating + 0.8 * growthPct; const combinedScore = +combinedScoreNum.toFixed(2);
 
     const classification =
       growthPct >= 2
@@ -605,6 +602,97 @@ app.use("/finder", finderRouter);
 
 
 /*──────────────────────────────────────────
+|  14) Dashboard helper endpoints          |
+└──────────────────────────────────────────*/
+
+/* utility: split an array into chunks */
+const chunk = (arr, n) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+};
+
+/* 1️⃣  MOST‑TRADED POPULAR STOCKS  */
+app.get("/api/popular-stocks*", async (_req, res) => {
+  try {
+    const popular = ["AAPL", "TSLA", "AMZN", "NVDA", "META", "GOOG", "MSFT"];
+    const quotes = await Promise.all(
+      popular.map((s) => fetchStockData(s).catch(() => null))
+    );
+
+    const rows = quotes
+      .map((d, i) =>
+        d && d.price
+          ? {
+              symbol: popular[i],
+              name: d.price.longName || popular[i],
+              price: d.price.regularMarketPrice || 0,
+              volume: d.price.regularMarketVolume || 0,
+            }
+          : null
+      )
+      .filter(Boolean);
+
+    return res.json({ stocks: rows });
+  } catch (e) {
+    console.error("popular‑stocks:", e.message);
+    return res.status(500).json({ stocks: [] });
+  }
+});
+
+/* 2️⃣  TOP‑FORECASTED (first 200 tickers, batched) */
+app.get("/api/top-forecasted*", async (_req, res) => {
+  try {
+    const sample = symbolsList
+      .slice(0, 200)
+      .map((s) => (typeof s === "string" ? s : s.symbol));
+
+    const gains = [];
+    for (const group of chunk(sample, 10)) {
+      const results = await Promise.all(
+        group.map(async (sym) => {
+          const q = await fetchStockData(sym).catch(() => null);
+          const price = q?.price?.regularMarketPrice;
+          if (!price) return null;
+          const fc = await buildForecastPrice(sym, price);
+          return { symbol: sym, gain: ((fc - price) / price) * 100 };
+        })
+      );
+      gains.push(...results.filter(Boolean));
+    }
+
+    gains.sort((a, b) => b.gain - a.gain);
+    return res.json({ forecasts: gains.slice(0, 5) });
+  } catch (e) {
+    console.error("top‑forecasted:", e.message);
+    return res.status(500).json({ forecasts: [] });
+  }
+});
+
+/* 3️⃣  TOP NEWS HEADLINES */
+app.get("/api/top-news*", async (_req, res) => {
+  try {
+    const feed = await rssParser.parseURL(
+      "https://news.google.com/rss/search?q=stock+market"
+    );
+    const headlines = (feed.items || []).slice(0, 5).map((i) => ({
+      title: i.title,
+      url: i.link,
+    }));
+    return res.json({ headlines });
+  } catch (e) {
+    console.error("top‑news:", e.message);
+    return res.status(500).json({ headlines: [] });
+  }
+});
+
+/* 4️⃣  NOTIFICATIONS placeholder (keeps dashboard happy) */
+app.get("/api/notifications*", (_req, res) => {
+  res.json({ notifications: [] });
+});
+
+
+/*──────────────────────────────────────────
 |  15) Community                           |
 └──────────────────────────────────────────*/
 app.get("/api/community-posts", async (_req,res)=>{
@@ -635,7 +723,7 @@ app.post("/forgotPassword", async (req,res)=>{
     from: process.env.NOTIFY_EMAIL,
     to  : user.email,
     subject: "Password Reset Request",
-    text: `Reset link (valid 1 h): https://sci-investments.web.app/resetPassword.html?token=${token}`,
+    text: `Reset link (valid 1 h): https://sci-investments.web.app/resetPassword.html?token=${token}`,
   });
   res.json({ message:"Reset link sent." });
 });
