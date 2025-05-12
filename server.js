@@ -529,6 +529,45 @@ async function classifyStockByForecast(symbol) {
   return { classification: "unstable" };
 }
 
+/*──────────────────────────────────────────
+|  STOCK‑HISTORY  –  daily candles         |
+└──────────────────────────────────────────*/
+app.post("/api/stock-history*", async (req, res) => {
+  try {
+    const { symbol, range = "1m" } = req.body || {};
+    if (!symbol) return res.status(400).json({ message: "symbol required." });
+
+    const dayCount = {
+      "1d": 1,  "5d": 5,  "1w": 7,
+      "1m": 30, "6m": 180, "1y": 365, "MAX": 1825
+    }[range] ?? 30;
+
+    const end = new Date();
+    const start = new Date(end.getTime() - dayCount * 24 * 60 * 60 * 1000);
+
+    const rows = await yahooFinance.historical(
+      symbol,
+      { period1: start, period2: end, interval: "1d" },
+      { fetchOptions: requestOptions }
+    );
+
+    if (!rows || !rows.length) return res.json({ data: [] });
+
+    rows.sort((a, b) => new Date(a.date) - new Date(b.date));
+    const data = rows.map(r => ({
+      date:  r.date,
+      open:  r.open,  high: r.high,
+      low:   r.low,   close:r.close,
+      volume:r.volume
+    }));
+
+    return res.json({ symbol, range, data });
+  } catch (e) {
+    console.error("stock‑history:", e.message);
+    return res.status(500).json({ data: [] });
+  }
+});
+
 
 /*──────────────────────────────────────────
 |  13) FINDER (batched / rate‑limited)     |
