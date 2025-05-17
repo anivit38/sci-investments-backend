@@ -419,54 +419,34 @@ app.post("/api/check-stock", async (req, res) => {
       growthPct =
         ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
     }
-  
-    const combinedScoreNum = 0.2 * rating + 0.8 * growthPct; const combinedScore = +combinedScoreNum.toFixed(2);
-
-    const classification =
-      growthPct >= 2
-        ? "growth"
-        : growthPct >= 0
-        ? "stable"
-        : "unstable";
-
-    const advice =
-      classification === "growth"
-        ? "Projected to grow. Consider buying."
-        : classification === "stable"
-        ? "Minimal growth expected. Hold or monitor."
-        : "Projected to decline. Consider selling or avoiding.";
-
-    /* 4. quick news sentiment (unchanged) */
+  /* 4. quick news sentiment (safe) */
     let news = { averageSentiment: 0, topStories: [] };
     try {
       const feed = await rssParser.parseURL(
         `https://news.google.com/rss/search?q=${upper}`
       );
-      const items = feed.items.slice(0, 5);
       const analyses = await Promise.all(
-        items.map(async (item) => {
+        (feed.items || []).slice(0, 5).map(async (item) => {
           let snippet = item.contentSnippet || item.title;
           try {
             const html = await (await fetchNative(item.link)).text();
             snippet = cheerio.load(html)("p").first().text() || snippet;
-          } catch (_) {}
+          } catch {}
           return {
-            title: item.title,
-            link: item.link,
-            snippet:
-              snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
+            title    : item.title,
+            link     : item.link,
+            snippet  : snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
             sentiment: sentiment.analyze(snippet).score,
           };
         })
       );
       news = {
         averageSentiment:
-          analyses.reduce((s, a) => s + a.sentiment, 0) /
-            analyses.length || 0,
+          analyses.reduce((s, a) => s + a.sentiment, 0) / analyses.length || 0,
         topStories: analyses,
       };
-    } catch (e) {
-      console.warn("News fetch failed:", e.message);
+    } catch (err) {
+      console.warn(`news sentiment for ${upper} failed:`, err.message);
     }
 
     /* 5. send response that matches your front‑end */
@@ -529,44 +509,6 @@ async function classifyStockByForecast(symbol) {
   return { classification: "unstable" };
 }
 
-/*──────────────────────────────────────────
-|  STOCK‑HISTORY  –  daily candles         |
-└──────────────────────────────────────────*/
-app.post("/api/stock-history*", async (req, res) => {
-  try {
-    const { symbol, range = "1m" } = req.body || {};
-    if (!symbol) return res.status(400).json({ message: "symbol required." });
-
-    const dayCount = {
-      "1d": 1,  "5d": 5,  "1w": 7,
-      "1m": 30, "6m": 180, "1y": 365, "MAX": 1825
-    }[range] ?? 30;
-
-    const end = new Date();
-    const start = new Date(end.getTime() - dayCount * 24 * 60 * 60 * 1000);
-
-    const rows = await yahooFinance.historical(
-      symbol,
-      { period1: start, period2: end, interval: "1d" },
-      { fetchOptions: requestOptions }
-    );
-
-    if (!rows || !rows.length) return res.json({ data: [] });
-
-    rows.sort((a, b) => new Date(a.date) - new Date(b.date));
-    const data = rows.map(r => ({
-      date:  r.date,
-      open:  r.open,  high: r.high,
-      low:   r.low,   close:r.close,
-      volume:r.volume
-    }));
-
-    return res.json({ symbol, range, data });
-  } catch (e) {
-    console.error("stock‑history:", e.message);
-    return res.status(500).json({ data: [] });
-  }
-});
 
 
 /*──────────────────────────────────────────
@@ -708,7 +650,7 @@ app.get("/api/top-forecasted*", async (_req, res) => {
   }
 });
 
-/* 3️⃣  TOP NEWS HEADLINES */
+/*3️⃣  TOP NEWS HEADLINES  (robust — never throws) */
 app.get("/api/top-news*", async (_req, res) => {
   try {
     const feed = await rssParser.parseURL(
@@ -716,12 +658,13 @@ app.get("/api/top-news*", async (_req, res) => {
     );
     const headlines = (feed.items || []).slice(0, 5).map((i) => ({
       title: i.title,
-      url: i.link,
+      url  : i.link,
     }));
     return res.json({ headlines });
-  } catch (e) {
-    console.error("top‑news:", e.message);
-    return res.status(500).json({ headlines: [] });
+  } catch (err) {
+    console.warn("top-news fetch failed:", err.message);
+    /* 200 with empty list keeps the front-end happy */
+    return res.json({ headlines: [] });
   }
 });
 
