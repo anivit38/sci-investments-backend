@@ -277,7 +277,11 @@ async function buildForecastPrice(symbol,price){
 /*──────────────────────────────────────────
 |  Rate‑limits                             |
 └──────────────────────────────────────────*/
-const stockCheckerLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
+const stockCheckerLimiter = rateLimit({
+  windowMs : 60 * 1000,
+  max      : 20,          // <- was 5
+  message  : { message: "Too many requests, please try again shortly." }
+});
 app.use("/api/check-stock", stockCheckerLimiter);
 
 const findStockLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
@@ -842,13 +846,13 @@ async function refreshAllHistoricalData() {
 }
 
 // initial run at boot
-refreshAllHistoricalData();
+//refreshAllHistoricalData();
 
 // run once every 24 h
-setInterval(() => {
-  console.log("⏰ Running daily refreshAllHistoricalData…");
-  refreshAllHistoricalData();
-}, ONE_DAY);
+//setInterval(() => {
+  //console.log("⏰ Running daily refreshAllHistoricalData…");
+  //refreshAllHistoricalData();
+//}, ONE_DAY);
 
 
 /*──────────────────────────────────────────
