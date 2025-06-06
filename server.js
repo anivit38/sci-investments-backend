@@ -563,8 +563,28 @@ app.post("/api/stock-history*", async (req, res) => {
 
     return res.json({ symbol, range, data });
   } catch (e) {
-    console.error("stock‑history:", e.message);
+    console.error("stock-history:", e.message);
     return res.status(500).json({ data: [] });
+  }
+});
+
+
+// ────────────────────────────────────────────────────────────
+// Intraday Indicators Endpoint
+// ────────────────────────────────────────────────────────────
+const { getIntradayIndicators } = require("./data/intradayService");
+
+app.get("/api/intraday/:symbol", async (req, res) => {
+  try {
+    const symbol = req.params.symbol?.toUpperCase();
+    if (!symbol) {
+      return res.status(400).json({ message: "Symbol is required." });
+    }
+    const result = await getIntradayIndicators(symbol);
+    return res.json(result);
+  } catch (err) {
+    console.error(`intraday/${req.params.symbol}:`, err.message);
+    return res.status(500).json({ message: "Failed to retrieve intraday data." });
   }
 });
 
@@ -674,7 +694,7 @@ app.get("/api/popular-stocks*", async (_req, res) => {
 
     return res.json({ stocks: rows });
   } catch (e) {
-    console.error("popular‑stocks:", e.message);
+    console.error("popular-stocks:", e.message);
     return res.status(500).json({ stocks: [] });
   }
 });
