@@ -3,7 +3,8 @@
  * FINDER, DASHBOARD, FORECASTING, COMMUNITY
  *******************************************/
 
-require("dotenv").config();
+require('dotenv').config();
+
 const express      = require("express");
 const cors         = require("cors");
 const bodyParser   = require("body-parser");
@@ -17,6 +18,13 @@ const yahooFinance = require("yahoo-finance2").default;
 const nodemailer   = require("nodemailer");
 const rateLimit    = require("express-rate-limit");
 const app          = express();
+const { getIntradayIndicators } = require("./data/intradayService");
+const { pullCompanyFundamentals } = require('./data/fetchFundamentals');
+const analyzeRouter = require('./routes/analyze');
+const { getFundamentals } = require("./services/FundamentalsService");
+const { getTechnical } = require('./services/TechnicalService');
+
+
 
 /* extras */
 const crypto      = require("crypto");
@@ -24,6 +32,7 @@ const RSSParser   = require("rss-parser");
 const Sentiment   = require("sentiment");
 const fetchNative = require("node-fetch");
 const cheerio     = require("cheerio");
+
 
 /*──────────────────────────────────────────
 |  GLOBAL DATA                             |
@@ -263,14 +272,23 @@ async function getWindowFromBucket(symbol){
   if(rows.length<30) throw new Error("not enough history");
   return rows.map(r=>FORECAST_FEATURE_KEYS.map((_,i)=>+r[i+2]||0));
 }
-async function buildForecastPrice(symbol,price){
-  if(forecastCache[symbol] && Date.now()-forecastCache[symbol].timestamp<FORECAST_CACHE_TTL)
-    return forecastCache[symbol].price;
-  let adv=null;
-  try{ adv=await predictNextDay(symbol,await getWindowFromBucket(symbol)); }catch{}
-  const simple=await simpleForecastPrice(symbol,price);
-  const final=adv&&Math.abs(adv-price)>0.01?adv:simple;
-  forecastCache[symbol]={price:final,timestamp:Date.now()};
+async function buildForecastPrice(symbol, price){
+  let adv = null;
+  try {
+    adv = await predictNextDay(symbol, await getWindowFromBucket(symbol));
+  } catch(e){
+    console.warn(`GRU failed for ${symbol}:`, e.message);
+  }
+
+  const simple = await simpleForecastPrice(symbol, price);
+  const useAdvanced = adv !== null && Math.abs(adv - price) > 0.01;
+  console.log(
+    `Forecast for ${symbol}:`,
+    useAdvanced ? `ADV(${adv.toFixed(2)})` : `SIMP(${simple.toFixed(2)})`
+  );
+
+  const final = useAdvanced ? adv : simple;
+  forecastCache[symbol] = { price: final, timestamp: Date.now() };
   return final;
 }
 
@@ -286,6 +304,7 @@ app.use("/finder/api/find-stocks", findStockLimiter); // correct path
 /*──────────────────────────────────────────
 |  ===  REST ENDPOINTS (all original)  === |
 └──────────────────────────────────────────*/
+app.use('/api', analyzeRouter);
 /*──────────────────────────────────────────
 |  11) Auth Endpoints                      |
 └──────────────────────────────────────────*/
@@ -338,6 +357,87 @@ app.get("/protected", (req, res) => {
   }
 });
 
+
+
+app.get("/api/fundamentals/:symbol", async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  try {
+    const fund = await getFundamentals(symbol);
+    if (!fund) throw new Error("No fundamentals returned");
+
+    const stock = await fetchStockData(symbol);
+    const currentPrice = stock?.price?.regularMarketPrice ?? null;
+
+    // Valuation logic with PE → P/S fallback
+    let valuation = null;
+    let advice    = "";
+
+    const { peRatio, priceToSales } = fund.ratios;
+    const { peRatio: bmPE, priceToSales: bmPS } = fund.benchmarks;
+    const cp = currentPrice;
+
+    if (cp !== null && peRatio != null && bmPE != null && peRatio > 0) {
+      const fairPrice = +((bmPE / peRatio) * cp).toFixed(2);
+      const status    = fairPrice > cp ? "undervalued" : "overvalued";
+      valuation       = { fairPrice, status };
+      advice          = status === "undervalued"
+        ? "Price below peer PE average—consider a closer look."
+        : "Price above peer PE average—be cautious of overpaying.";
+    }
+    else if (cp !== null && priceToSales != null && bmPS != null && priceToSales > 0) {
+      const fairPrice = +((bmPS / priceToSales) * cp).toFixed(2);
+      const status    = fairPrice > cp ? "undervalued" : "overvalued";
+      valuation       = { fairPrice, status };
+      advice          = status === "undervalued"
+        ? "Price below peer P/S average—consider a closer look."
+        : "Price above peer P/S average—be cautious of overpaying.";
+    }
+    else {
+      if (
+        fund.weaknesses.some(w =>
+          ["Negative net margin","Negative ROA"].includes(w.flag)
+        )
+      ) {
+        advice = "Company is unprofitable—avoid investing.";
+      } else {
+        advice = "No valuation signal available.";
+      }
+    }
+
+    return res.json({
+      symbol,
+      companyInfo: fund.companyInfo,
+      ratios:      fund.ratios,
+      benchmarks:  fund.benchmarks,
+      rating:      fund.rating,
+      weaknesses:  fund.weaknesses,
+      valuation,
+      advice,
+      news:        fund.news,
+      currentPrice,
+      fetchedAt:   fund.fetchedAt,
+    });
+  } catch (err) {
+    console.error("Fundamentals endpoint error:", err);
+    return res.status(500).json({ message: "Failed to fetch fundamentals." });
+  }
+});
+
+
+
+// GET /api/technical/:symbol
+app.get('/api/technical/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  try {
+    const technical = await getTechnical(symbol);
+    return res.json({ symbol, technical });
+  } catch (err) {
+    console.error('TechnicalService error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
 /*──────────────────────────────────────────
 |  12) STOCK CHECKER                       |
 └──────────────────────────────────────────*/
@@ -349,34 +449,40 @@ app.post("/api/check-stock", async (req, res) => {
     }
     const upper = symbol.toUpperCase();
 
-    /* 1. fundamentals */
+    // ── 1) Fetch quote for metrics ─────────────────────────────────────────
     const stock = await fetchStockData(upper);
     if (!stock || !stock.price) {
       return res
         .status(404)
         .json({ message: "Stock not found or data unavailable." });
     }
+    const priceData = stock.price;
+    const summary  = stock.summaryDetail || {};
+    const finData  = stock.financialData || {};
 
+    // Build your metrics object exactly as before
     const metrics = {
-      volume:           stock.price.regularMarketVolume ?? null,
-      currentPrice:     stock.price.regularMarketPrice ?? null,
-      peRatio:          stock.summaryDetail?.trailingPE ?? null,
-      pbRatio:          stock.summaryDetail?.priceToBook ?? null,
-      dividendYield:    stock.summaryDetail?.dividendYield ?? null,
-      earningsGrowth:   stock.financialData?.earningsGrowth ?? null,
-      debtRatio:        stock.financialData?.debtToEquity ?? null,
-      dayHigh:          stock.price.regularMarketDayHigh ?? null,
-      dayLow:           stock.price.regularMarketDayLow ?? null,
-      fiftyTwoWeekHigh: stock.summaryDetail?.fiftyTwoWeekHigh ?? null,
-      fiftyTwoWeekLow:  stock.summaryDetail?.fiftyTwoWeekLow ?? null,
+      volume:           priceData.regularMarketVolume ?? null,
+      currentPrice:     priceData.regularMarketPrice  ?? null,
+      peRatio:          summary.trailingPE            ?? null,
+      pbRatio:          summary.priceToBook           ?? null,
+      dividendYield:    summary.dividendYield         ?? null,
+      earningsGrowth:   finData.earningsGrowth        ?? null,
+      debtRatio:        finData.debtToEquity          ?? null,
+      dayHigh:          priceData.regularMarketDayHigh?? null,
+      dayLow:           priceData.regularMarketDayLow ?? null,
+      fiftyTwoWeekHigh: summary.fiftyTwoWeekHigh      ?? null,
+      fiftyTwoWeekLow:  summary.fiftyTwoWeekLow       ?? null,
     };
-    const avgVol =
-      stock.summaryDetail?.averageDailyVolume3Month ?? metrics.volume ?? 0;
 
-    /* 2. quick fundamental rating */
+    const avgVol =
+      summary.averageDailyVolume3Month ?? metrics.volume ?? 0;
+
+    // ── 2) Quick fundamental rating (same as original) ─────────────────────
     let rating = 0;
-    if (metrics.volume && metrics.volume > avgVol * 1.2) rating += 3;
-    else if (metrics.volume && metrics.volume < avgVol * 0.8) rating -= 2;
+    if (metrics.volume > avgVol * 1.2) rating += 3;
+    else if (metrics.volume < avgVol * 0.8) rating -= 2;
+
     if (metrics.peRatio !== null) {
       if (metrics.peRatio >= 5 && metrics.peRatio <= 25) rating += 2;
       else if (metrics.peRatio > 30) rating -= 1;
@@ -391,52 +497,46 @@ app.post("/api/check-stock", async (req, res) => {
       else if (metrics.debtRatio > 1) rating -= 1;
     }
 
-    const dayRange =
-      (metrics.dayHigh ?? 0) - (metrics.dayLow ?? 0);
+    const dayRange  = (metrics.dayHigh  || 0) - (metrics.dayLow  || 0);
+    const weekRange = (metrics.fiftyTwoWeekHigh || 0)
+                    - (metrics.fiftyTwoWeekLow  || 0);
+
     if (dayRange > 0) {
-      const dayPos =
-        (metrics.currentPrice - metrics.dayLow) / dayRange;
-      if (dayPos < 0.2) rating += 1;
-      if (dayPos > 0.8) rating -= 1;
+      const pos = (metrics.currentPrice - metrics.dayLow) / dayRange;
+      if (pos < 0.2) rating += 1;
+      if (pos > 0.8) rating -= 1;
     }
-
-    const weekRange =
-      (metrics.fiftyTwoWeekHigh ?? 0) - (metrics.fiftyTwoWeekLow ?? 0);
     if (weekRange > 0) {
-      const weekPos =
-        (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-      if (weekPos < 0.3) rating += 2;
-      if (weekPos > 0.8) rating -= 2;
+      const pos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
+      if (pos < 0.3) rating += 2;
+      if (pos > 0.8) rating -= 2;
     }
 
-    /* 3. build forecast */
-    const forecastPrice = await buildForecastPrice(
-      upper,
+    // ── 3) Deep fundamentals via your new service ─────────────────────────
+    const fund = await getFundamentals(upper);
+    if (!fund) {
+      // fall back to just the quick rating if your service failed
+      console.warn(`FundamentalsService failed for ${upper}`);
+    }
+
+    // ── 4) Forecast ───────────────────────────────────────────────────────
+    const forecastPrice = await buildForecastPrice(upper, metrics.currentPrice);
+    const growthPct =
       metrics.currentPrice
-    );
-    let growthPct = 0;
-    if (metrics.currentPrice && metrics.currentPrice !== 0) {
-      growthPct =
-        ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100;
-    }
-  
-    const combinedScoreNum = 0.2 * rating + 0.8 * growthPct; const combinedScore = +combinedScoreNum.toFixed(2);
+        ? ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100
+        : 0;
 
+    const combinedScore = +(0.2 * rating + 0.8 * growthPct).toFixed(2);
     const classification =
-      growthPct >= 2
-        ? "growth"
-        : growthPct >= 0
-        ? "stable"
-        : "unstable";
-
+      growthPct >= 2  ? "growth" :
+      growthPct >= 0  ? "stable" :
+                        "unstable";
     const advice =
-      classification === "growth"
-        ? "Projected to grow. Consider buying."
-        : classification === "stable"
-        ? "Minimal growth expected. Hold or monitor."
-        : "Projected to decline. Consider selling or avoiding.";
+      classification === "growth" ? "Projected to grow. Consider buying." :
+      classification === "stable" ? "Minimal growth expected. Hold or monitor." :
+                                    "Projected to decline. Consider selling or avoiding.";
 
-    /* 4. quick news sentiment (unchanged) */
+    // ── 5) News sentiment (unchanged) ─────────────────────────────────────
     let news = { averageSentiment: 0, topStories: [] };
     try {
       const feed = await rssParser.parseURL(
@@ -449,54 +549,49 @@ app.post("/api/check-stock", async (req, res) => {
           try {
             const html = await (await fetchNative(item.link)).text();
             snippet = cheerio.load(html)("p").first().text() || snippet;
-          } catch (_) {}
+          } catch {}
           return {
             title: item.title,
-            link: item.link,
-            snippet:
-              snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
+            link:  item.link,
+            snippet: snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
             sentiment: sentiment.analyze(snippet).score,
           };
         })
       );
       news = {
         averageSentiment:
-          analyses.reduce((s, a) => s + a.sentiment, 0) /
-            analyses.length || 0,
+          analyses.reduce((sum, a) => sum + a.sentiment, 0) / analyses.length,
         topStories: analyses,
       };
     } catch (e) {
       console.warn("News fetch failed:", e.message);
     }
 
-    /* 5. send response that matches your front‑end */
+    // ── 6) Send it all back ────────────────────────────────────────────────
     return res.json({
       symbol: upper,
-      name: stock.price.longName || upper,
+      name:   priceData.longName || upper,
       industry: stock.assetProfile?.industry || "Unknown",
+
       fundamentalRating: rating.toFixed(2),
       combinedScore,
       classification,
       advice,
+
       forecast: {
         forecastPrice: +forecastPrice.toFixed(2),
         projectedGrowthPercent: `${growthPct.toFixed(2)}%`,
         forecastPeriod: "Close",
         forecastEndDate: getForecastEndTime(),
       },
-      metrics: {
-        currentPrice: metrics.currentPrice ?? "N/A",
-        peRatio: metrics.peRatio ?? "N/A",
-        earningsGrowth: metrics.earningsGrowth ?? "N/A",
-        debtRatio: metrics.debtRatio ?? "N/A",
-        volume: metrics.volume ?? "N/A",
-        dayRange: dayRange || "N/A",
-        fiftyTwoWeekRange: weekRange || "N/A",
-      },
+
+      // metrics + deep ratios + benchmarks
+      metrics,
+      fundamentals: fund || {},
       news,
     });
   } catch (err) {
-    console.error("check-stock:", err.message);
+    console.error("check-stock:", err);
     return res.status(500).json({ message: "Server error." });
   }
 });
@@ -572,7 +667,8 @@ app.post("/api/stock-history*", async (req, res) => {
 // ────────────────────────────────────────────────────────────
 // Intraday Indicators Endpoint
 // ────────────────────────────────────────────────────────────
-const { getIntradayIndicators } = require("./data/intradayService");
+
+
 
 app.get("/api/intraday/:symbol", async (req, res) => {
   try {
@@ -583,10 +679,12 @@ app.get("/api/intraday/:symbol", async (req, res) => {
     const result = await getIntradayIndicators(symbol);
     return res.json(result);
   } catch (err) {
-    console.error(`intraday/${req.params.symbol}:`, err.message);
-    return res.status(500).json({ message: "Failed to retrieve intraday data." });
+    console.error(`intraday/${req.params.symbol}:`, err);
+    // Return the real error message so we can diagnose failures:
+    return res.status(500).json({ message: err.message });
   }
 });
+
 
 
 /*──────────────────────────────────────────
@@ -926,6 +1024,13 @@ setInterval(() => {
   console.log("⏰ Running daily refreshAllHistoricalData…");
   refreshAllHistoricalData();
 }, ONE_DAY);
+
+
+const cron = require('node-cron');
+cron.schedule('0 2 * * 1-5', () => {
+  console.log('⏰ Running daily pullCompanyFundamentals…');
+  watchlist.forEach(sym => pullCompanyFundamentals(sym));
+});
 
 
 /*──────────────────────────────────────────
