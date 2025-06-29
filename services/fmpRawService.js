@@ -207,4 +207,7 @@ async function getMetric(symbol, metricKey) {
   }
 }
 
-module.exports = { getMetric };
+module.exports = {
+  getMetric,
+  loadFmpAll,    // <— add this
+};

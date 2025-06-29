@@ -49,134 +49,109 @@ function evaluateWeaknesses(r, bm) {
 }
 
 async function getFundamentals(symbol) {
+  // --- step 1: live profile or fall back to stale cache ---
+  let profile, rawRatios, inc, bs;
   try {
-    // 1) Profile
+    // try live profile call
     const pf = await axios.get(
       `https://financialmodelingprep.com/api/v3/profile/${symbol}`,
       { params: { apikey: FMP_API_KEY } }
     );
-    const profile = pf.data?.[0] || {};
-    const currentPrice = parseNumber(profile.price);
-
-    // 2) Company info & reports
-    const companyInfo = {
-      name:        profile.companyName,
-      website:     profile.website,
-      description: profile.description,
-      reports: {
-        incomeStatement: `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?apikey=${FMP_API_KEY}`,
-        balanceSheet:    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}?apikey=${FMP_API_KEY}`,
-        cashFlow:        `https://financialmodelingprep.com/api/v3/cash-flow-statement/${symbol}?apikey=${FMP_API_KEY}`,
-      }
-    };
-
-    // 3) Ratios via fallback
-    const keys = [
-      "grossMargin","operatingMargin","netMargin",
-      "roa","roe","currentRatio","quickRatio",
-      "debtToEquity","interestCoverage",
-      "assetTurnover","inventoryTurnover","receivablesTurnover",
-      "peRatio","priceToBook","priceToSales","dividendYield"
-    ];
-    const rawResults = await Promise.all(keys.map(k => fetchWithFallback(symbol, k)));
-    const ratios = keys.reduce((acc, k, i) => {
-      acc[k] = parseNumber(rawResults[i]);
-      return acc;
-    }, {});
-
-    // 4) Benchmarks
-    const industry   = profile.sector || "Unknown";
-    const benchmarks = industryMetrics[industry] || {};
-
-    // 5) Rating & weaknesses
-    const rating     = computeRating(ratios);
-    const weaknesses = evaluateWeaknesses(ratios, benchmarks);
-
-    // 6) News + sentiment
-    let news = [];
-    try {
-      const RSSParser = require("rss-parser");
-      const Sentiment = require("sentiment");
-      const parser    = new RSSParser();
-      const sentiment = new Sentiment();
-
-      const feed = await parser.parseURL(`https://news.google.com/rss/search?q=${symbol}`);
-      news = await Promise.all(feed.items.slice(0,5).map(async item => {
-        let snippet = item.contentSnippet || item.title;
-        try {
-          const html = await axios.get(item.link).then(r => r.data);
-          const $    = require("cheerio").load(html);
-          snippet    = $("p").first().text() || snippet;
-        } catch {}
-        return {
-          title:     item.title,
-          link:      item.link,
-          snippet:   snippet.slice(0,200) + (snippet.length>200?"…":""),
-          sentiment: sentiment.analyze(snippet).score
-        };
-      }));
-    } catch (_) { /* swallow news errors */ }
-
-    // 7) Fair-value & generic advice
-    let valuation = null, advice = "No valuation signal available.";
-    if (ratios.peRatio > 0 && benchmarks.peRatio > 0 && currentPrice != null) {
-      const fairPrice = +((benchmarks.peRatio/ratios.peRatio) * currentPrice).toFixed(2);
-      const status    = fairPrice > currentPrice ? "undervalued" : "overvalued";
-      valuation = { fairPrice, status };
-      advice    = status === "undervalued"
-        ? "Price below peer PE average—consider a closer look."
-        : "Price above peer PE average—be cautious of overpaying.";
-    }
-
-    return {
-      symbol,
-      companyInfo,
-      ratios,
-      benchmarks,
-      rating,
-      weaknesses,
-      valuation,
-      advice,
-      news,
-      currentPrice,
-      fetchedAt: new Date().toISOString()
-    };
-
-  } catch (err) {
-    console.error("🔶 FundamentalsService error:", err.message);
-
-    // Skeleton fallback
-    const skeleton = {
-      symbol,
-      companyInfo: { name: symbol, website: null, description: null, reports: {} },
-      ratios:      {},
-      benchmarks:  {},
-      rating:      null,
-      weaknesses:  [],
-      valuation:   null,
-      advice:      "No fundamentals available at this time.",
-      news:        [],
-      currentPrice:null,
-      fetchedAt:   new Date().toISOString()
-    };
-
-    // Try stale disk-cache from loadFmpAll()
-    try {
-      const { profile, rawRatios } = await loadFmpAll(symbol);
-      skeleton.companyInfo = {
-        name:        profile.companyName,
-        website:     profile.website,
-        description: profile.description,
-        reports:     skeleton.companyInfo.reports
-      };
-      Object.entries(rawRatios).forEach(([k,v]) => {
-        if (v != null) skeleton.ratios[k] = parseNumber(v);
-      });
-      skeleton.currentPrice = parseNumber(profile.price);
-    } catch (_) {}
-
-    return skeleton;
+    profile = pf.data?.[0] || {};
+    // now fetch the rest via your cached loader
+    ({ profile, rawRatios, inc, bs } = await loadFmpAll(symbol));
+  } catch (e) {
+    console.warn(
+      `⚠️  Unable to fetch live profile for "${symbol}" ` +
+      `(status ${e.response?.status || e.message}), using cached data`
+    );
+    ({ profile, rawRatios, inc, bs } = await loadFmpAll(symbol));
   }
+  const currentPrice = parseNumber(profile.price);
+
+  // --- step 2: company info & report URLs ---
+  const companyInfo = {
+    name:        profile.companyName,
+    website:     profile.website,
+    description: profile.description,
+    reports: {
+      incomeStatement: `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?apikey=${FMP_API_KEY}`,
+      balanceSheet:    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}?apikey=${FMP_API_KEY}`,
+      cashFlow:        `https://financialmodelingprep.com/api/v3/cash-flow-statement/${symbol}?apikey=${FMP_API_KEY}`,
+    }
+  };
+
+  // --- step 3: ratios via fallback chain ---
+  const keys = [
+    "grossMargin","operatingMargin","netMargin",
+    "roa","roe","currentRatio","quickRatio",
+    "debtToEquity","interestCoverage",
+    "assetTurnover","inventoryTurnover","receivablesTurnover",
+    "peRatio","priceToBook","priceToSales","dividendYield"
+  ];
+  const rawResults = await Promise.all(keys.map(k => fetchWithFallback(symbol, k)));
+  const ratios = keys.reduce((acc, k, i) => {
+    acc[k] = parseNumber(rawResults[i]);
+    return acc;
+  }, {});
+
+  // --- step 4: benchmarks & scoring ---
+  const industry   = profile.sector || "Unknown";
+  const benchmarks = industryMetrics[industry] || {};
+  const rating     = computeRating(ratios);
+  const weaknesses = evaluateWeaknesses(ratios, benchmarks);
+
+  // --- step 5: fetch news + sentiment ---
+  let news = [];
+  try {
+    const RSSParser = require("rss-parser");
+    const Sentiment = require("sentiment");
+    const parser    = new RSSParser();
+    const sentiment = new Sentiment();
+
+    const feed = await parser.parseURL(`https://news.google.com/rss/search?q=${symbol}`);
+    news = await Promise.all(feed.items.slice(0,5).map(async item => {
+      let snippet = item.contentSnippet || item.title;
+      try {
+        const html = await axios.get(item.link).then(r => r.data);
+        const $    = require("cheerio").load(html);
+        snippet    = $("p").first().text() || snippet;
+      } catch {}
+      return {
+        title:     item.title,
+        link:      item.link,
+        snippet:   snippet.slice(0,200) + (snippet.length>200?"…":""),
+        sentiment: sentiment.analyze(snippet).score
+      };
+    }));
+  } catch (_) {
+    // swallow news errors
+  }
+
+  // --- step 6: fair-value & advice ---
+  let valuation = null, advice = "No valuation signal available.";
+  if (ratios.peRatio > 0 && benchmarks.peRatio > 0 && currentPrice != null) {
+    const fairPrice = +((benchmarks.peRatio/ratios.peRatio) * currentPrice).toFixed(2);
+    const status    = fairPrice > currentPrice ? "undervalued" : "overvalued";
+    valuation = { fairPrice, status };
+    advice    = status === "undervalued"
+      ? "Price below peer PE average—consider a closer look."
+      : "Price above peer PE average—be cautious of overpaying.";
+  }
+
+  return {
+    symbol,
+    companyInfo,
+    ratios,
+    benchmarks,
+    rating,
+    weaknesses,
+    valuation,
+    advice,
+    news,
+    currentPrice,
+    fetchedAt: new Date().toISOString()
+  };
 }
 
 module.exports = { getFundamentals };
