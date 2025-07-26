@@ -1,8 +1,9 @@
 // services/FundamentalsService.js
 
 require("dotenv").config();
+const path = require("path");
 const axios               = require("axios");
-const industryMetrics     = require("./backend/industryMetrics.json");
+const industryMetrics = require(path.join(__dirname, "..", "industryMetrics.json"));
 const { fetchWithFallback } = require("./fundamentalsProvider");
 const { loadFmpAll }      = require("./backend/services/fmpRawService");
 
