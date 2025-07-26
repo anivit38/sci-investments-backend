@@ -7,4 +7,5 @@ data/historicalData_enriched_full.csv
 
 
 # ignore GCP service‑account key
-versatile-bolt-466123-p9-51a0b3048d76.json
+versatile.json.json
+serviceAccountKey.json.json
