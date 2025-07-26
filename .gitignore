@@ -4,3 +4,7 @@ node_modules/
 model/forecast_model_phase3/
 data/historicalData_enriched_full.csv
 /serviceAccountKey.json
+
+
+# ignore GCP service‑account key
+versatile-bolt-466123-p9-51a0b3048d76.json
