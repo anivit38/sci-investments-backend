@@ -2,9 +2,9 @@
 
 require("dotenv").config();
 const axios               = require("axios");
-const industryMetrics     = require("../industryMetrics.json");
+const industryMetrics     = require("../../backend/industryMetrics.json");
 const { fetchWithFallback } = require("./fundamentalsProvider");
-const { loadFmpAll }      = require("./fmpRawService");
+const { loadFmpAll }      = require("../../backend/services/fmpRawService");
 
 const FMP_API_KEY = process.env.FMP_API_KEY;
 if (!FMP_API_KEY) {
@@ -49,23 +49,26 @@ function evaluateWeaknesses(r, bm) {
 }
 
 async function getFundamentals(symbol) {
+  // If symbol has an exchange suffix (like SHOP.TO), strip it for FMP & caching
+  const lookupSymbol = symbol.includes('.') ? symbol.split('.')[0] : symbol;
+
   // --- step 1: live profile or fall back to stale cache ---
   let profile, rawRatios, inc, bs;
   try {
-    // try live profile call
+    // Try live FMP profile using stripped symbol
     const pf = await axios.get(
-      `https://financialmodelingprep.com/api/v3/profile/${symbol}`,
+      `https://financialmodelingprep.com/api/v3/profile/${lookupSymbol}`,
       { params: { apikey: FMP_API_KEY } }
     );
     profile = pf.data?.[0] || {};
-    // now fetch the rest via your cached loader
-    ({ profile, rawRatios, inc, bs } = await loadFmpAll(symbol));
+    // Fetch raw ratios and FS from cache or FMP API
+    ({ profile, rawRatios, inc, bs } = await loadFmpAll(lookupSymbol));
   } catch (e) {
     console.warn(
       `⚠️  Unable to fetch live profile for "${symbol}" ` +
       `(status ${e.response?.status || e.message}), using cached data`
     );
-    ({ profile, rawRatios, inc, bs } = await loadFmpAll(symbol));
+    ({ profile, rawRatios, inc, bs } = await loadFmpAll(lookupSymbol));
   }
   const currentPrice = parseNumber(profile.price);
 
@@ -75,9 +78,9 @@ async function getFundamentals(symbol) {
     website:     profile.website,
     description: profile.description,
     reports: {
-      incomeStatement: `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?apikey=${FMP_API_KEY}`,
-      balanceSheet:    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}?apikey=${FMP_API_KEY}`,
-      cashFlow:        `https://financialmodelingprep.com/api/v3/cash-flow-statement/${symbol}?apikey=${FMP_API_KEY}`,
+      incomeStatement: `https://financialmodelingprep.com/api/v3/income-statement/${lookupSymbol}?apikey=${FMP_API_KEY}`,
+      balanceSheet:    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${lookupSymbol}?apikey=${FMP_API_KEY}`,
+      cashFlow:        `https://financialmodelingprep.com/api/v3/cash-flow-statement/${lookupSymbol}?apikey=${FMP_API_KEY}`,
     }
   };
 
@@ -89,15 +92,27 @@ async function getFundamentals(symbol) {
     "assetTurnover","inventoryTurnover","receivablesTurnover",
     "peRatio","priceToBook","priceToSales","dividendYield"
   ];
-  const rawResults = await Promise.all(keys.map(k => fetchWithFallback(symbol, k)));
+  const rawResults = await Promise.all(
+    keys.map(k => fetchWithFallback(lookupSymbol, k))
+  );
   const ratios = keys.reduce((acc, k, i) => {
     acc[k] = parseNumber(rawResults[i]);
     return acc;
   }, {});
 
   // --- step 4: benchmarks & scoring ---
-  const industry   = profile.sector || "Unknown";
-  const benchmarks = industryMetrics[industry] || {};
+  const industry = profile.sector || "Unknown";
+  // Ensure these four keys always present
+  const defaultBenchmarks = {
+    peRatio: null,
+    revenueGrowth: null,
+    dividendYield: null,
+    debtToEquity: null
+  };
+  const benchmarks = {
+    ...defaultBenchmarks,
+    ...(industryMetrics[industry] || {})
+  };
   const rating     = computeRating(ratios);
   const weaknesses = evaluateWeaknesses(ratios, benchmarks);
 
@@ -110,31 +125,34 @@ async function getFundamentals(symbol) {
     const sentiment = new Sentiment();
 
     const feed = await parser.parseURL(`https://news.google.com/rss/search?q=${symbol}`);
-    news = await Promise.all(feed.items.slice(0,5).map(async item => {
-      let snippet = item.contentSnippet || item.title;
-      try {
-        const html = await axios.get(item.link).then(r => r.data);
-        const $    = require("cheerio").load(html);
-        snippet    = $("p").first().text() || snippet;
-      } catch {}
-      return {
-        title:     item.title,
-        link:      item.link,
-        snippet:   snippet.slice(0,200) + (snippet.length>200?"…":""),
-        sentiment: sentiment.analyze(snippet).score
-      };
-    }));
+    news = await Promise.all(
+      feed.items.slice(0,5).map(async item => {
+        let snippet = item.contentSnippet || item.title;
+        try {
+          const html = await axios.get(item.link).then(r => r.data);
+          const $    = require("cheerio").load(html);
+          snippet    = $("p").first().text() || snippet;
+        } catch {}
+        return {
+          title:     item.title,
+          link:      item.link,
+          snippet:   snippet.slice(0,200) + (snippet.length>200?"…":""),
+          sentiment: sentiment.analyze(snippet).score
+        };
+      })
+    );
   } catch (_) {
     // swallow news errors
   }
 
   // --- step 6: fair-value & advice ---
-  let valuation = null, advice = "No valuation signal available.";
+  let valuation = null;
+  let advice = "No valuation signal available.";
   if (ratios.peRatio > 0 && benchmarks.peRatio > 0 && currentPrice != null) {
-    const fairPrice = +((benchmarks.peRatio/ratios.peRatio) * currentPrice).toFixed(2);
+    const fairPrice = +((benchmarks.peRatio / ratios.peRatio) * currentPrice).toFixed(2);
     const status    = fairPrice > currentPrice ? "undervalued" : "overvalued";
-    valuation = { fairPrice, status };
-    advice    = status === "undervalued"
+    valuation       = { fairPrice, status };
+    advice          = status === "undervalued"
       ? "Price below peer PE average—consider a closer look."
       : "Price above peer PE average—be cautious of overpaying.";
   }

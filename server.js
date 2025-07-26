@@ -5,24 +5,74 @@
 
 require('dotenv').config();
 
-const express      = require("express");
-const cors         = require("cors");
-const bodyParser   = require("body-parser");
-const bcrypt       = require("bcryptjs");
-const jwt          = require("jsonwebtoken");
-const mongoose     = require("mongoose");
-const path         = require("path");
-const fs           = require("fs");
-const tf           = require("@tensorflow/tfjs-node");
-const yahooFinance = require("yahoo-finance2").default;
-const nodemailer   = require("nodemailer");
-const rateLimit    = require("express-rate-limit");
-const app          = express();
-const { getIntradayIndicators } = require("./data/intradayService");
-const { pullCompanyFundamentals } = require('./data/fetchFundamentals');
-const analyzeRouter = require('./routes/analyze');
-const { getFundamentals } = require("./services/FundamentalsService");
-const { getTechnical } = require('./services/TechnicalService');
+const express    = require('express');
+const cors       = require('cors');
+const bodyParser = require('body-parser');
+const bcrypt     = require('bcryptjs');
+const admin      = require('firebase-admin');
+const mongoose   = require('mongoose');
+const path       = require('path');
+const fs         = require('fs');
+const tf         = require('@tensorflow/tfjs-node');
+const yahoo      = require('yahoo-finance2').default;
+const nodemailer = require('nodemailer');
+const rateLimit  = require('express-rate-limit');
+const axios      = require('axios');
+
+const analyzeRouter      = require('./routes/analyze');
+const userProfileRoutes  = require('./routes/userProfileRoutes');
+const advisorRoutes      = require('./routes/advisorRoutes');
+const UserProfile        = require('./models/UserProfile');
+
+// — Initialize Firebase Admin with your service account key path from .env —
+admin.initializeApp({
+  credential: admin.credential.cert(
+    require(process.env.FIREBASE_SERVICE_ACCOUNT)
+  )
+});
+
+const app = express();
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+app.use(
+  cors({
+    origin: ['https://sci-investments.web.app','http://localhost:3000'],
+    methods: ['GET','POST','OPTIONS'],
+    allowedHeaders: ['Content-Type','Authorization','Accept'],
+    credentials: true,
+    optionsSuccessStatus: 200,
+  })
+);
+app.options('*', cors());
+
+// ─── BODY PARSER ───────────────────────────────────────────────────────────────
+app.use(bodyParser.json());
+
+// ─── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
+async function authenticate(req, res, next) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) {
+    return res
+      .status(401)
+      .json({ error: 'Authorization header missing or malformed' });
+  }
+  const idToken = header.split(' ')[1];
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.user = { userId: decoded.uid, email: decoded.email };
+    next();
+  } catch (err) {
+    console.error('Firebase Auth verify failed:', err);
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
+app.use('/api', analyzeRouter);
+app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
+app.use('/api', advisorRoutes);
+
+
 
 
 
@@ -44,20 +94,67 @@ const rssParser  = new RSSParser();
 const sentiment  = new Sentiment();
 const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 
-/*──────────────────────────────────────────
-|  SINGLE CORS MIDDLEWARE (no duplicates)  |
-└──────────────────────────────────────────*/
-app.use(
-  cors({
-    origin: ["https://sci-investments.web.app", "http://localhost:3000"],
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
-    credentials: true,
-    optionsSuccessStatus: 200,
-  })
+
+// Make sure this comes after `app.use(bodyParser.json());`
+// Complete onboarding: save profile + get welcome text from CF
+app.post(
+  "/api/completeOnboarding",
+  authenticate, // ← protect and populate req.user
+  async (req, res) => {
+    try {
+      const userId  = req.user.userId;
+      const answers = req.body;
+
+      // 1) Save all answers into your UserProfile collection
+      await UserProfile.findOneAndUpdate(
+        { userId },
+        { userId, ...answers },
+        { upsert: true, new: true }
+      );
+
+      // 2) Build the prompt
+      const systemPrompt = `
+You are a personal AI financial advisor. Below is the user's profile:
+• Experience: ${answers.experience}
+• Risk tolerance: ${answers.riskTolerance}
+• Investment horizon: ${answers.horizon}
+• Portfolio size: ${answers.portfolioSize}
+• Primary goals: ${answers.goals}
+• Annual income: ${answers.incomeRange}
+• Percent of income to invest: ${answers.investPct}
+• Current age: ${answers.currentAge}
+• Desired retirement age: ${answers.retireAge}
+• Desired retirement income: ${answers.retireIncome}
+• Sector interests: ${answers.sectors?.join(", ") || "none"}
+• Notes: ${answers.notes || "none"}
+
+Please generate a friendly, concise welcome message (under 100 words) that:
+1) Acknowledges their profile  
+2) Explains how the AI can help  
+3) Invites them to start chatting.
+      `.trim();
+
+      // 3) Call your CF
+      const cfUrl =
+        process.env.NODE_ENV === "production"
+          ? "https://us-central1-sci-investments.cloudfunctions.net/onboardAI"
+          : "http://127.0.0.1:5001/sci-investments/us-central1/onboardAI";
+
+      const cfResp = await axios.post(cfUrl, {
+        symbol: "N/A",
+        prompt: systemPrompt,
+      });
+
+      // 4) Send back welcome text
+      return res.json({ welcomeText: cfResp.data.text });
+    } catch (err) {
+      console.error("completeOnboarding error:", err);
+      const status = err.response?.status || 500;
+      return res.status(status).json({ error: err.message });
+    }
+  }
 );
-app.options("*", cors());
-app.use(bodyParser.json());
+
 
 /*──────────────────────────────────────────
 |  TIME‑SERIES CONFIG                      |
@@ -141,7 +238,6 @@ mongoose.connect(process.env.MONGODB_URI||"mongodb://127.0.0.1:27017/sci_investm
 }).then(()=>console.log("✅ Connected to MongoDB"))
   .catch(e=>console.error("❌ MongoDB:",e.message));
 mongoose.set("debug",true);
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
 
 /*──────────────────────────────────────────
 |  Forecast model load (unchanged)         |
@@ -305,6 +401,17 @@ app.use("/finder/api/find-stocks", findStockLimiter); // correct path
 |  ===  REST ENDPOINTS (all original)  === |
 └──────────────────────────────────────────*/
 app.use('/api', analyzeRouter);
+
+// debug only on the profile‑save endpoint
+app.use('/api/user-profile', (req, res, next) => {
+  console.log('🔥 [user-profile] Authorization header:', req.headers.authorization);
+  next();
+});
+
+// re‑mount the profile router so that POST /api/user-profile actually works
+app.use('/api', userProfileRoutes);
+
+app.use('/api', advisorRoutes);
 /*──────────────────────────────────────────
 |  11) Auth Endpoints                      |
 └──────────────────────────────────────────*/
@@ -1027,6 +1134,7 @@ setInterval(() => {
 
 
 const cron = require('node-cron');
+const { auth } = require('firebase-admin');
 cron.schedule('0 2 * * 1-5', () => {
   console.log('⏰ Running daily pullCompanyFundamentals…');
   watchlist.forEach(sym => pullCompanyFundamentals(sym));

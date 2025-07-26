@@ -3,3 +3,4 @@ node_modules/
 # Phase‑3 models (very large, plus Windows‑reserved names)
 model/forecast_model_phase3/
 data/historicalData_enriched_full.csv
+/serviceAccountKey.json
