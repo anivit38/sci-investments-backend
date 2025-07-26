@@ -7,5 +7,6 @@ data/historicalData_enriched_full.csv
 
 
 # ignore GCP service‑account key
-versatile.json.json
 serviceAccountKey.json.json
+versatile.json.json
+
