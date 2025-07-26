@@ -1,7 +1,11 @@
 // backend/routes/analyze.js
 const express = require('express');
+const path = require('path');
 const router = express.Router();
 const FundamentalsService = require('../services/FundamentalsService');
+
+// ─── Load industryMetrics.json from the project root ────────────────────────
+const industryMetrics = require(path.join(__dirname, '..', 'industryMetrics.json'));
 
 /**
  * POST /api/analyze-stock
@@ -14,10 +18,13 @@ router.post('/analyze-stock', async (req, res) => {
       return res.status(400).json({ message: 'symbol & type required' });
     }
 
-    let result = { symbol };
+    const result = { symbol };
 
     if (type === 'fundamental') {
       result.fundamentals = await FundamentalsService.getFundamentals(symbol);
+
+      // (Optionally) include your static industry metrics here:
+      // e.g. result.industryBenchmarks = industryMetrics[symbol] || null;
     } else {
       // TODO: call TechnicalsService when ready
       result.technicals = null;
