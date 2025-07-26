@@ -18,6 +18,7 @@ const yahoo      = require('yahoo-finance2').default;
 const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
+const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 
 const analyzeRouter      = require('./routes/analyze');
 const userProfileRoutes  = require('./routes/userProfileRoutes');
@@ -26,11 +27,8 @@ const UserProfile        = require('./models/UserProfile');
 
 // — Initialize Firebase Admin with your service account key path from .env —
 admin.initializeApp({
-  credential: admin.credential.cert(
-    require(process.env.FIREBASE_SERVICE_ACCOUNT)
-  )
+  credential: admin.credential.cert(serviceAccount)
 });
-
 const app = express();
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
