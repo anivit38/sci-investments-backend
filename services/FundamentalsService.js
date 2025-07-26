@@ -2,9 +2,9 @@
 
 require("dotenv").config();
 const axios               = require("axios");
-const industryMetrics     = require("../../backend/industryMetrics.json");
+const industryMetrics     = require("./backend/industryMetrics.json");
 const { fetchWithFallback } = require("./fundamentalsProvider");
-const { loadFmpAll }      = require("../../backend/services/fmpRawService");
+const { loadFmpAll }      = require("./backend/services/fmpRawService");
 
 const FMP_API_KEY = process.env.FMP_API_KEY;
 if (!FMP_API_KEY) {
