@@ -22,7 +22,7 @@ const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 
 const analyzeRouter      = require('./routes/analyze');
 const userProfileRoutes  = require('./routes/userProfileRoutes');
-const advisorRoutes      = require('./routes/advisorRoutes');
+const { router: advisorRouter } = require('./routes/advisorRoutes');
 const UserProfile        = require('./models/UserProfile');
 
 // — Initialize Firebase Admin with your service account key path from .env —
@@ -68,7 +68,7 @@ async function authenticate(req, res, next) {
 // ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
 app.use('/api', analyzeRouter);
 app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
-app.use('/api', advisorRoutes);
+app.use('/api', advisorRouter);
 
 
 
@@ -398,18 +398,7 @@ app.use("/finder/api/find-stocks", findStockLimiter); // correct path
 /*──────────────────────────────────────────
 |  ===  REST ENDPOINTS (all original)  === |
 └──────────────────────────────────────────*/
-app.use('/api', analyzeRouter);
 
-// debug only on the profile‑save endpoint
-app.use('/api/user-profile', (req, res, next) => {
-  console.log('🔥 [user-profile] Authorization header:', req.headers.authorization);
-  next();
-});
-
-// re‑mount the profile router so that POST /api/user-profile actually works
-app.use('/api', userProfileRoutes);
-
-app.use('/api', advisorRoutes);
 /*──────────────────────────────────────────
 |  11) Auth Endpoints                      |
 └──────────────────────────────────────────*/
