@@ -22,7 +22,7 @@ const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 
 const analyzeRouter      = require('./routes/analyze');
 const userProfileRoutes  = require('./routes/userProfileRoutes');
-const { router: advisorRouter } = require('./routes/advisorRoutes');
+const advisorRouter = require('./routes/advisorRoutes');
 const UserProfile        = require('./models/UserProfile');
 
 // — Initialize Firebase Admin with your service account key path from .env —
