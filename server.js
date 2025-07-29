@@ -99,6 +99,7 @@ app.post(
   "/api/completeOnboarding",
   authenticate, // ← protect and populate req.user
   async (req, res) => {
+    console.log("🔥 COMPLETE ONBOARDING ROUTE HIT for user:", req.user?.userId);
     try {
       const userId  = req.user.userId;
       const answers = req.body;
