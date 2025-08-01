@@ -97,6 +97,7 @@ const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 // Complete onboarding: save profile + get welcome text from CF
 app.post(
   "/api/completeOnboarding",
+  cors(corsOptions),
   authenticate, // ← protect and populate req.user
   async (req, res) => {
     console.log("🔥 COMPLETE ONBOARDING ROUTE HIT for user:", req.user?.userId);
