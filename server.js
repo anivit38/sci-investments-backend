@@ -32,16 +32,15 @@ admin.initializeApp({
 const app = express();
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
-app.use(
-  cors({
-    origin: ['https://sci-investments.web.app','http://localhost:3000'],
-    methods: ['GET','POST','OPTIONS'],
-    allowedHeaders: ['Content-Type','Authorization','Accept'],
-    credentials: true,
-    optionsSuccessStatus: 200,
-  })
-);
-app.options('*', cors());
+const corsOptions = {
+  origin: ['https://sci-investments.web.app','http://localhost:3000'],
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept'],
+  credentials: true,
+  optionsSuccessStatus: 200,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // ─── BODY PARSER ───────────────────────────────────────────────────────────────
 app.use(bodyParser.json());
