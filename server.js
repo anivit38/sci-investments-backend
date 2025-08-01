@@ -94,7 +94,7 @@ const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 
 // Make sure this comes after `app.use(bodyParser.json());`
 // Complete onboarding: save profile + get welcome text from CF
-app.post(
+app.options(
   "/api/completeOnboarding",
   cors(corsOptions),
   authenticate, // ← protect and populate req.user
