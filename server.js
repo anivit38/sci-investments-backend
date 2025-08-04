@@ -68,22 +68,6 @@ async function authenticate(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
-// ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
-app.use('/api', analyzeRouter);
-app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
-app.use('/api', advisorRouter);
-
-
-
-
-
-/* extras */
-const crypto      = require("crypto");
-const RSSParser   = require("rss-parser");
-const Sentiment   = require("sentiment");
-const fetchNative = require("node-fetch");
-const cheerio     = require("cheerio");
-
 
 /*──────────────────────────────────────────
 |  GLOBAL DATA                             |
@@ -157,6 +141,19 @@ Please generate a friendly, concise welcome message (under 100 words) that:
     }
   }
 );
+
+// ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
+app.use('/api', analyzeRouter);
+app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
+app.use('/api', advisorRouter);
+
+
+/* extras */
+const crypto      = require("crypto");
+const RSSParser   = require("rss-parser");
+const Sentiment   = require("sentiment");
+const fetchNative = require("node-fetch");
+const cheerio     = require("cheerio");
 
 
 /*──────────────────────────────────────────
