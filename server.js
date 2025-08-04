@@ -31,7 +31,8 @@ admin.initializeApp({
 });
 const app = express();
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
+// ─── CORS ────────────────────────────────────────────────────────────────────
+
 const corsOptions = {
   origin: ['https://sci-investments.web.app','http://localhost:3000'],
   methods: ['GET','POST','OPTIONS'],
@@ -39,11 +40,15 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 200,
 };
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+app.options('/api/completeOnboarding', cors(corsOptions));
 
 // ─── BODY PARSER ───────────────────────────────────────────────────────────────
+
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
 // ─── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
 async function authenticate(req, res, next) {
@@ -57,13 +62,12 @@ async function authenticate(req, res, next) {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     req.user = { userId: decoded.uid, email: decoded.email };
-    next();
+    return next();
   } catch (err) {
     console.error('Firebase Auth verify failed:', err);
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
-
 // ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
 app.use('/api', analyzeRouter);
 app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
@@ -94,7 +98,7 @@ const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 
 // Make sure this comes after `app.use(bodyParser.json());`
 // Complete onboarding: save profile + get welcome text from CF
-app.options(
+app.post(
   "/api/completeOnboarding",
   cors(corsOptions),
   authenticate, // ← protect and populate req.user
