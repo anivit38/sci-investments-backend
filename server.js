@@ -24,6 +24,9 @@ const analyzeRouter      = require('./routes/analyze');
 const userProfileRoutes  = require('./routes/userProfileRoutes');
 const advisorRouter = require('./routes/advisorRoutes');
 const UserProfile        = require('./models/UserProfile');
+const RSSParser = require('rss-parser');
+const Sentiment = require('sentiment');
+
 
 // — Initialize Firebase Admin with your service account key path from .env —
 admin.initializeApp({
@@ -75,8 +78,7 @@ async function authenticate(req, res, next) {
 const symbolsList = JSON.parse(
   fs.readFileSync(path.join(__dirname, "symbols.json"), "utf8")
 );
-const rssParser  = new RSSParser();
-const sentiment  = new Sentiment();
+
 const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 
 
@@ -150,8 +152,6 @@ app.use('/api', advisorRouter);
 
 /* extras */
 const crypto      = require("crypto");
-const RSSParser   = require("rss-parser");
-const Sentiment   = require("sentiment");
 const fetchNative = require("node-fetch");
 const cheerio     = require("cheerio");
 
