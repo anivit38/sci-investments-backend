@@ -1,0 +1,26 @@
+{
+    "Technology": {
+        "peRatio": 37.83,
+        "revenueGrowth": 15.0,
+        "dividendYield": 0.43,
+        "debtToEquity": 2.09
+    },
+    "Consumer Discretionary": {
+        "peRatio": 40.25,
+        "revenueGrowth": 10.0,
+        "dividendYield": 0.5,
+        "debtToEquity": 2.43
+    },
+    "Healthcare": {
+        "peRatio": 18.0,
+        "revenueGrowth": 8.0,
+        "dividendYield": 2.0,
+        "debtToEquity": 1.0
+    },
+    "Utilities": {
+        "peRatio": 15.0,
+        "revenueGrowth": 3.0,
+        "dividendYield": 4.0,
+        "debtToEquity": 3.0
+    }
+}
