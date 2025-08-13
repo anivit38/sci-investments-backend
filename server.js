@@ -53,6 +53,11 @@ if (!admin.apps.length) {
   });
 }
 
+// ---- Express app ----
+const app = express();
+app.use(express.json());
+
+
 
 // ─── CORS ────────────────────────────────────────────────────────────────────
 
