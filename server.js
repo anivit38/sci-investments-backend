@@ -3,7 +3,8 @@
  * FINDER, DASHBOARD, FORECASTING, COMMUNITY
  *******************************************/
 
-require('dotenv').config();
+const path       = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express    = require('express');
 const cors       = require('cors');
@@ -11,7 +12,6 @@ const bodyParser = require('body-parser');
 const bcrypt     = require('bcryptjs');
 const admin      = require('firebase-admin');
 const mongoose   = require('mongoose');
-const path       = require('path');
 const fs         = require('fs');
 const tf         = require('@tensorflow/tfjs-node');
 const yahooFinance = require('yahoo-finance2').default;
@@ -31,7 +31,9 @@ const rssParser = new RSSParser();
 const sentiment = new Sentiment();
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
-
+const pdfParse  = require('pdf-parse');
+const chokidar  = require('chokidar');
+const RESEARCH_DIR = path.join(__dirname, '..', 'research'); // your folder outside backend
 
 // ---- Firebase Admin init (uses GOOGLE_SERVICE_ACCOUNT_KEY from env) ----
 const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -62,24 +64,156 @@ app.use(express.json());
 // ─── CORS ────────────────────────────────────────────────────────────────────
 
 const corsOptions = {
-  origin: ['https://sci-investments.web.app','http://localhost:3000'],
+  origin: [
+    'https://sci-investments.web.app',
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500'
+  ],
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Accept','x-user-id'],
   credentials: true,
   optionsSuccessStatus: 200,
 };
-
-
-
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.options('/api/completeOnboarding', cors(corsOptions));
 app.use(express.static(path.join(__dirname, "../public")));
 
-// ─── BODY PARSER ───────────────────────────────────────────────────────────────
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+
+const newsletterRouter = require('./routes/newsletter');
+app.use('/api/newsletter', newsletterRouter);
+
+
+
+// ─── INDEXER ─────────────────────────────────────────────────────────────
+const researchIndex = new Map(); // key: SYMBOL -> { docs:[{title, date, text, path}], mergedText }
+function guessSymbolFromFilename(file) {
+  const base = path.basename(file).replace(/\.[Pp][Dd][Ff]$/, '');
+  // Accept patterns like "TSLA - Q2 Review.pdf", "Research_TSLA_2024.pdf", etc.
+  const hit = base.toUpperCase().match(/\b[A-Z]{1,5}\b/);
+  return hit ? hit[0] : null;
+}
+
+async function loadResearchFolder() {
+  if (!fs.existsSync(RESEARCH_DIR)) return;
+  const files = fs.readdirSync(RESEARCH_DIR).filter(f => /\.pdf$/i.test(f));
+  for (const f of files) {
+    const full = path.join(RESEARCH_DIR, f);
+    const data = await pdfParse(fs.readFileSync(full)).catch(() => null);
+    if (!data || !data.text) continue;
+    const sym = guessSymbolFromFilename(f);
+    if (!sym) continue;
+    const entry = researchIndex.get(sym) || { docs: [], mergedText: '' };
+    entry.docs.push({
+      title: f.replace(/\.pdf$/i, ''),
+      date: fs.statSync(full).mtime.toISOString().slice(0,10),
+      text: data.text.slice(0, 200000), // cap to keep prompt sane
+      path: full
+    });
+    entry.mergedText = (entry.mergedText + '\n\n' + data.text).slice(-500000); // keep last 500k chars
+    researchIndex.set(sym, entry);
+  }
+  console.log(`📚 Research loaded for: ${Array.from(researchIndex.keys()).join(', ') || '(none)'}`);
+}
+
+// initial load + watch for changes
+loadResearchFolder().catch(e => console.warn('research load:', e.message));
+if (fs.existsSync(RESEARCH_DIR)) {
+  chokidar.watch(RESEARCH_DIR, { ignoreInitial: true })
+    .on('add', () => loadResearchFolder())
+    .on('change', () => loadResearchFolder())
+    .on('unlink', () => loadResearchFolder());
+}
+
+// ────── ACCESSOR ─────────────────────────────────────────────────────────────────────
+
+function getResearchForSymbol(symbol) {
+  const e = researchIndex.get(String(symbol || '').toUpperCase());
+  if (!e) return null;
+  // keep a short “context pack” for the LLM
+  const docs = e.docs.slice(-3); // most recent 3
+  const joined = docs.map(d => `■ ${d.title} (${d.date})\n${d.text}`).join('\n\n---\n\n');
+  // trim again (LLM safety)
+  return joined.slice(0, 120000); // ~120k chars max (you can lower)
+}
+
+
+// ─── CHAT ─────────────────────────────────────────────────────────────
+
+// ==== CHAT SERVICE ADAPTER ====
+const CHAT_SERVICE_URL = process.env.CHAT_SERVICE_URL || 'https://chatai-yfo4ujklgq-uc.a.run.app';
+
+function renderPromptFromMessages(system, messages) {
+  const turns = (messages || [])
+    .map(m => `${(m.role || 'user').toUpperCase()}: ${m.content || ''}`)
+    .join('\n');
+  return `${system}\n\n--- DIALOGUE ---\n${turns}`.trim();
+}
+
+function normalizeChatResponse(data) {
+  const text =
+    data?.text ??
+    data?.output ??
+    data?.reply ??
+    data?.choices?.[0]?.message?.content ??
+    (typeof data === 'string' ? data : '');
+  return String(text || '').trim();
+}
+
+// ==== CHAT SERVICE ADAPTER (hardened) ====
+function trimMessages(messages = [], maxTurns = 12, maxCharsPerMsg = 1500) {
+  const out = [];
+  for (const m of [...messages].reverse()) {
+    out.unshift({
+      role: m.role || 'user',
+      content: String(m.content || '').slice(-maxCharsPerMsg)
+    });
+    if (out.length >= maxTurns) break;
+  }
+  return out;
+}
+
+async function callChatServiceAdaptive({ system, messages }) {
+  if (!CHAT_SERVICE_URL) return ''; // let caller fall back
+
+  const safeMsgs = trimMessages(messages || [], 12, 1500);
+  const safeSystem = String(system || '').slice(0, 8000); // protect token budget
+  const packed = [{ role: 'system', content: safeSystem }, ...safeMsgs];
+
+  const opts = { timeout: 20000 }; // 20s hard cap
+
+  // A) messages-based call
+  try {
+    const rA = await axios.post(CHAT_SERVICE_URL, { messages: packed }, opts);
+    const tA = normalizeChatResponse(rA.data);
+    if (tA) return tA;
+    console.warn('Chat A empty. keys=', Object.keys(rA.data || {}));
+  } catch (e) {
+    console.warn('Chat A error:', e.message);
+  }
+
+  // B) single-prompt fallback
+  try {
+    const prompt = renderPromptFromMessages(safeSystem, safeMsgs);
+    const rB = await axios.post(CHAT_SERVICE_URL, { prompt }, opts);
+    const tB = normalizeChatResponse(rB.data);
+    if (tB) return tB;
+    console.warn('Chat B empty. keys=', Object.keys(rB.data || {}));
+  } catch (e) {
+    console.warn('Chat B error:', e.message);
+  }
+
+  return ''; // important: don't throw → caller can build an offline reply
+}
+
+
+
+// ─── BODY PARSER ───────────────────────────────────────────────────────────────
+app.use(bodyParser.json({ limit: '1mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
+
 
 // ─── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
 async function authenticate(req, res, next) {
@@ -99,6 +233,393 @@ async function authenticate(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+
+
+// ─── BIG BRAIN ────────────────────────────────────────────────────────
+
+// server.js (add near other helpers)
+async function buildResearchPack(symbol) {
+  const y = await fetchStockData(symbol);
+
+  // --- reuse Stock-Checker / Finder metrics ---
+  const priceData = y?.price || {};
+  const summary   = y?.summaryDetail || {};
+  const finData   = y?.financialData || {};
+  const researchText = getResearchForSymbol(symbol);
+
+
+  const checkerMetrics = {
+    volume:           priceData.regularMarketVolume ?? null,
+    currentPrice:     priceData.regularMarketPrice  ?? null,
+    peRatio:          summary.trailingPE            ?? null,
+    pbRatio:          summary.priceToBook           ?? null,
+    dividendYield:    summary.dividendYield         ?? null,
+    earningsGrowth:   finData.earningsGrowth        ?? null,
+    debtRatio:        finData.debtToEquity          ?? null,
+    dayHigh:          priceData.regularMarketDayHigh?? null,
+    dayLow:           priceData.regularMarketDayLow ?? null,
+    fiftyTwoWeekHigh: summary.fiftyTwoWeekHigh      ?? null,
+    fiftyTwoWeekLow:  summary.fiftyTwoWeekLow       ?? null,
+    avgVol:           summary.averageDailyVolume3Month ?? priceData.regularMarketVolume ?? 0,
+  };
+
+  // quickRating (same rules as /api/check-stock)
+  let quickRating = 0;
+  if (checkerMetrics.volume > checkerMetrics.avgVol * 1.2) quickRating += 3;
+  else if (checkerMetrics.volume < checkerMetrics.avgVol * 0.8) quickRating -= 2;
+
+  if (checkerMetrics.peRatio != null) {
+    if (checkerMetrics.peRatio >= 5 && checkerMetrics.peRatio <= 25) quickRating += 2;
+    else if (checkerMetrics.peRatio > 30) quickRating -= 1;
+  }
+  if (checkerMetrics.earningsGrowth != null) {
+    if (checkerMetrics.earningsGrowth > 0.15) quickRating += 4;
+    else if (checkerMetrics.earningsGrowth > 0.03) quickRating += 2;
+    else if (checkerMetrics.earningsGrowth < 0) quickRating -= 2;
+  }
+  if (checkerMetrics.debtRatio != null) {
+    if (checkerMetrics.debtRatio < 0.3) quickRating += 3;
+    else if (checkerMetrics.debtRatio > 1) quickRating -= 1;
+  }
+
+  // Finder-style quality score (compact)
+  function computeFinderScore(f) {
+    let score = 0; const reasons = [];
+    if (f.avgVol >= 1_000_000) { score += 4; reasons.push("Good liquidity"); }
+    else if (f.avgVol >= 250_000) { score += 2; reasons.push("OK liquidity"); }
+    else reasons.push("Thinly traded");
+
+    if (f.pe && f.pe > 4 && f.pe < 30) { score += 3; reasons.push("Reasonable PE"); }
+    else if (f.ps && f.ps < 8) { score += 1; reasons.push("P/S acceptable"); }
+    else { score -= 1; reasons.push("Valuation rich/unknown"); }
+
+    if (typeof f.growth === "number") {
+      if (f.growth > 0.15) { score += 4; reasons.push("Strong earnings growth"); }
+      else if (f.growth > 0.03) { score += 2; reasons.push("Modest earnings growth"); }
+      else if (f.growth < 0) { score -= 2; reasons.push("Negative earnings growth"); }
+    }
+    if (typeof f.debtToEq === "number") {
+      if (f.debtToEq < 0.6) { score += 3; reasons.push("Low leverage"); }
+      else if (f.debtToEq > 1.5) { score -= 2; reasons.push("High leverage"); }
+    }
+
+    if (f.wkHi && f.wkLo && f.price && f.wkHi > f.wkLo) {
+      const pos = (f.price - f.wkLo) / (f.wkHi - f.wkLo);
+      if (pos < 0.3) { score += 2; reasons.push("Near 52w lows"); }
+      else if (pos > 0.9) { score -= 1; reasons.push("Near 52w highs"); }
+    }
+    return { score, reasons };
+  }
+
+  const finderFeatures = {
+    price: checkerMetrics.currentPrice,
+    avgVol: checkerMetrics.avgVol,
+    pe: summary.trailingPE ?? null,
+    ps: summary.priceToSalesTrailing12Months ?? null,
+    pb: summary.priceToBook ?? null,
+    div: summary.dividendYield ?? null,
+    wkHi: checkerMetrics.fiftyTwoWeekHigh,
+    wkLo: checkerMetrics.fiftyTwoWeekLow,
+    dayHi: checkerMetrics.dayHigh,
+    dayLo: checkerMetrics.dayLow,
+    growth: checkerMetrics.earningsGrowth,
+    debtToEq: checkerMetrics.debtRatio,
+    grossMargin: finData.grossMargins ?? null,
+    opMargin: finData.operatingMargins ?? null,
+  };
+  const { score: finderScore, reasons: finderReasons } = computeFinderScore(finderFeatures);
+
+  // Fundamentals / technical / short term
+  const fundamentals = await getFundamentals(symbol).catch(() => null);
+  const technical    = await getTechnicalForUser(symbol, null).catch(() => null);
+  const st           = await computeShortTermExpectedMove(symbol).catch(() => null);
+
+  // live snapshot
+  const live = {
+    name: y?.price?.longName || symbol,
+    price: checkerMetrics.currentPrice ?? null,
+    dayHigh: checkerMetrics.dayHigh ?? null,
+    dayLow:  checkerMetrics.dayLow  ?? null,
+    wkHigh:  checkerMetrics.fiftyTwoWeekHigh ?? null,
+    wkLow:   checkerMetrics.fiftyTwoWeekLow  ?? null
+  };
+
+  const pos52w = (live.price!=null && live.wkHigh && live.wkLow && live.wkHigh>live.wkLow)
+    ? ((live.price - live.wkLow)/(live.wkHigh - live.wkLow))
+    : null;
+
+  const ratios = fundamentals?.ratios || {};
+  const bench  = fundamentals?.benchmarks || {};
+  const fair   = fundamentals?.valuation || null;
+
+  const tech = technical ? {
+    trend: technical.trend ?? null,
+    levels: technical.levels ?? null,
+    indicators: {
+      RSI14:  technical?.indicators?.RSI14 ?? null,
+      MACD:   technical?.indicators?.MACD ?? null,
+      SMA50:  technical?.indicators?.SMA50 ?? null,
+      SMA200: technical?.indicators?.SMA200 ?? null,
+      ATR14:  technical?.indicators?.ATR14 ?? null,
+    },
+    suggestion: technical.suggestion ?? null,
+    instructions: technical.instructions ?? null
+  } : null;
+
+  const stCompact = st ? {
+    pUpPct: +(st.pUp * 100).toFixed(1),
+    magnitudePct: +(st.magnitude * 100).toFixed(2),
+    expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
+  } : null;
+
+  // light news
+  let news = [];
+  try {
+    const feed = await rssParser.parseURL(`https://news.google.com/rss/search?q=${symbol}`);
+    news = (feed.items || []).slice(0, 5).map(i => ({ title: i.title, url: i.link }));
+  } catch {}
+
+  // ---------- FINAL RETURN ----------
+  return {
+    symbol,
+    live,
+    pos52w,
+    metrics: { ...checkerMetrics, quickRating },
+    finder: { score: finderScore, reasons: finderReasons },
+
+    fundamentals: {
+      rating: fundamentals?.rating ?? null,
+      weaknesses: fundamentals?.weaknesses ?? [],
+      ratios: {
+        pe: ratios.peRatio ?? null,
+        ps: ratios.priceToSales ?? null,
+        pb: ratios.priceToBook ?? null,
+        debtToEq: ratios.debtToEquity ?? null,
+        earningsGrowth: ratios.earningsGrowth ?? null,
+      },
+      benchmarks: {
+        pe: bench.peRatio ?? null,
+        ps: bench.priceToSales ?? null,
+      },
+      fair, // { fairPrice, status }
+    },
+
+    technical: tech,
+    shortTerm: stCompact,
+    news,
+    research: researchText ? { note: "From local research PDFs", text: researchText } : null
+  };
+}
+
+
+const ChatMemory = require('./models/ChatMemory');
+
+// --- Helper: get user profile from auth header or x-user-id ---
+async function getUserProfile(req) {
+  try {
+    let userId = null;
+    const header = req.headers.authorization || '';
+    if (header.startsWith('Bearer ')) {
+      const idToken = header.split(' ')[1];
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      userId = decoded.uid;
+    } else if (req.headers['x-user-id']) {
+      userId = req.headers['x-user-id'];
+    }
+    if (!userId) return null;
+    return await UserProfile.findOne({ userId }).lean();
+  } catch (e) {
+    console.warn('getUserProfile:', e.message);
+    return null;
+  }
+}
+
+// --- Helper: call your CF to personalize the advice ---
+async function buildAdvisorSuggestion({ symbol, profile, baseAdvice, fundamentals, technical, metrics }) {
+  try {
+    const cfUrl =
+      process.env.NODE_ENV === "production"
+        ? "https://us-central1-sci-investments.cloudfunctions.net/onboardAI"
+        : "http://127.0.0.1:5001/sci-investments/us-central1/onboardAI";
+
+    const techNorm = technical ? {
+      trend:  technical.trend ?? null,
+      levels: technical.levels ?? null,
+      rsi14:  technical.indicators?.RSI14 ?? technical.rsi14 ?? null,
+      macd:   technical.indicators?.MACD  ?? technical.macd  ?? null,
+    } : null;
+    
+    const prompt = `
+You are an AI financial advisor. Personalize the recommendation for the user below.
+Return a concise paragraph (<=120 words) that starts with "Advisor Suggestion:".
+
+User profile (JSON): ${JSON.stringify(profile || {}, null, 2)}
+Symbol: ${symbol}
+Metrics: ${JSON.stringify(metrics || {})}
+Fundamentals: ${JSON.stringify(fundamentals ? {
+  valuation: fundamentals.valuation, rating: fundamentals.rating, weaknesses: fundamentals.weaknesses
+} : {})}
+Technical: ${JSON.stringify(techNorm || {})}
+Raw system advice: ${baseAdvice || "N/A"}
+
+If the raw advice conflicts with the user's risk tolerance, horizon, diversification, or sector preferences, say so and adjust the action (e.g., smaller position, hold, avoid) with 1–2 concrete reasons tied to the profile.
+    `.trim();
+
+    const resp = await axios.post(cfUrl, { symbol, prompt });
+    const text = (resp.data && (resp.data.text || resp.data)) || "";
+    return String(text).trim();
+  } catch (e) {
+    console.warn("Advisor CF error:", e.message);
+    return null;
+  }
+}
+
+
+
+// ─── AI Advisor Picks (personalized from chat memory) ─────────────────────────
+// ─── AI Advisor Picks (from chats + for-you discovery) ───────────────────────
+app.get('/api/ai-picks', authenticate, async (req, res) => {
+  try {
+    const userId  = req.user.userId;
+    const profile = await getUserProfile(req).catch(() => null);
+    const mem     = await ChatMemory.findOne({ userId }).lean().catch(() => null);
+
+    /* ---------- A) From your chats (watchlist) ---------- */
+    const watch = Array.from(
+      new Set((mem?.facts?.watchlist || []).map(s => String(s).toUpperCase()))
+    ).slice(0, 12); // small cap for work
+
+    const fromChats = [];
+    for (const sym of watch) {
+      try {
+        const q     = await fetchStockData(sym).catch(() => null);
+        const price = q?.price?.regularMarketPrice;
+        if (!price) continue;
+
+        const st = await computeShortTermExpectedMove(sym).catch(() => null);
+        if (!st) continue;
+
+        const row = {
+          symbol: sym,
+          price,
+          pUp: +(st.pUp * 100).toFixed(1),
+          magnitudePct: +(st.magnitude * 100).toFixed(2),
+          expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
+        };
+
+        const baseAdvice =
+          row.expectedReturnPct >= 0
+            ? `Projected next-day return ~${row.expectedReturnPct}%.`
+            : `Risk of decline ~${Math.abs(row.expectedReturnPct)}%.`;
+
+        try {
+          const suggestion = await buildAdvisorSuggestion({
+            symbol: sym,
+            profile,
+            baseAdvice,
+            fundamentals: null,
+            technical: null,
+            metrics: {
+              currentPrice: price,
+              pUp: row.pUp,
+              expectedReturnPct: row.expectedReturnPct
+            }
+          });
+          if (suggestion) row.advisorSuggestion = String(suggestion).trim();
+        } catch {}
+
+        fromChats.push(row);
+      } catch {}
+    }
+    fromChats.sort((a, b) =>
+      (b.expectedReturnPct - a.expectedReturnPct) || (b.pUp - a.pUp)
+    );
+
+    /* ---------- B) For You (discovery, personalized) ---------- */
+    // preferences
+    const risk     = String(profile?.riskTolerance || 'medium').toLowerCase();
+    const horizon  = String(profile?.horizon || 'short').toLowerCase();
+    const sectors  = Array.isArray(profile?.sectors) ? profile.sectors.map(String) : [];
+
+    const minPrice = risk === 'low' ? 10 : risk === 'medium' ? 5 : 2;
+    const maxPrice = risk === 'low' ? 300 : risk === 'medium' ? 250 : 400;
+
+    // small universe to keep it snappy (raise later if you like)
+    const UNIVERSE = 220;
+    const universe = symbolsList
+      .slice(0, UNIVERSE)
+      .map(s => (typeof s === 'string' ? s : s.symbol));
+
+    const forYou = [];
+    for (const sym of universe) {
+      try {
+        const yq = await fetchStockData(sym).catch(() => null);
+        const p  = yq?.price?.regularMarketPrice;
+        if (!p || p < minPrice || p > maxPrice) continue;
+
+        // optional sector bias bonus
+        const sec = yq?.assetProfile?.sector || '';
+        const sectorBonus = sectors.length
+          ? (sectors.some(s => (sec || '').toLowerCase().includes(String(s).toLowerCase())) ? 1 : 0)
+          : 0;
+
+        // short-term model (T+1). If you prefer long-term, swap in buildForecastPrice()
+        const st = await computeShortTermExpectedMove(sym).catch(() => null);
+        if (!st) continue;
+
+        const row = {
+          symbol: sym,
+          price: p,
+          pUp: +(st.pUp * 100).toFixed(1),
+          magnitudePct: +(st.magnitude * 100).toFixed(2),
+          expectedReturnPct: +(st.expectedReturn * 100).toFixed(2),
+          _rank: st.expectedReturn + 0.002 * sectorBonus // small nudge for sector prefs
+        };
+
+        // quick, lightweight personalization snippet
+        const baseAdvice =
+          row.expectedReturnPct >= 0
+            ? `Projected next-day return ~${row.expectedReturnPct}% (p_up ${row.pUp}%).`
+            : `Expected softness (~${Math.abs(row.expectedReturnPct)}%).`;
+
+        try {
+          const suggestion = await buildAdvisorSuggestion({
+            symbol: sym,
+            profile,
+            baseAdvice,
+            fundamentals: null,
+            technical: null,
+            metrics: {
+              currentPrice: p,
+              pUp: row.pUp,
+              expectedReturnPct: row.expectedReturnPct,
+              horizon
+            }
+          });
+          if (suggestion) row.advisorSuggestion = String(suggestion).trim();
+        } catch {}
+
+        forYou.push(row);
+      } catch {}
+    }
+
+    forYou.sort((a, b) =>
+      (b._rank - a._rank) || (b.expectedReturnPct - a.expectedReturnPct) || (b.pUp - a.pUp)
+    );
+
+    return res.json({
+      picksFromChats: fromChats.slice(0, 5),
+      picksForYou: forYou.slice(0, 5),
+      meta: { horizon, risk, sectors, minPrice, maxPrice }
+    });
+  } catch (e) {
+    console.error('ai-picks:', e.message);
+    res.status(500).json({ picksFromChats: [], picksForYou: [] });
+  }
+});
+
+
+
 
 /*──────────────────────────────────────────
 |  GLOBAL DATA                             |
@@ -416,6 +937,23 @@ async function buildForecastPrice(symbol, price){
   return final;
 }
 
+
+
+/*──────────────────────────────────────────
+|  Symbol validator (used by multiple routes)
+└──────────────────────────────────────────*/
+function isValidSymbol(s) {
+  if (!s) return false;
+  const sym = String(s).trim().toUpperCase();
+
+  // Keep the pattern conservative; expand if you store dots/hyphens in symbols.json
+  if (!/^[A-Z]{1,5}$/.test(sym)) return false;
+
+  // Check against your symbols.json
+  return symbolsList.some(x => (typeof x === 'string' ? x : x.symbol) === sym);
+}
+
+
 /*──────────────────────────────────────────
 |  Rate‑limits                             |
 └──────────────────────────────────────────*/
@@ -630,10 +1168,28 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // 2) Forecast (short horizon)
-    const forecastPrice = await buildForecastPrice(upper, metrics.currentPrice);
-    const growthPct = metrics.currentPrice
-      ? ((forecastPrice - metrics.currentPrice) / metrics.currentPrice) * 100
-      : 0;
+    // 2) Forecast (short horizon — expected move model)
+    let forecastPrice = metrics.currentPrice;
+    let growthPct = 0;
+    try {
+      const st = await computeShortTermExpectedMove(upper);
+      if (st && metrics.currentPrice) {
+        const expR = st.expectedReturn; // signed decimal, T+1
+        forecastPrice = +(metrics.currentPrice * (1 + expR));
+        growthPct = expR * 100;
+      } else if (metrics.currentPrice) {
+        // fallback to legacy GRU/simple
+        const fc = await buildForecastPrice(upper, metrics.currentPrice);
+        forecastPrice = fc;
+        growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+      }
+    } catch {
+      // fallback path
+      const fc = await buildForecastPrice(upper, metrics.currentPrice);
+      forecastPrice = fc;
+      growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+    }
+
     const classification =
       growthPct >= 2  ? "growth" :
       growthPct >= 0  ? "stable" : "unstable";
@@ -774,12 +1330,28 @@ app.post("/api/check-stock", async (req, res) => {
       classification === "stable" ? "Minimal growth expected. Hold or monitor." :
                                     "Projected to decline. Consider selling or avoiding.";
 
+
+                                    // Personalized Advisor Suggestion
+    let advisorSuggestion = null;
+    try {
+      const profile = await getUserProfile(req); // pulls from Firebase token or x-user-id
+      advisorSuggestion = await buildAdvisorSuggestion({
+        symbol: upper,
+        profile,
+        baseAdvice: advice,                 // your existing generic advice string
+        fundamentals: fundamentalDetail,
+        technical: technicalDetail,
+        metrics
+      });
+    } catch (_) { /* swallow */ }
+
     return res.json({
       ...base,
       fundamentalRating: quickRating.toFixed(2),
       combinedScore,
       classification,
       advice,
+      advisorSuggestion,
       forecast: {
         forecastPrice: +forecastPrice.toFixed(2),
         projectedGrowthPercent: `${growthPct.toFixed(2)}%`,
@@ -795,6 +1367,369 @@ app.post("/api/check-stock", async (req, res) => {
     return res.status(500).json({ message: "Server error." });
   }
 });
+
+// POST /api/advisor/chat  (requires Firebase auth)
+function mergeFacts(oldFacts = {}, inc = {}) {
+  const out = { ...oldFacts };
+  for (const [k, v] of Object.entries(inc)) {
+    if (v == null) continue;
+    if (k === 'watchlist' && Array.isArray(v)) {
+      const set = new Set([...(out.watchlist || []), ...v.map(s => String(s).toUpperCase())]);
+      out.watchlist = Array.from(set);
+    } else if (k === 'sectorLimits' && typeof v === 'object') {
+      out.sectorLimits = { ...(out.sectorLimits || {}), ...v };
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+async function extractFactsAdaptive(messages) {
+  const system = `You extract durable investing preferences from a chat.
+Return ONLY compact JSON with optional keys:
+{ "riskTolerance": "low|medium|high",
+  "horizon": "short|medium|long",
+  "maxPositionPct": number,
+  "stopLossPct": number,
+  "watchlist": ["TICK","ER"],
+  "sectorLimits": {"Tech":30,...},
+  "notes": "1 short sentence if useful" }`;
+  try {
+    const text = await callChatServiceAdaptive({
+      system,
+      messages: messages.slice(-4) // last few turns are enough
+    });
+    try { return JSON.parse(text); } catch { return {}; }
+  } catch {
+    return {};
+  }
+}
+
+
+app.get('/api/research-pack/:symbol', authenticate, async (req,res)=>{
+  try{
+    const sym = String(req.params.symbol||'').toUpperCase();
+    if(!isValidSymbol(sym)) return res.status(404).json({message:'unknown symbol'});
+    const pack = await buildResearchPack(sym);
+    res.json(pack);
+  }catch(e){
+    console.error('research-pack', e.message);
+    res.status(500).json({message:'failed'});
+  }
+});
+
+
+
+function detectHorizonFromMessages(messages = []) {
+  const text = [...messages]
+    .reverse()
+    .map(m => (m.role || 'user') === 'user' ? String(m.content || '') : '')
+    .join(' ')
+    .toLowerCase();
+
+  // strong long-term keywords
+  const longHits = /\b(long[-\s]?term|years|multi[-\s]?year|retirement|hold (for )?\d+\s*(years|yrs)|5\+ years|decade|buy and hold)\b/i;
+  // strong short-term keywords
+  const shortHits = /\b(short[-\s]?term|next (day|week)|this (week|month)|swing|day[-\s]?trade|entry|stop[-\s]?loss|target|breakout|scalp|intraday)\b/i;
+
+  if (longHits.test(text)) return 'long';
+  if (shortHits.test(text)) return 'short';
+  return 'auto'; // default → we’ll choose based on user profile or fall back to short for trading phrases
+}
+
+
+
+// POST /api/advisor/chat  (requires Firebase auth)
+app.post('/api/advisor/chat', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { messages = [], context = {} } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ text: 'messages[] is required' });
+    }
+
+    // ── Profile + memory
+    const profile = await getUserProfile(req).catch(() => null);
+    const memDoc  = (await ChatMemory.findOne({ userId })) || new ChatMemory({ userId });
+    const memory  = memDoc.facts || {};
+
+    // ── Intent classification (LLM first, with heuristic fallback)
+    async function classifyIntent(msgs) {
+      const sys = `
+Return STRICT JSON for user's last message with fields:
+{"intent":"greet|ideas|ticker_question|portfolio_sizing|risk_policy|education|macro|watchlist_update|other",
+ "symbols":["TICK","ER"]}
+
+Rules:
+- "ticker_question" if they ask about, compare, buy/hold/sell, or mention a ticker/company.
+- "ideas" for "what should I buy", "picks", "recommendations", "watchlist suggestions".
+- "portfolio_sizing" for "how much", "position size", "allocation", "risk %", "diversify".
+- "education" for definitions/explain ("what is PE", "how does MACD work").
+- "macro" for market/sector/economy outlook.
+- "greet" for small talk.
+Include up to 2 detected symbols. Output JSON only.
+`.trim();
+
+      try {
+        const out = await callChatServiceAdaptive({ system: sys, messages: msgs.slice(-4) });
+        const parsed = JSON.parse(out);
+        if (parsed && parsed.intent) return parsed;
+      } catch {}
+      // heuristic fallback
+      const last = (msgs[msgs.length - 1]?.content || '').toUpperCase();
+      const syms = (last.match(/\b[A-Z]{1,5}\b/g) || []).filter(isValidSymbol).slice(0, 2);
+      if (syms.length) return { intent: 'ticker_question', symbols: syms };
+      if (/\b(PICK|BUY|IDEA|RECOMMEND|WATCHLIST)\b/.test(last)) return { intent: 'ideas', symbols: [] };
+      if (/\b(ALLOCATION|SIZE|SIZING|POSITION|RISK|STOP)\b/.test(last)) return { intent: 'portfolio_sizing', symbols: [] };
+      if (/\bWHAT IS|HOW WORKS|EXPLAIN|MEAN\b/.test(last)) return { intent: 'education', symbols: [] };
+      if (/\bHELLO|HI|HEY\b/.test(last)) return { intent: 'greet', symbols: [] };
+      return { intent: 'other', symbols: [] };
+    }
+
+    const { intent, symbols: classifiedSyms = [] } = await classifyIntent(messages);
+
+    // ── pick a symbol if present in context or classification
+    const ctx = { ...context };
+    if (!ctx.symbol && classifiedSyms.length) ctx.symbol = classifiedSyms[0];
+
+    const horizonIntent = detectHorizonFromMessages(messages); // 'long' | 'short' | 'auto'
+
+    // ── helper: quick picks (2–3 names) using your short-term model
+    async function quickPicksForUser(profile) {
+      const risk = String(profile?.riskTolerance || 'medium').toLowerCase();
+      const minPrice = risk === 'low' ? 10 : risk === 'medium' ? 5 : 2;
+      const maxPrice = risk === 'low' ? 300 : risk === 'medium' ? 250 : 400;
+
+      // sample a light universe for speed
+      const universe = symbolsList.slice(0, 120).map(s => (typeof s === 'string' ? s : s.symbol));
+
+      const rows = await mapLimit(universe, 6, async (sym) => {
+        try {
+          const yq = await fetchStockData(sym).catch(() => null);
+          const price = yq?.price?.regularMarketPrice;
+          if (!price || price < minPrice || price > maxPrice) return null;
+
+          const st = await computeShortTermExpectedMove(sym).catch(() => null);
+          if (!st) return null;
+
+          return {
+            symbol: sym,
+            price,
+            pUp: +(st.pUp * 100).toFixed(1),
+            magnitudePct: +(st.magnitude * 100).toFixed(2),
+            expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
+          };
+        } catch { return null; }
+      });
+
+      const valid = rows.filter(Boolean);
+      valid.sort((a, b) => (b.expectedReturnPct - a.expectedReturnPct) || (b.pUp - a.pUp));
+      return valid.slice(0, 3);
+    }
+
+    // ── assemble context if a symbol is present
+    let llmContext = {
+      symbol: ctx.symbol || null,
+      live: null,
+      checkerMetrics: null,
+      finder: null,
+      fundamentals: null,
+      tech: null,
+      stModel: null,
+      researchText: null,
+      horizonIntent
+    };
+
+    if (ctx.symbol) {
+      const sym  = String(ctx.symbol).toUpperCase();
+      const pack = await buildResearchPack(sym).catch(() => null);
+
+      // short-term model snapshot
+      let stModel = null;
+      if (pack?.shortTerm) {
+        stModel = {
+          pUpPct: pack.shortTerm.pUpPct,
+          magnitudePct: pack.shortTerm.magnitudePct,
+          expectedReturnPct: pack.shortTerm.expectedReturnPct
+        };
+      } else {
+        const st = await computeShortTermExpectedMove(sym).catch(() => null);
+        if (st) {
+          stModel = {
+            pUpPct: +(st.pUp * 100).toFixed(1),
+            magnitudePct: +(st.magnitude * 100).toFixed(2),
+            expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
+          };
+        }
+      }
+
+      const techSlim = pack?.technical ? {
+        trend: pack.technical.trend ?? null,
+        levels: pack.technical.levels ?? null,
+        indicators: pack.technical.indicators ?? null
+      } : null;
+
+      llmContext = {
+        ...llmContext,
+        live: pack?.live || null,
+        checkerMetrics: pack?.metrics || null,
+        finder: pack?.finder || null,
+        fundamentals: pack?.fundamentals ? {
+          rating: pack.fundamentals.rating ?? null,
+          weaknesses: pack.fundamentals.weaknesses ?? [],
+          ratios: pack.fundamentals.ratios ?? {},
+          benchmarks: pack.fundamentals.benchmarks ?? {},
+          fair: pack.fundamentals.valuation ?? null
+        } : null,
+        tech: techSlim,
+        stModel,
+        researchText: (pack?.research?.text || '').slice(0, 1800)
+      };
+    }
+
+    // ── build the system prompt with intent routing
+    let system;
+    if (ctx.symbol || intent === 'ticker_question') {
+      system = `
+You are SCI's AI equity advisor.
+
+Use ONLY the provided Context (live snapshot, fundamentals/benchmarks, Finder score+reasons, short-term model), the user's Profile & Memory, and the researchText.
+Never invent prices. Personalize to risk/horizon.
+
+Format (≤180 words):
+1) Snapshot — name, price, 52w position. Include quick rating and Finder score with one reason.
+2) Core View — short-term if horizonIntent ≠ 'long'; otherwise long-term thesis (bullets) using researchText.
+3) Action — buy/hold/avoid with risk notes (sizing aligned to profile); if short-term, you may suggest entry/stop/target ranges implied by support/resistance/ATR if available; otherwise keep high-level.
+
+Data:
+Intent: ${intent}
+Profile: ${JSON.stringify(profile || {})}
+Memory:  ${JSON.stringify(memory || {})}
+Context: ${JSON.stringify(llmContext || {})}
+`.trim();
+    } else if (intent === 'portfolio_sizing' || intent === 'risk_policy') {
+      system = `
+You are a portfolio coach. The user asked about position sizing/risk.
+Use Profile & Memory (riskTolerance, maxPositionPct, stopLossPct, portfolioSize) if available.
+If numbers are missing, provide a clear framework (e.g., risk 0.5–1.5% of equity per trade; derive share count from stop distance).
+Give an example with round numbers. Keep it ≤160 words.
+
+Profile: ${JSON.stringify(profile || {})}
+Memory:  ${JSON.stringify(memory || {})}
+`.trim();
+    } else if (intent === 'ideas') {
+      // fetch quick picks (no ticker given)
+      const picks = await quickPicksForUser(profile).catch(() => []);
+      const picksLite = picks.map(p => ({
+        symbol: p.symbol, price: p.price,
+        pUp: p.pUp, magnitudePct: p.magnitudePct, expectedReturnPct: p.expectedReturnPct
+      }));
+      system = `
+You are SCI's stock scout. The user wants ideas/picks without giving a ticker.
+Use the short-term model picks provided below. Personalize to Profile/Memory (risk, horizon, sectors).
+Output a short list (2–3 bullets) with each pick's price and brief rationale (probability/magnitude or quality).
+Close with a nudge that you can deep-dive any of them.
+
+Profile: ${JSON.stringify(profile || {})}
+Memory:  ${JSON.stringify(memory || {})}
+Picks:   ${JSON.stringify(picksLite || [])}
+`.trim();
+    } else if (intent === 'education') {
+      system = `
+You are a concise explainer for investing concepts (≤160 words).
+Use simple language, one mini example, and one caution/pitfall. No symbols required.
+Profile (to adjust tone): ${JSON.stringify(profile || {})}
+`.trim();
+    } else if (intent === 'greet' || intent === 'other' || intent === 'macro' || intent === 'watchlist_update') {
+      // friendly general assistant + quick capability summary; try to be helpful immediately
+      const picks = await quickPicksForUser(profile).catch(() => []);
+      const picksLite = picks.map(p => ({ symbol: p.symbol, expectedReturnPct: p.expectedReturnPct }));
+      system = `
+You are SCI's AI financial assistant. The user didn't provide a ticker.
+Greet briefly and show what you can do (1 short line).
+Offer 2 quick actionable options tailored to Profile/Memory (e.g., "get ideas", "size a position", "analyze your watchlist").
+If Picks are supplied, mention 1–2 tickers with their expected-return snapshot as "quick ideas".
+Keep it ≤120 words.
+
+Profile: ${JSON.stringify(profile || {})}
+Memory:  ${JSON.stringify(memory || {})}
+Picks:   ${JSON.stringify(picksLite || [])}
+`.trim();
+    }
+
+    // ── call the model
+    let reply = await callChatServiceAdaptive({ system, messages });
+
+    // ── never return empty
+    if (!reply || !String(reply).trim()) {
+      const fallback = ctx.symbol
+        ? `I loaded data for ${ctx.symbol} but couldn't reach the model. Try again in a moment or ask for ideas.`
+        : `I can give ideas, size positions, or analyze a ticker. For example, say “ideas” or “AAPL analysis”.`;
+      reply = fallback;
+    }
+
+    // ── durable memory extraction/update
+    try {
+      const facts = await extractFactsAdaptive([...messages, { role: 'assistant', content: reply }]);
+      if (facts && Object.keys(facts).length) {
+        memDoc.facts     = mergeFacts(memDoc.facts, facts);
+        memDoc.summary   = `Last update: ${new Date().toISOString()}`;
+        memDoc.updatedAt = new Date();
+        await memDoc.save();
+      }
+    } catch (e) {
+      console.warn('memory update skipped:', e.message);
+    }
+
+    return res.json({ text: String(reply) });
+  } catch (e) {
+    console.error('chat route error:', e.message);
+    const status = /missing|required|400/.test(e.message) ? 400 : 500;
+    return res.status(status).json({ text: `Chat error: ${e.message}` });
+  }
+});
+
+
+
+
+app.get('/api/price/:symbol', authenticate, async (req, res) => {
+  try {
+    const sym = String(req.params.symbol || '').toUpperCase();
+    if (!sym) return res.status(400).json({ error: 'symbol required' });
+    if (!isValidSymbol(sym)) return res.status(404).json({ error: 'unknown symbol' });
+
+    const q = await yahooFinance.quote(sym, {}, { fetchOptions: requestOptions });
+    if (!q?.regularMarketPrice) return res.status(404).json({ error: 'no price' });
+
+    return res.json({ symbol: sym, price: q.regularMarketPrice, timestamp: new Date().toISOString() });
+  } catch (e) {
+    console.error('price endpoint:', e.message);
+    res.status(502).json({ error: 'price provider failed' });
+  }
+});
+app.get("/api/model/shortterm/:symbol", async (req, res) => {
+  try {
+    const sym = String(req.params.symbol || "").toUpperCase();
+    if (!sym) return res.status(400).json({ message: "symbol required" });
+    if (!isValidSymbol(sym)) return res.status(404).json({ message: "unknown symbol" });
+    const r = await computeShortTermExpectedMove(sym);
+    return res.json({
+      symbol: sym,
+      pUp: +(r.pUp).toFixed(4),
+      magnitudePct: +(r.magnitude * 100).toFixed(3),
+      expectedReturnPct: +(r.expectedReturn * 100).toFixed(3),
+      expectedIncreasePct: +(r.expectedIncrease * 100).toFixed(3),
+      diagnostics: r.diagnostics
+    });
+  } catch (e) {
+    console.error("shortterm model:", e.message);
+    return res.status(500).json({ message: "Model error" });
+  }
+});
+
+
+
 /*──────────────────────────────────────────
 |  STOCK‑HISTORY  –  daily candles         |
 └──────────────────────────────────────────*/
@@ -860,98 +1795,536 @@ app.get("/api/intraday/:symbol", async (req, res) => {
 
 
 /*──────────────────────────────────────────
-|  13) FINDER (batched / rate‑limited)     |
+|  Short-term expected move (T+1, daily)   |
+|  Probability × Magnitude model           |
 └──────────────────────────────────────────*/
-// -------- Finder (optimized) --------
-const finderRouter = express.Router();
 
+// tiny cache to avoid recomputing repeatedly (10 min)
+const ST_EXPECTED_CACHE = new Map();
+const ST_TTL_MS = 10 * 60 * 1000;
 
-async function classifyStockByForecast(sym) {
-  const q = await fetchStockData(sym).catch(() => null);
-  const price = q?.price?.regularMarketPrice;
-  if (!price) return { classification: 'unknown', growthPct: 0, forecastPrice: null };
+const stClamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const stSigmoid = z => 1 / (1 + Math.exp(-z));
 
-  const fc = await buildForecastPrice(sym, price);
-  const growthPct = ((fc - price) / price) * 100;
-  const classification = growthPct >= 2 ? 'growth' : (growthPct >= 0 ? 'stable' : 'unstable');
-  return { classification, growthPct, forecastPrice: fc };
+// fetch ~120 trading days of daily bars
+async function stGetDaily(symbol, days = 120) {
+  const end = new Date();
+  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+  const rows = await yahooFinance.historical(
+    symbol,
+    { period1: start, period2: end, interval: "1d" },
+    { fetchOptions: requestOptions }
+  );
+  const data = (rows || [])
+    .map(r => ({
+      date: new Date(r.date),
+      open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume
+    }))
+    .filter(r => Number.isFinite(r.open) && Number.isFinite(r.close) && Number.isFinite(r.high) && Number.isFinite(r.low) && Number.isFinite(r.volume))
+    .sort((a,b)=>a.date-b.date);
+  return data;
 }
 
-
-
-// apply limiter to just this route
-finderRouter.use("/api/find-stocks", findStockLimiter);
-
-/* helper – fetch quotes in parallel, max N at once */
-async function fetchBatch(symbols, maxParallel = 20) {
-  const out = [];
-  let active = [];
-  for (const sym of symbols) {
-    active.push(
-      fetchStockData(sym).then((d) => ({ sym, data: d })).catch(() => null)
-    );
-    if (active.length >= maxParallel) {
-      out.push(...(await Promise.all(active)));
-      active = [];
-    }
+// indicators: EMA, RSI14, ATR14, MACD(12,26,9), BBands(20), OBV, z-score
+function stEMA(vals, period) {
+  const k = 2 / (period + 1);
+  let e = vals[0];
+  const out = [e];
+  for (let i = 1; i < vals.length; i++) { e = vals[i] * k + e * (1 - k); out.push(e); }
+  return out;
+}
+function stRSI14(closes, p = 14) {
+  if (closes.length < p + 1) return null;
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= p; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gain += d; else loss -= d;
   }
-  if (active.length) out.push(...(await Promise.all(active)));
-  return out.filter(Boolean);
+  gain /= p; loss /= p;
+  let rs = loss === 0 ? 100 : gain / loss;
+  let rsi = 100 - (100 / (1 + rs));
+  for (let i = p + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    gain = (gain * (p - 1) + g) / p;
+    loss = (loss * (p - 1) + l) / p;
+    rs = loss === 0 ? 100 : gain / loss;
+    rsi = 100 - (100 / (1 + rs));
+  }
+  return rsi;
+}
+function stATR14(rows, p = 14) {
+  if (rows.length < p + 1) return null;
+  const trs = [];
+  for (let i = 1; i < rows.length; i++) {
+    const h = rows[i].high, l = rows[i].low, pc = rows[i - 1].close;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  const e = stEMA(trs, p);
+  return e[e.length - 1];
+}
+function stMACD(closes, fast = 12, slow = 26, sigP = 9) {
+  if (closes.length < slow + sigP + 5) return { macd: null, signal: null, hist: null };
+  const ef = stEMA(closes, fast);
+  const es = stEMA(closes, slow);
+  const line = closes.map((_, i) => ef[i] - es[i]);
+  const sig = stEMA(line.slice(-sigP - 50), sigP).pop();
+  const val = line[line.length - 1];
+  return { macd: val, signal: sig, hist: val - sig };
+}
+function stBBands(closes, p = 20) {
+  if (closes.length < p) return { upper: null, lower: null, pctB: null, sma: null, std: null };
+  const arr = closes.slice(-p);
+  const sma = arr.reduce((s, x) => s + x, 0) / p;
+  const std = Math.sqrt(arr.reduce((s, x) => s + (x - sma) ** 2, 0) / p);
+  const upper = sma + 2 * std, lower = sma - 2 * std;
+  const last = closes[closes.length - 1];
+  const pctB = (last - lower) / (upper - lower);
+  return { upper, lower, pctB, sma, std };
+}
+function stOBV(rows) {
+  let v = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const dir = Math.sign(rows[i].close - rows[i - 1].close);
+    v += dir * rows[i].volume;
+  }
+  return v;
+}
+function stZ(series) {
+  if (series.length < 2) return 0;
+  const m = series.reduce((s, x) => s + x, 0) / series.length;
+  const sd = Math.sqrt(series.reduce((s, x) => s + (x - m) ** 2, 0) / series.length) || 1e-6;
+  return (series[series.length - 1] - m) / sd;
 }
 
-finderRouter.post("/api/find-stocks", async (req, res) => {
+// Main calculator: returns { pUp, magnitude, expectedReturn, expectedIncrease, diagnostics }
+async function computeShortTermExpectedMove(symbol) {
+  const cache = ST_EXPECTED_CACHE.get(symbol);
+  if (cache && (Date.now() - cache.ts) < ST_TTL_MS) return cache.val;
+
+  const rows = await stGetDaily(symbol, 130);
+  if (!rows || rows.length < 40) throw new Error("Not enough history");
+
+  const closes = rows.map(r => r.close);
+  const vols   = rows.map(r => r.volume);
+  const last   = rows[rows.length - 1];
+
+  // Feature engineering (t uses last bar)
+  const ret1d   = (closes[closes.length - 1] / closes[closes.length - 2]) - 1;
+  const mom5    = (closes[closes.length - 1] / closes[closes.length - 6]) - 1;
+  const rangePct= (last.high - last.low) / last.close;
+  const gapPct  = (last.open / closes[closes.length - 2]) - 1;
+
+  const RSI     = stRSI14(closes, 14);
+  const { hist: MACDh } = stMACD(closes);
+  const { pctB } = stBBands(closes, 20);
+  const ATR     = stATR14(rows, 14);
+  const atrPct  = ATR ? ATR / last.close : 0.01;
+
+  // volume/OBV z-scores over 60d
+  const volZ = stZ(vols.slice(-60));
+  const obvSeries = [];
+  for (let i = rows.length - 60; i < rows.length; i++) {
+    obvSeries.push(stOBV(rows.slice(0, i + 1)));
+  }
+  const obvZ = stZ(obvSeries);
+
+  // Normalize into bounded features
+  const rsiN   = (RSI != null) ? stClamp((RSI - 50) / 10, -3, 3) : 0;         // ±30pts → ±3
+  const macdN  = (MACDh != null && ATR) ? stClamp(MACDh / ATR, -3, 3) : 0;    // MACD hist vs ATR
+  const mom5N  = stClamp(mom5 / 0.05, -3, 3);                                  // 5% → 1.0
+  const gapN   = stClamp(gapPct / 0.01, -3, 3);                                 // 1% gap → 1.0
+  const rngN   = stClamp(rangePct / 0.03, 0, 3);                                // 3% range → 1.0
+  const bbN    = (pctB != null) ? stClamp((pctB - 0.5) * 2, -2, 2) : 0;        // [-1..+1] → [-2..2]
+  const volN   = stClamp(volZ, -3, 3);
+  const obvN   = stClamp(obvZ, -3, 3);
+
+  // Direction probability (logistic blend) – tunable weights
+  const z =
+      0.15
+    + 0.8  * rsiN
+    + 0.6  * macdN
+    + 0.5  * mom5N
+    + 0.3  * gapN
+    + 0.2  * bbN
+    + 0.15 * volN
+    + 0.10 * obvN
+    - 0.2  * rngN;
+
+  const pUp = stSigmoid(z);
+
+  // Magnitude = expected |move| (%)
+  const magnitude = stClamp(
+    (atrPct || 0.01) * (1
+      + 0.25 * Math.abs(volN)
+      + 0.35 * Math.abs(macdN)
+      + 0.20 * Math.abs(gapN)
+      + 0.25 * Math.abs(mom5N)
+    ),
+    0.002, 0.08   // 0.2% .. 8%
+  );
+
+  const expectedReturn   = (2 * pUp - 1) * magnitude; // signed %
+  const expectedIncrease = pUp * magnitude;           // chance-adjusted %
+
+  const out = {
+    pUp,                       // 0..1
+    magnitude,                 // abs move, as decimal (e.g. 0.012 = 1.2%)
+    expectedReturn,            // signed decimal
+    expectedIncrease,          // decimal
+    diagnostics: { RSI, MACDh, pctB, atrPct, ret1d, mom5, rangePct, gapPct, volZ, obvZ }
+  };
+  ST_EXPECTED_CACHE.set(symbol, { val: out, ts: Date.now() });
+  return out;
+}
+
+// Test endpoint: GET /api/model/shortterm/:symbol
+app.get("/api/model/shortterm/:symbol", async (req, res) => {
   try {
-    let { stockType, exchange, minPrice, maxPrice, limit = 400 } = req.body;
-    if (
-      typeof stockType !== "string" ||
-      typeof exchange !== "string" ||
-      typeof minPrice !== "number" ||
-      typeof maxPrice !== "number"
-    ) {
+    const sym = String(req.params.symbol || "").toUpperCase();
+    if (!sym) return res.status(400).json({ message: "symbol required" });
+    const r = await computeShortTermExpectedMove(sym);
+    return res.json({
+      symbol: sym,
+      pUp: +(r.pUp).toFixed(4),
+      magnitudePct: +(r.magnitude * 100).toFixed(3),
+      expectedReturnPct: +(r.expectedReturn * 100).toFixed(3),
+      expectedIncreasePct: +(r.expectedIncrease * 100).toFixed(3),
+      diagnostics: r.diagnostics
+    });
+  } catch (e) {
+    console.error("shortterm model:", e.message);
+    return res.status(500).json({ message: "Model error" });
+  }
+});
+
+
+/*──────────────────────────────────────────
+|  13) FINDER (v2.1, self-contained)       |
+└──────────────────────────────────────────*/
+const finderRouter = express.Router();
+finderRouter.use("/find-stocks", findStockLimiter);
+
+// --- tiny in-memory cache ---
+const finderQuoteCache = new Map();
+function setCached(key, val) { finderQuoteCache.set(key, { val, ts: Date.now() }); }
+function getCached(key, ttlMs = 60 * 60 * 1000) {
+  const hit = finderQuoteCache.get(key);
+  return hit && (Date.now() - hit.ts < ttlMs) ? hit.val : null;
+}
+
+// --- helpers ---
+function extractQuoteFeatures(yq) {
+  const p  = yq?.price || {};
+  const sd = yq?.summaryDetail || {};
+  const fd = yq?.financialData || {};
+  return {
+    name: p.longName || p.shortName || null,
+    price: p.regularMarketPrice ?? null,
+    vol:   p.regularMarketVolume ?? null,
+    avgVol: sd.averageDailyVolume3Month ?? p.regularMarketVolume ?? 0,
+
+    pe: sd.trailingPE ?? null,
+    ps: sd.priceToSalesTrailing12Months ?? null,
+    pb: sd.priceToBook ?? null,
+    div: sd.dividendYield ?? null,
+
+    wkHi: sd.fiftyTwoWeekHigh ?? null,
+    wkLo: sd.fiftyTwoWeekLow ?? null,
+    dayHi: p.regularMarketDayHigh ?? null,
+    dayLo: p.regularMarketDayLow ?? null,
+
+    growth: fd.earningsGrowth ?? null,
+    debtToEq: fd.debtToEquity ?? null,
+    grossMargin: fd.grossMargins ?? null,
+    opMargin: fd.operatingMargins ?? null,
+
+    rsi14: null // optional future hook
+  };
+}
+
+function baseScore(f) {
+  let score = 0; const reasons = [];
+
+  // Liquidity
+  if (f.avgVol && f.avgVol >= 1_000_000) { score += 4; reasons.push("Good liquidity (avg vol ≥1M)"); }
+  else if (f.avgVol && f.avgVol >= 250_000) { score += 2; reasons.push("OK liquidity (avg vol ≥250k)"); }
+  else { reasons.push("Thinly traded"); }
+
+  // Valuation sanity
+  if (f.pe && f.pe > 4 && f.pe < 30) { score += 3; reasons.push("Reasonable PE"); }
+  else if (f.ps && f.ps < 8) { score += 1; reasons.push("P/S acceptable"); }
+  else { score -= 1; reasons.push("Valuation rich/unknown"); }
+
+  // Growth/profitability/quality
+  if (typeof f.growth === "number") {
+    if (f.growth > 0.15) { score += 4; reasons.push("Strong earnings growth"); }
+    else if (f.growth > 0.03) { score += 2; reasons.push("Modest earnings growth"); }
+    else if (f.growth < 0) { score -= 2; reasons.push("Negative earnings growth"); }
+  }
+  if (typeof f.debtToEq === "number") {
+    if (f.debtToEq < 0.6) { score += 3; reasons.push("Low leverage"); }
+    else if (f.debtToEq > 1.5) { score -= 2; reasons.push("High leverage"); }
+  }
+  if (typeof f.grossMargin === "number" && f.grossMargin > 0.4) { score += 2; reasons.push("Healthy gross margin"); }
+  if (typeof f.opMargin === "number" && f.opMargin > 0.15) { score += 2; reasons.push("Solid operating margin"); }
+
+  // 52w position
+  if (f.wkHi != null && f.wkLo != null && f.price != null && f.wkHi > f.wkLo) {
+    const pos = (f.price - f.wkLo) / (f.wkHi - f.wkLo);
+    if (pos < 0.3) { score += 2; reasons.push("Near 52w lows (value tilt)"); }
+    else if (pos > 0.9) { score -= 1; reasons.push("Near 52w highs (breakout risk)"); }
+  }
+
+  // Optional RSI
+  if (typeof f.rsi14 === "number") {
+    if (f.rsi14 < 30) { score += 2; reasons.push("RSI oversold"); }
+    if (f.rsi14 > 70) { score -= 1; reasons.push("RSI overbought"); }
+  }
+
+  return { score, reasons };
+}
+
+// Bounded parallel mapper
+async function mapLimit(items, concurrency, mapper) {
+  const out = new Array(items.length);
+  let i = 0, active = 0;
+  return new Promise((resolve, reject) => {
+    const kick = () => {
+      while (active < concurrency && i < items.length) {
+        const idx = i++; active++;
+        Promise.resolve(mapper(items[idx], idx))
+          .then(v => { out[idx] = v; active--; (i >= items.length && active === 0) ? resolve(out) : kick(); })
+          .catch(reject);
+      }
+    };
+    kick();
+  });
+}
+
+async function safeForecast(sym, price) {
+  try {
+    const cached = getCached(`fc:${sym}`, 12 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const fc = await buildForecastPrice(sym, price);
+    setCached(`fc:${sym}`, fc);
+    return fc;
+  } catch { return null; }
+}
+
+// ---------- main route ----------
+finderRouter.post("/find-stocks", async (req, res) => {
+  try {
+    let {
+      stockType,            // "growth" | "stable"
+      exchange,             // "NYSE" | "NASDAQ" | "TSX"
+      minPrice,
+      maxPrice,
+      horizon = "short",    // "short" | "long"
+      minGrowthPct = 0.8,   // floor for growth names
+      topK = 30,
+      universeLimit = 600,
+      includeAdvisor = false      // renamed to avoid any shadowing
+    } = req.body || {};
+
+    if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
       return res.status(400).json({ message: "Bad finder parameters." });
     }
-    stockType = stockType.toLowerCase();
-    exchange = exchange.toUpperCase();
 
-    // 1) Universe by exchange, capped by limit
+    horizon       = (""+horizon).toLowerCase()==="long" ? "long" : "short";
+    minGrowthPct  = Math.max(0, +minGrowthPct || 0.8);
+    stockType     = stockType.toLowerCase();
+    exchange      = exchange.toUpperCase();
+    topK          = Math.min(Math.max(+topK || 30, 10), 60);
+    universeLimit = Math.min(Math.max(+universeLimit || 600, 100), 2000);
+
+    // 1) Universe by exchange
     const tickers = symbolsList
-      .filter((s) => {
-        const ex = (typeof s === "string" ? "N/A" : s.exchange || "N/A").toUpperCase();
-        return ex === exchange;
-      })
-      .map((s) => (typeof s === "string" ? s : s.symbol))
-      .slice(0, limit);
+      .filter(s => (typeof s === "string" ? true : (s.exchange || s.ex || "").toUpperCase() === exchange))
+      .map(s => (typeof s === "string" ? s : s.symbol))
+      .slice(0, universeLimit);
 
-    // 2) Prices in bulk, pre-filter by price range
-    const batchResults = await fetchBatch(tickers, 20);
-    const inRange = batchResults
-      .filter(({ data }) => {
-        const price = data?.price?.regularMarketPrice;
-        return price && price >= minPrice && price <= maxPrice;
-      })
-      .map(({ sym }) => sym);
+    // 2) Quote + cheap horizon prefilter
+    const quoted = await mapLimit(tickers, 18, async (sym) => {
+      const yq = getCached(`q:${sym}`) || await fetchStockData(sym);
+      if (yq) setCached(`q:${sym}`, yq);
 
-    // 3) Classify only survivors, in parallel
-    const classifications = await Promise.all(
-      inRange.map(async (sym) => {
-        const { classification } = await classifyStockByForecast(sym);
-        return { sym, classification };
-      })
+      const f = extractQuoteFeatures(yq);
+      if (!f.price || f.price < minPrice || f.price > maxPrice) return null;
+
+      const bs = baseScore(f);
+
+      // horizon screens
+      let pass = true;
+      const horizonNotes = [];
+      if (horizon === "short") {
+        if (!f.avgVol || f.avgVol < 250_000) { pass = false; horizonNotes.push("Insufficient liquidity"); }
+        if (f.wkHi && f.wkLo && f.price && f.wkHi > f.wkLo) {
+          const pos = (f.price - f.wkLo) / (f.wkHi - f.wkLo);
+          if (pos > 0.95) { pass = false; horizonNotes.push("Too extended near 52w high"); }
+        }
+        if (typeof f.debtToEq === "number" && f.debtToEq > 2.5) { pass = false; horizonNotes.push("Excess leverage for short term"); }
+      } else {
+        if (bs.score < 10) { pass = false; horizonNotes.push("Quality score below long-term bar (10)"); }
+        if (typeof f.debtToEq === "number" && f.debtToEq > 1.2) { pass = false; horizonNotes.push("Debt/equity too high"); }
+        if (typeof f.grossMargin === "number" && f.grossMargin < 0.3) { pass = false; horizonNotes.push("Gross margin <30%"); }
+      }
+
+      if (!pass) return null;
+      return { symbol: sym, features: f, base: bs, horizonNotes };
+    });
+
+    const prelim = quoted.filter(Boolean);
+
+    // 3) Rank & slice for forecasting
+    prelim.sort((a,b) => (b.base.score - a.base.score) || ((b.features.avgVol||0) - (a.features.avgVol||0)));
+    const slice = prelim.slice(0, Math.max(topK * 3, 60));
+
+    // 4) Forecast pass on slice
+    const forecasted = await mapLimit(slice, 8, async (row) => {
+      const { symbol, features, base, horizonNotes } = row;
+
+      let forecastPrice = null;
+      let growthPct = null;            // % change for T+1
+      let classification = "unknown";
+
+      if (horizon === "short") {
+        // 🔹 NEW: probability × magnitude model (T+1)
+        const st = await computeShortTermExpectedMove(symbol).catch(() => null);
+        if (st && features.price) {
+          const expR = st.expectedReturn;            // signed decimal (e.g., 0.008 = 0.8%)
+          growthPct = expR * 100;
+          forecastPrice = +(features.price * (1 + expR)).toFixed(2);
+          horizonNotes.push(
+            `Short-term model: p_up ${(st.pUp * 100).toFixed(0)}%, |move| ${(st.magnitude * 100).toFixed(1)}%`
+          );
+        }
+      } else {
+        // Long-term: keep your existing forecast path
+        const fc = await safeForecast(symbol, features.price);
+        if (fc && features.price) {
+          growthPct = ((fc - features.price) / features.price) * 100;
+          forecastPrice = +fc.toFixed(2);
+        }
+      }
+
+      if (growthPct != null) {
+        classification = growthPct >= 2 ? "growth" : (growthPct >= 0 ? "stable" : "unstable");
+      }
+
+      return {
+        symbol,
+        name: features.name,
+        exchange,
+        price: features.price,
+        avgVol: features.avgVol,
+        score: base.score,
+        reasons: [...base.reasons, ...horizonNotes],
+        forecastPrice,
+        growthPct,
+        classification
+      };
+    });
+
+
+    // 5) Policy filters (type + horizon) + minGrowth floor
+    const accept = (row) => {
+      if (row.growthPct == null || row.forecastPrice == null) return false;
+
+      if (stockType === "growth") {
+        if (row.growthPct < minGrowthPct) return false;
+        if (horizon === "short") {
+          if (row.avgVol < 250_000) return false;
+        } else {
+          if (row.score < 12) return false;
+        }
+        return true;
+      }
+
+      if (stockType === "stable") {
+        const inBand = row.growthPct >= -1 && row.growthPct <= 2;
+        const qualityOK = row.score >= (horizon === "long" ? 8 : 5);
+        return inBand && qualityOK;
+      }
+
+      return true;
+    };
+
+    const filtered = forecasted.filter(accept);
+
+    // 6) Final sort & trim
+    filtered.sort((a,b) =>
+      (b.score - a.score) ||
+      ((b.growthPct ?? -999) - (a.growthPct ?? -999)) ||
+      ((b.avgVol||0) - (a.avgVol||0))
     );
 
-    // 4) Final list
-    const stocks = classifications
-      .filter(({ classification }) => classification === stockType)
-      .map(({ sym }) => ({ symbol: sym, exchange }));
+    const out = filtered.slice(0, topK);
 
-    return res.json({ stocks });
+    // === optional per-pick AI Advisor (topK only) ===
+if (includeAdvisor && out.length) {
+  try {
+    const hasAuthHeader = /^Bearer\s+/.test(req.headers.authorization || "");
+    const hasUidHeader  = !!req.headers['x-user-id'];
+    const profile = await getUserProfile(req); // from your helper
+
+    await mapLimit(out, 3, async (row) => {
+      const baseAdvice =
+        row.classification === "growth"
+          ? `Projected to grow ~${row.growthPct?.toFixed(2)}%. Quality score ${row.score}.`
+          : row.classification === "stable"
+          ? `Projected to be stable (~${row.growthPct?.toFixed(2)}%). Quality score ${row.score}.`
+          : `Uncertain projection. Quality score ${row.score}.`;
+
+      let suggestion = null;
+      try {
+        suggestion = await buildAdvisorSuggestion({
+          symbol: row.symbol,
+          profile,          // may be null; CF prompt already tolerates {}
+          baseAdvice,
+          fundamentals: null,
+          technical: null,
+          metrics: {
+            currentPrice: row.price,
+            avgVolume: row.avgVol,
+            growthPct: row.growthPct,
+            qualityScore: row.score,
+            classification: row.classification,
+          },
+        });
+      } catch (e) {
+        console.warn("Advisor CF error:", e.message);
+      }
+
+      // Decide what to show:
+      if (suggestion && String(suggestion).trim()) {
+        row.advisorSuggestion = String(suggestion).trim();
+      } else if (profile || hasAuthHeader || hasUidHeader) {
+        // You ARE signed in (or at least sent identity), but CF gave nothing → show generic, not "sign in"
+        row.advisorSuggestion = `Advisor Suggestion: ${baseAdvice}`;
+      } else {
+        // Truly anonymous → show the sign-in nudge
+        row.advisorSuggestion = "Advisor Suggestion: Sign in for a personalized plan, or open the Stock Checker for deeper analysis.";
+      }
+    });
+  } catch (e) {
+    console.warn("Finder advisor step:", e.message);
+  }
+}
+
+
+
+    return res.json({ stocks: out, meta: { horizon, minGrowthPct, topK, universeLimit } });
   } catch (err) {
-    console.error("Finder error:", err);
+    console.error("Finder v2.1 error:", err);
     return res.status(500).json({ message: "Finder server error." });
   }
 });
 
-app.use("/finder", finderRouter);
+
+app.use("/api", finderRouter);
+
 
 
 /*──────────────────────────────────────────
@@ -1021,6 +2394,53 @@ app.get("/api/top-forecasted*", async (_req, res) => {
     return res.status(500).json({ forecasts: [] });
   }
 });
+
+/* 1.5️⃣  BEST-BUYS (short-term, probability-based) */
+app.get("/api/best-buys*", async (_req, res) => {
+  try {
+    // sample a reasonable universe (fast + cheap); you can raise to 400–600 later
+    const sample = symbolsList
+      .slice(0, 200)
+      .map(s => (typeof s === "string" ? s : s.symbol));
+
+    const results = [];
+    for (const group of chunk(sample, 12)) {           // small batches to be polite
+      const batch = await Promise.all(
+        group.map(async (sym) => {
+          try {
+            const q = await fetchStockData(sym).catch(() => null);
+            const price = q?.price?.regularMarketPrice;
+            if (!price) return null;
+
+            const st = await computeShortTermExpectedMove(sym).catch(() => null);
+            if (!st) return null;
+
+            return {
+              symbol: sym,
+              price,
+              pUp: +(st.pUp * 100).toFixed(1),                // “chance to go up”
+              magnitudePct: +(st.magnitude * 100).toFixed(2), // abs move
+              expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
+            };
+          } catch { return null; }
+        })
+      );
+      results.push(...batch.filter(Boolean));
+    }
+
+    // Rank by highest probability first, then by (+) expected return
+    results.sort(
+      (a, b) => (b.pUp - a.pUp) || (b.expectedReturnPct - a.expectedReturnPct)
+    );
+
+    return res.json({ picks: results.slice(0, 5) });
+  } catch (e) {
+    console.error("best-buys:", e.message);
+    return res.status(500).json({ picks: [] });
+  }
+});
+
+
 
 /* 3️⃣  TOP NEWS HEADLINES */
 app.get("/api/top-news*", async (_req, res) => {
