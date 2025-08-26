@@ -55,29 +55,35 @@ if (!admin.apps.length) {
   });
 }
 
+
 // ---- Express app ----
 const app = express();
 app.use(express.json());
 
+// ─── CORS (single global config) ──────────────────────────────────────────────
+const ALLOWLIST = new Set([
+  'https://sci-investments.web.app',
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+]);
 
-
-// ─── CORS ────────────────────────────────────────────────────────────────────
-
-const corsOptions = {
-  origin: [
-    'https://sci-investments.web.app',
-    'http://localhost:3000',
-    'http://localhost:5500',
-    'http://127.0.0.1:5500'
-  ],
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept','x-user-id'],
-  credentials: true,
-  optionsSuccessStatus: 200,
+const corsOptionsDelegate = (req, cb) => {
+  const origin = req.headers.origin;
+  const isAllowed = origin && ALLOWLIST.has(origin);
+  cb(null, {
+    origin: isAllowed, // echo only allowed origins (false blocks it)
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-user-id'],
+    optionsSuccessStatus: 204,
+  });
 };
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-app.options('/api/completeOnboarding', cors(corsOptions));
+
+app.use(cors(corsOptionsDelegate));
+// always answer preflight
+app.options('*', cors(corsOptionsDelegate));
+
 app.use(express.static(path.join(__dirname, "../public")));
 
 
@@ -350,7 +356,7 @@ async function buildResearchPack(symbol) {
 
   const ratios = fundamentals?.ratios || {};
   const bench  = fundamentals?.benchmarks || {};
-  const fair   = fundamentals?.valuation || null;
+  const valuation = fundamentals?.valuation ?? null;
 
   const tech = technical ? {
     trend: technical.trend ?? null,
@@ -401,7 +407,7 @@ async function buildResearchPack(symbol) {
         pe: bench.peRatio ?? null,
         ps: bench.priceToSales ?? null,
       },
-      fair, // { fairPrice, status }
+      valuation, // { fairPrice, status }
     },
 
     technical: tech,
@@ -635,7 +641,6 @@ const { predictNextDay } = require("./data/trainGRU"); // GRU helper
 // Complete onboarding: save profile + get welcome text from CF
 app.post(
   "/api/completeOnboarding",
-  cors(corsOptions),
   authenticate, // ← protect and populate req.user
   async (req, res) => {
     console.log("🔥 COMPLETE ONBOARDING ROUTE HIT for user:", req.user?.userId);
@@ -957,10 +962,22 @@ function isValidSymbol(s) {
 /*──────────────────────────────────────────
 |  Rate‑limits                             |
 └──────────────────────────────────────────*/
-const stockCheckerLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
+const stockCheckerLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',   // <-- key
+});
 app.use("/api/check-stock", stockCheckerLimiter);
 
-const findStockLimiter = rateLimit({windowMs:60*1000,max:30,message:{message:"Too many requests, please try again shortly."}});
+const findStockLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
+});
 
 /*──────────────────────────────────────────
 |  ===  REST ENDPOINTS (all original)  === |
@@ -1021,68 +1038,77 @@ app.get("/protected", (req, res) => {
 
 
 app.get("/api/fundamentals/:symbol", async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase();
+  const symbol = (req.params.symbol || "").toUpperCase();
   try {
     const fund = await getFundamentals(symbol);
     if (!fund) throw new Error("No fundamentals returned");
 
-    const stock = await fetchStockData(symbol);
+    const stock = await fetchStockData(symbol).catch(() => null);
     const currentPrice = stock?.price?.regularMarketPrice ?? null;
 
-    // Valuation logic with PE → P/S fallback
-    let valuation = null;
-    let advice    = "";
+    // Start with any valuation/advice the service already computed
+    let valuation = fund.valuation ?? null;
+    let advice    = fund.advice ?? "";
 
-    const { peRatio, priceToSales } = fund.ratios;
-    const { peRatio: bmPE, priceToSales: bmPS } = fund.benchmarks;
+    // Safe destructuring (guards when service omits sections)
+    const { peRatio, priceToSales, priceToBook } = fund.ratios || {};
+    const {
+      peRatio: bmPE,
+      priceToSales: bmPS,
+      priceToBook: bmPB
+    } = fund.benchmarks || {};
     const cp = currentPrice;
 
-    if (cp !== null && peRatio != null && bmPE != null && peRatio > 0) {
-      const fairPrice = +((bmPE / peRatio) * cp).toFixed(2);
-      const status    = fairPrice > cp ? "undervalued" : "overvalued";
-      valuation       = { fairPrice, status };
-      advice          = status === "undervalued"
-        ? "Price below peer PE average—consider a closer look."
-        : "Price above peer PE average—be cautious of overpaying.";
+    // Helper to set valuation/advice consistently
+    function setValuation(fairPriceCalc, basisLabel) {
+      const fair = +(fairPriceCalc).toFixed(2);
+      const status = fair > cp ? "undervalued" : "overvalued";
+      valuation = { fairPrice: fair, status };
+      advice =
+        status === "undervalued"
+          ? `Price below peer ${basisLabel} average—consider a closer look.`
+          : `Price above peer ${basisLabel} average—be cautious of overpaying.`;
     }
-    else if (cp !== null && priceToSales != null && bmPS != null && priceToSales > 0) {
-      const fairPrice = +((bmPS / priceToSales) * cp).toFixed(2);
-      const status    = fairPrice > cp ? "undervalued" : "overvalued";
-      valuation       = { fairPrice, status };
-      advice          = status === "undervalued"
-        ? "Price below peer P/S average—consider a closer look."
-        : "Price above peer P/S average—be cautious of overpaying.";
-    }
-    else {
-      if (
-        fund.weaknesses.some(w =>
-          ["Negative net margin","Negative ROA"].includes(w.flag)
-        )
-      ) {
-        advice = "Company is unprofitable—avoid investing.";
+
+    // Only compute if we don't already have a valuation and we have a live price
+    if (valuation == null && Number.isFinite(cp)) {
+      if (peRatio != null && peRatio > 0 && bmPE != null && bmPE > 0) {
+        setValuation((bmPE / peRatio) * cp, "PE");
+      } else if (priceToSales != null && priceToSales > 0 && bmPS != null && bmPS > 0) {
+        setValuation((bmPS / priceToSales) * cp, "P/S");
+      } else if (priceToBook != null && priceToBook > 0 && bmPB != null && bmPB > 0) {
+        setValuation((bmPB / priceToBook) * cp, "P/B");
       } else {
-        advice = "No valuation signal available.";
+        if (
+          Array.isArray(fund.weaknesses) &&
+          fund.weaknesses.some(w => ["Negative net margin", "Negative ROA"].includes(w.flag))
+        ) {
+          advice = "Company is unprofitable—avoid investing.";
+        } else {
+          advice = advice || "No valuation signal available.";
+        }
       }
     }
 
     return res.json({
       symbol,
-      companyInfo: fund.companyInfo,
-      ratios:      fund.ratios,
-      benchmarks:  fund.benchmarks,
-      rating:      fund.rating,
-      weaknesses:  fund.weaknesses,
+      companyInfo: fund.companyInfo || null,
+      ratios:      fund.ratios || {},
+      benchmarks:  fund.benchmarks || {},
+      rating:      fund.rating ?? null,
+      weaknesses:  fund.weaknesses || [],
       valuation,
       advice,
-      news:        fund.news,
-      currentPrice,
-      fetchedAt:   fund.fetchedAt,
+      news:        fund.news || [],
+      currentPrice: cp,
+      fetchedAt:   fund.fetchedAt || new Date().toISOString(),
     });
   } catch (err) {
     console.error("Fundamentals endpoint error:", err);
     return res.status(500).json({ message: "Failed to fetch fundamentals." });
   }
 });
+
 
 
 
@@ -1580,7 +1606,7 @@ Include up to 2 detected symbols. Output JSON only.
           weaknesses: pack.fundamentals.weaknesses ?? [],
           ratios: pack.fundamentals.ratios ?? {},
           benchmarks: pack.fundamentals.benchmarks ?? {},
-          fair: pack.fundamentals.valuation ?? null
+          valuation: pack.fundamentals.valuation ?? null
         } : null,
         tech: techSlim,
         stModel,
@@ -1979,25 +2005,6 @@ async function computeShortTermExpectedMove(symbol) {
   return out;
 }
 
-// Test endpoint: GET /api/model/shortterm/:symbol
-app.get("/api/model/shortterm/:symbol", async (req, res) => {
-  try {
-    const sym = String(req.params.symbol || "").toUpperCase();
-    if (!sym) return res.status(400).json({ message: "symbol required" });
-    const r = await computeShortTermExpectedMove(sym);
-    return res.json({
-      symbol: sym,
-      pUp: +(r.pUp).toFixed(4),
-      magnitudePct: +(r.magnitude * 100).toFixed(3),
-      expectedReturnPct: +(r.expectedReturn * 100).toFixed(3),
-      expectedIncreasePct: +(r.expectedIncrease * 100).toFixed(3),
-      diagnostics: r.diagnostics
-    });
-  } catch (e) {
-    console.error("shortterm model:", e.message);
-    return res.status(500).json({ message: "Model error" });
-  }
-});
 
 
 /*──────────────────────────────────────────
