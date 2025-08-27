@@ -2330,8 +2330,7 @@ if (includeAdvisor && out.length) {
 });
 
 
-app.use("/api", finderRouter);
-
+app.use(["/api", "/finder/api"], finderRouter);
 
 
 /*──────────────────────────────────────────
