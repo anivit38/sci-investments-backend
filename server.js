@@ -1330,8 +1330,10 @@ app.post("/api/check-stock", async (req, res) => {
     let technicalDetail = null;
     if (category === "technical" || category === "overall") {
       try {
-        const userId = req.user?.userId || req.headers['x-user-id'] || null; // header fallback if route stays public
+        const userId = req.user?.userId || req.headers['x-user-id'] || null;
         const t = await getTechnicalForUser(upper, userId);
+
+        // pick only JSON-safe fields
         technicalDetail = {
           rsi14:  t?.indicators?.RSI14 ?? null,
           macd:   t?.indicators?.MACD ?? null,
@@ -1340,22 +1342,24 @@ app.post("/api/check-stock", async (req, res) => {
           atr14:  t?.indicators?.ATR14 ?? null,
           trend:  t?.trend ?? (() => {
             const s50 = t?.indicators?.SMA50, s200 = t?.indicators?.SMA200;
-            if (s50 && s200) return s50 > s200 ? 'uptrend' : (s50 < s200 ? 'downtrend' : 'sideways');
-            return 'sideways';
+            if (s50 && s200) return s50 > s200 ? "uptrend" : (s50 < s200 ? "downtrend" : "sideways");
+            return "sideways";
           })(),
           levels: t?.levels ?? {
             support: metrics.dayLow ?? metrics.fiftyTwoWeekLow,
             resistance: metrics.dayHigh ?? metrics.fiftyTwoWeekHigh,
           },
-          suggestion: t?.suggestion,        // <-- action/entry/stop/target/why
-          instructions: t?.instructions,    // <-- human-readable steps
-          raw: t                            // <-- includes chartUrl & the full series
-      };
-
+          suggestion:   t?.suggestion ?? null,
+          instructions: t?.instructions ?? null,
+          chartUrl:     t?.chartUrl ?? null,              // keep a simple string
+          // DO NOT attach the whole object:
+          // raw: t
+        };
       } catch (e) {
         console.warn(`TechnicalService failed for ${upper}:`, e.message);
       }
     }
+
 
     // 6) Build the base payload
     const base = {
