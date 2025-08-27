@@ -112,6 +112,18 @@ const BEST_BUYS_CACHE = { ts: 0, data: null };
 const BEST_BUYS_TTL_MS = 10 * 60 * 1000;
 
 
+// simple timeout wrapper for any promise
+function withTimeout(promise, ms = 4000) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))
+  ]);
+}
+
+
+
+
+
 // ─── INDEXER ─────────────────────────────────────────────────────────────
 const researchIndex = new Map(); // key: SYMBOL -> { docs:[{title, date, text, path}], mergedText }
 function guessSymbolFromFilename(file) {
@@ -1217,55 +1229,47 @@ app.post("/api/check-stock", async (req, res) => {
     let forecastPrice = metrics.currentPrice;
     let growthPct = 0;
     try {
-      const st = await computeShortTermExpectedMove(upper);
+      const st = await withTimeout(computeShortTermExpectedMove(upper), 4000);
       if (st && metrics.currentPrice) {
-        const expR = st.expectedReturn; // signed decimal, T+1
+        const expR = st.expectedReturn;                 // signed decimal
         forecastPrice = +(metrics.currentPrice * (1 + expR));
         growthPct = expR * 100;
       } else if (metrics.currentPrice) {
-        // fallback to legacy GRU/simple
-        const fc = await buildForecastPrice(upper, metrics.currentPrice);
-        forecastPrice = fc;
-        growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+        try {
+          const fc = await withTimeout(buildForecastPrice(upper, metrics.currentPrice), 2000);
+          forecastPrice = fc;
+          growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+        } catch { /* keep defaults */ }
       }
     } catch {
-      // fallback path
-      const fc = await buildForecastPrice(upper, metrics.currentPrice);
-      forecastPrice = fc;
-      growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+      try {
+        const fc = await withTimeout(buildForecastPrice(upper, metrics.currentPrice), 2000);
+        forecastPrice = fc;
+        growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
+      } catch { /* keep defaults */ }
     }
 
-    const classification =
-      growthPct >= 2  ? "growth" :
-      growthPct >= 0  ? "stable" : "unstable";
 
-    // 3) News sentiment (used in overall, but cheap to keep)
+    // 3) News sentiment — LITE (RSS only, no per-article fetch)
+    // keeps this endpoint fast/reliable on free hosting
     let news = { averageSentiment: 0, topStories: [] };
     try {
-      const feed = await rssParser.parseURL(`https://news.google.com/rss/search?q=${upper}`);
-      const items = (feed.items || []).slice(0, 5);
-      const analyses = await Promise.all(
-        items.map(async (item) => {
-          let snippet = item.contentSnippet || item.title;
-          try {
-            const html = await (await fetchNative(item.link)).text();
-            snippet = cheerio.load(html)("p").first().text() || snippet;
-          } catch {}
-          return {
-            title: item.title,
-            link:  item.link,
-            snippet: snippet.slice(0, 200) + (snippet.length > 200 ? "…" : ""),
-            sentiment: sentiment.analyze(snippet).score,
-          };
-        })
+      const feed = await withTimeout(
+        rssParser.parseURL(`https://news.google.com/rss/search?q=${upper}`),
+        3000
       );
-      news = {
-        averageSentiment: analyses.length
-          ? analyses.reduce((s, a) => s + a.sentiment, 0) / analyses.length
-          : 0,
-        topStories: analyses,
-      };
-    } catch (_) {}
+      const items = (feed.items || []).slice(0, 5).map(i => {
+        const snippet = (i.contentSnippet || i.title || '').slice(0, 200);
+        return { title: i.title, link: i.link, snippet };
+      });
+      const scores = items.map(x => sentiment.analyze(x.snippet).score);
+      const avg = scores.length ? scores.reduce((a,b)=>a+b,0)/scores.length : 0;
+      news = { averageSentiment: avg, topStories: items };
+    } catch (_) {
+      // swallow; keep default empty news
+    }
+
+
 
     // 4) Fundamental detail (only when requested or overall)
     let fundamentalDetail = null;
