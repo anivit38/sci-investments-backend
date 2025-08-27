@@ -1333,32 +1333,39 @@ app.post("/api/check-stock", async (req, res) => {
         const userId = req.user?.userId || req.headers['x-user-id'] || null;
         const t = await getTechnicalForUser(upper, userId);
 
-        // pick only JSON-safe fields
+        // Only include plain JSON-safe fields (NO raw object)
+        const ind = t?.indicators || {};
+        const lev = t?.levels || {};
         technicalDetail = {
-          rsi14:  t?.indicators?.RSI14 ?? null,
-          macd:   t?.indicators?.MACD ?? null,
-          sma50:  t?.indicators?.SMA50 ?? null,
-          sma200: t?.indicators?.SMA200 ?? null,
-          atr14:  t?.indicators?.ATR14 ?? null,
+          rsi14:  Number.isFinite(ind.RSI14)  ? ind.RSI14  : null,
+          macd:   Number.isFinite(ind.MACD)   ? ind.MACD   : null,
+          sma50:  Number.isFinite(ind.SMA50)  ? ind.SMA50  : null,
+          sma200: Number.isFinite(ind.SMA200) ? ind.SMA200 : null,
+          atr14:  Number.isFinite(ind.ATR14)  ? ind.ATR14  : null,
           trend:  t?.trend ?? (() => {
-            const s50 = t?.indicators?.SMA50, s200 = t?.indicators?.SMA200;
-            if (s50 && s200) return s50 > s200 ? "uptrend" : (s50 < s200 ? "downtrend" : "sideways");
+            const s50 = ind.SMA50, s200 = ind.SMA200;
+            if (Number.isFinite(s50) && Number.isFinite(s200)) {
+              return s50 > s200 ? "uptrend" : (s50 < s200 ? "downtrend" : "sideways");
+            }
             return "sideways";
           })(),
-          levels: t?.levels ?? {
-            support: metrics.dayLow ?? metrics.fiftyTwoWeekLow,
-            resistance: metrics.dayHigh ?? metrics.fiftyTwoWeekHigh,
+          levels: {
+            support: Number.isFinite(lev.support)    ? lev.support    :
+                    (Number.isFinite(metrics.dayLow) ? metrics.dayLow : metrics.fiftyTwoWeekLow ?? null),
+            resistance: Number.isFinite(lev.resistance) ? lev.resistance :
+                        (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh : metrics.fiftyTwoWeekHigh ?? null),
           },
           suggestion:   t?.suggestion ?? null,
           instructions: t?.instructions ?? null,
-          chartUrl:     t?.chartUrl ?? null,              // keep a simple string
-          // DO NOT attach the whole object:
-          // raw: t
+          chartUrl:     (typeof t?.chartUrl === 'string') ? t.chartUrl : null
+          // DO NOT: raw: t
         };
       } catch (e) {
         console.warn(`TechnicalService failed for ${upper}:`, e.message);
       }
     }
+
+
 
 
     // 6) Build the base payload
@@ -1377,28 +1384,34 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // overall summary
+    const classification =
+      growthPct >= 2 ? "growth" :
+      growthPct >= 0 ? "stable" :
+      "decline";
+
     const combinedScore = +(0.2 * quickRating + 0.8 * growthPct).toFixed(2);
     const advice =
-      classification === "growth" ? "Projected to grow. Consider buying." :
-      classification === "stable" ? "Minimal growth expected. Hold or monitor." :
-                                    "Projected to decline. Consider selling or avoiding.";
+      classification === "growth"
+        ? "Projected to grow. Consider buying."
+        : classification === "stable"
+        ? "Minimal growth expected. Hold or monitor."
+        : "Projected to decline. Consider selling or avoiding.";
 
-
-                                    // Personalized Advisor Suggestion
+    // Personalized Advisor Suggestion
     let advisorSuggestion = null;
     try {
       const profile = await getUserProfile(req); // pulls from Firebase token or x-user-id
       advisorSuggestion = await buildAdvisorSuggestion({
         symbol: upper,
         profile,
-        baseAdvice: advice,                 // your existing generic advice string
+        baseAdvice: advice,
         fundamentals: fundamentalDetail,
         technical: technicalDetail,
         metrics
       });
     } catch (_) { /* swallow */ }
 
-    return res.json({
+    const payload = {
       ...base,
       fundamentalRating: quickRating.toFixed(2),
       combinedScore,
@@ -1414,12 +1427,20 @@ app.post("/api/check-stock", async (req, res) => {
       fundamentals: fundamentalDetail || {},
       technical: technicalDetail || {},
       news
+    };
+
+    try {
+      return res.json(payload);
+    } catch (e) {
+      console.error("check-stock serialize error:", e);
+      return res.status(500).json({ message: `serialize-failed: ${e.message}` });
+    }
+    } catch (err) {
+      console.error("check-stock route error:", err);
+      return res.status(500).json({ message: "Server error." });
+    }
     });
-  } catch (err) {
-    console.error("check-stock:", err);
-    return res.status(500).json({ message: "Server error." });
-  }
-});
+
 
 // POST /api/advisor/chat  (requires Firebase auth)
 function mergeFacts(oldFacts = {}, inc = {}) {
