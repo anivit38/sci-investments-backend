@@ -60,29 +60,45 @@ if (!admin.apps.length) {
 const app = express();
 app.use(express.json());
 
-// ─── CORS (single global config) ──────────────────────────────────────────────
+// ─── CORS (single global config, hardened) ─────────────────────────────────────
+app.set('trust proxy', 1); // required behind Render's proxy
+
 const ALLOWLIST = new Set([
   'https://sci-investments.web.app',
+  'https://sci-investments.firebaseapp.com',  // add Firebase's legacy host too
   'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500',
 ]);
 
+// add Vary: Origin so caches don't poison responses
+app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+
 const corsOptionsDelegate = (req, cb) => {
   const origin = req.headers.origin;
-  const isAllowed = origin && ALLOWLIST.has(origin);
+  const allowed = !origin || ALLOWLIST.has(origin);
   cb(null, {
-    origin: isAllowed, // echo only allowed origins (false blocks it)
+    origin: allowed ? origin : false,     // echo the exact allowed origin
     credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-user-id'],
+    methods: ['GET','POST','OPTIONS'],
+    allowedHeaders: ['Content-Type','Authorization','Accept','x-user-id'],
     optionsSuccessStatus: 204,
   });
 };
 
 app.use(cors(corsOptionsDelegate));
-// always answer preflight
-app.options('*', cors(corsOptionsDelegate));
+
+// Catch-all preflight handler. Keeps headers even if route/middleware throws.
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWLIST.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,x-user-id');
+  }
+  res.sendStatus(204);
+});
 
 app.use(express.static(path.join(__dirname, "../public")));
 
@@ -91,6 +107,9 @@ app.use(express.static(path.join(__dirname, "../public")));
 const newsletterRouter = require('./routes/newsletter');
 app.use('/api/newsletter', newsletterRouter);
 
+// Best-buys cache (10 min)
+const BEST_BUYS_CACHE = { ts: 0, data: null };
+const BEST_BUYS_TTL_MS = 10 * 60 * 1000;
 
 
 // ─── INDEXER ─────────────────────────────────────────────────────────────
@@ -2401,16 +2420,21 @@ app.get("/api/top-forecasted*", async (_req, res) => {
   }
 });
 
-/* 1.5️⃣  BEST-BUYS (short-term, probability-based) */
+/* 1.5️⃣  BEST-BUYS (short-term, probability-based) — cached + lighter */
 app.get("/api/best-buys*", async (_req, res) => {
   try {
-    // sample a reasonable universe (fast + cheap); you can raise to 400–600 later
+    // serve cached result if fresh
+    if (BEST_BUYS_CACHE.data && (Date.now() - BEST_BUYS_CACHE.ts) < BEST_BUYS_TTL_MS) {
+      return res.json({ picks: BEST_BUYS_CACHE.data });
+    }
+
+    // smaller universe + polite batching keeps Render happy
     const sample = symbolsList
-      .slice(0, 200)
+      .slice(0, 120) // was 200 — tighten for latency on free tier
       .map(s => (typeof s === "string" ? s : s.symbol));
 
     const results = [];
-    for (const group of chunk(sample, 12)) {           // small batches to be polite
+    for (const group of chunk(sample, 10)) {           // smaller batch than before
       const batch = await Promise.all(
         group.map(async (sym) => {
           try {
@@ -2424,8 +2448,8 @@ app.get("/api/best-buys*", async (_req, res) => {
             return {
               symbol: sym,
               price,
-              pUp: +(st.pUp * 100).toFixed(1),                // “chance to go up”
-              magnitudePct: +(st.magnitude * 100).toFixed(2), // abs move
+              pUp: +(st.pUp * 100).toFixed(1),
+              magnitudePct: +(st.magnitude * 100).toFixed(2),
               expectedReturnPct: +(st.expectedReturn * 100).toFixed(2)
             };
           } catch { return null; }
@@ -2434,17 +2458,21 @@ app.get("/api/best-buys*", async (_req, res) => {
       results.push(...batch.filter(Boolean));
     }
 
-    // Rank by highest probability first, then by (+) expected return
-    results.sort(
-      (a, b) => (b.pUp - a.pUp) || (b.expectedReturnPct - a.expectedReturnPct)
-    );
+    results.sort((a, b) => (b.pUp - a.pUp) || (b.expectedReturnPct - a.expectedReturnPct));
 
-    return res.json({ picks: results.slice(0, 5) });
+    const picks = results.slice(0, 5);
+
+    // cache & return
+    BEST_BUYS_CACHE.ts = Date.now();
+    BEST_BUYS_CACHE.data = picks;
+
+    return res.json({ picks });
   } catch (e) {
     console.error("best-buys:", e.message);
     return res.status(500).json({ picks: [] });
   }
 });
+
 
 
 
