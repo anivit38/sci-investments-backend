@@ -246,6 +246,31 @@ async function callChatServiceAdaptive({ system, messages }) {
 }
 
 
+// ultra-light quote: price/vol/day/52w only
+async function getLightQuote(symbol) {
+  try {
+    const q = await withTimeout(
+      yahooFinance.quote(
+        symbol,
+        {
+          fields: [
+            "regularMarketPrice",
+            "regularMarketVolume",
+            "regularMarketDayHigh",
+            "regularMarketDayLow",
+            "fiftyTwoWeekHigh",
+            "fiftyTwoWeekLow",
+          ],
+        },
+        { fetchOptions: requestOptions }
+      ),
+      6000
+    );
+    return q || null;
+  } catch { return null; }
+}
+
+
 
 // ─── BODY PARSER ───────────────────────────────────────────────────────────────
 app.use(bodyParser.json({ limit: '1mb' }));
@@ -2056,7 +2081,7 @@ async function computeShortTermExpectedMove(symbol) {
 
 
 /*──────────────────────────────────────────
-|  13) FINDER (v2.1, self-contained)       |
+|  13) FINDER (v2.2, light+heavy passes)   |
 └──────────────────────────────────────────*/
 const finderRouter = express.Router();
 finderRouter.use("/find-stocks", findStockLimiter);
@@ -2069,7 +2094,7 @@ function getCached(key, ttlMs = 60 * 60 * 1000) {
   return hit && (Date.now() - hit.ts < ttlMs) ? hit.val : null;
 }
 
-// --- helpers ---
+// --- helpers (same as before) ---
 function extractQuoteFeatures(yq) {
   const p  = yq?.price || {};
   const sd = yq?.summaryDetail || {};
@@ -2079,40 +2104,30 @@ function extractQuoteFeatures(yq) {
     price: p.regularMarketPrice ?? null,
     vol:   p.regularMarketVolume ?? null,
     avgVol: sd.averageDailyVolume3Month ?? p.regularMarketVolume ?? 0,
-
     pe: sd.trailingPE ?? null,
     ps: sd.priceToSalesTrailing12Months ?? null,
     pb: sd.priceToBook ?? null,
     div: sd.dividendYield ?? null,
-
     wkHi: sd.fiftyTwoWeekHigh ?? null,
     wkLo: sd.fiftyTwoWeekLow ?? null,
     dayHi: p.regularMarketDayHigh ?? null,
     dayLo: p.regularMarketDayLow ?? null,
-
     growth: fd.earningsGrowth ?? null,
     debtToEq: fd.debtToEquity ?? null,
     grossMargin: fd.grossMargins ?? null,
     opMargin: fd.operatingMargins ?? null,
-
-    rsi14: null // optional future hook
+    rsi14: null
   };
 }
 
 function baseScore(f) {
   let score = 0; const reasons = [];
-
-  // Liquidity
   if (f.avgVol && f.avgVol >= 1_000_000) { score += 4; reasons.push("Good liquidity (avg vol ≥1M)"); }
   else if (f.avgVol && f.avgVol >= 250_000) { score += 2; reasons.push("OK liquidity (avg vol ≥250k)"); }
   else { reasons.push("Thinly traded"); }
-
-  // Valuation sanity
   if (f.pe && f.pe > 4 && f.pe < 30) { score += 3; reasons.push("Reasonable PE"); }
   else if (f.ps && f.ps < 8) { score += 1; reasons.push("P/S acceptable"); }
   else { score -= 1; reasons.push("Valuation rich/unknown"); }
-
-  // Growth/profitability/quality
   if (typeof f.growth === "number") {
     if (f.growth > 0.15) { score += 4; reasons.push("Strong earnings growth"); }
     else if (f.growth > 0.03) { score += 2; reasons.push("Modest earnings growth"); }
@@ -2124,20 +2139,15 @@ function baseScore(f) {
   }
   if (typeof f.grossMargin === "number" && f.grossMargin > 0.4) { score += 2; reasons.push("Healthy gross margin"); }
   if (typeof f.opMargin === "number" && f.opMargin > 0.15) { score += 2; reasons.push("Solid operating margin"); }
-
-  // 52w position
   if (f.wkHi != null && f.wkLo != null && f.price != null && f.wkHi > f.wkLo) {
     const pos = (f.price - f.wkLo) / (f.wkHi - f.wkLo);
     if (pos < 0.3) { score += 2; reasons.push("Near 52w lows (value tilt)"); }
     else if (pos > 0.9) { score -= 1; reasons.push("Near 52w highs (breakout risk)"); }
   }
-
-  // Optional RSI
   if (typeof f.rsi14 === "number") {
     if (f.rsi14 < 30) { score += 2; reasons.push("RSI oversold"); }
     if (f.rsi14 > 70) { score -= 1; reasons.push("RSI overbought"); }
   }
-
   return { score, reasons };
 }
 
@@ -2171,28 +2181,18 @@ async function safeForecast(sym, price) {
 // ---------- main route ----------
 finderRouter.post("/find-stocks", async (req, res) => {
   try {
-    let {
-      stockType,            // "growth" | "stable"
-      exchange,             // "NYSE" | "NASDAQ" | "TSX"
-      minPrice,
-      maxPrice,
-      horizon = "short",    // "short" | "long"
-      minGrowthPct = 0.8,   // floor for growth names
-      topK = 30,
-      universeLimit = 600,
-      includeAdvisor = false      // renamed to avoid any shadowing
+    const {
+      stockType = "growth",         // 'growth' | 'stable'
+      exchange = "NASDAQ",          // 'NASDAQ' | 'NYSE' | 'TSX'
+      minPrice = 5,
+      maxPrice = 150,
+      horizon  = "short",           // 'short' | 'long'
+      topK = 20,
+      universeLimit = 200,
+      includeAdvisor = false,
+      // floor for growth screen (only used when stockType==='growth')
+      minGrowthPct = stockType === "growth" ? 1 : -100
     } = req.body || {};
-
-    if (!stockType || !exchange || typeof minPrice !== "number" || typeof maxPrice !== "number") {
-      return res.status(400).json({ message: "Bad finder parameters." });
-    }
-
-    horizon       = (""+horizon).toLowerCase()==="long" ? "long" : "short";
-    minGrowthPct  = Math.max(0, +minGrowthPct || 0.8);
-    stockType     = stockType.toLowerCase();
-    exchange      = exchange.toUpperCase();
-    topK          = Math.min(Math.max(+topK || 30, 10), 60);
-    universeLimit = Math.min(Math.max(+universeLimit || 600, 100), 2000);
 
     // 1) Universe by exchange
     const tickers = symbolsList
@@ -2200,13 +2200,42 @@ finderRouter.post("/find-stocks", async (req, res) => {
       .map(s => (typeof s === "string" ? s : s.symbol))
       .slice(0, universeLimit);
 
-    // 2) Quote + cheap horizon prefilter
-    const quoted = await mapLimit(tickers, 18, async (sym) => {
-      const yq = getCached(`q:${sym}`) || await fetchStockData(sym);
-      if (yq) setCached(`q:${sym}`, yq);
+    // 2) LIGHT PASS (price/volume only) — very fast
+    const lightRows = (await mapLimit(tickers, 12, async (sym) => {
+      const q = await getLightQuote(sym);
+      if (!q) return null;
+
+      const price = q.regularMarketPrice;
+      if (!price || price < minPrice || price > maxPrice) return null;
+
+      return {
+        symbol: sym,
+        price,
+        vol: q.regularMarketVolume || 0,
+        wkHi: q.fiftyTwoWeekHigh ?? null,
+        wkLo: q.fiftyTwoWeekLow ?? null,
+        dayHi: q.regularMarketDayHigh ?? null,
+        dayLo: q.regularMarketDayLow ?? null,
+      };
+    })).filter(Boolean);
+
+    // prefer liquid names; keep a small working set
+    lightRows.sort((a,b) => (b.vol - a.vol));
+    const working = lightRows.slice(0, Math.max(24, topK * 2));  // SMALL slice
+
+    // 2.5) HEAVY PASS (quoteSummary) only on "working" set
+    const prelim = (await mapLimit(working, 6, async (w) => {
+      const yq = await fetchStockData(w.symbol);
+      if (!yq) return null;
 
       const f = extractQuoteFeatures(yq);
-      if (!f.price || f.price < minPrice || f.price > maxPrice) return null;
+      // carry over the fast fields so we never miss basics
+      f.price  = f.price  ?? w.price;
+      f.avgVol = f.avgVol ?? w.vol;
+      f.wkHi   = f.wkHi   ?? w.wkHi;
+      f.wkLo   = f.wkLo   ?? w.wkLo;
+      f.dayHi  = f.dayHi  ?? w.dayHi;
+      f.dayLo  = f.dayLo  ?? w.dayLo;
 
       const bs = baseScore(f);
 
@@ -2219,22 +2248,20 @@ finderRouter.post("/find-stocks", async (req, res) => {
           const pos = (f.price - f.wkLo) / (f.wkHi - f.wkLo);
           if (pos > 0.95) { pass = false; horizonNotes.push("Too extended near 52w high"); }
         }
-        if (typeof f.debtToEq === "number" && f.debtToEq > 2.5) { pass = false; horizonNotes.push("Excess leverage for short term"); }
+        if (typeof f.debtToEq === "number" && f.debtToEq > 2.5) { pass = false; horizonNotes.push("Excess leverage"); }
       } else {
         if (bs.score < 10) { pass = false; horizonNotes.push("Quality score below long-term bar (10)"); }
         if (typeof f.debtToEq === "number" && f.debtToEq > 1.2) { pass = false; horizonNotes.push("Debt/equity too high"); }
         if (typeof f.grossMargin === "number" && f.grossMargin < 0.3) { pass = false; horizonNotes.push("Gross margin <30%"); }
       }
-
       if (!pass) return null;
-      return { symbol: sym, features: f, base: bs, horizonNotes };
-    });
 
-    const prelim = quoted.filter(Boolean);
+      return { symbol: w.symbol, features: f, base: bs, horizonNotes };
+    })).filter(Boolean);
 
-    // 3) Rank & slice for forecasting
+    // 3) Rank & slice for forecasting (smaller than before)
     prelim.sort((a,b) => (b.base.score - a.base.score) || ((b.features.avgVol||0) - (a.features.avgVol||0)));
-    const slice = prelim.slice(0, Math.max(topK * 3, 60));
+    const slice = prelim.slice(0, Math.max(18, topK * 2));
 
     // 4) Forecast pass on slice
     const forecasted = await mapLimit(slice, 8, async (row) => {
@@ -2245,10 +2272,9 @@ finderRouter.post("/find-stocks", async (req, res) => {
       let classification = "unknown";
 
       if (horizon === "short") {
-        // 🔹 NEW: probability × magnitude model (T+1)
         const st = await computeShortTermExpectedMove(symbol).catch(() => null);
         if (st && features.price) {
-          const expR = st.expectedReturn;            // signed decimal (e.g., 0.008 = 0.8%)
+          const expR = st.expectedReturn;  // signed decimal
           growthPct = expR * 100;
           forecastPrice = +(features.price * (1 + expR)).toFixed(2);
           horizonNotes.push(
@@ -2256,7 +2282,6 @@ finderRouter.post("/find-stocks", async (req, res) => {
           );
         }
       } else {
-        // Long-term: keep your existing forecast path
         const fc = await safeForecast(symbol, features.price);
         if (fc && features.price) {
           growthPct = ((fc - features.price) / features.price) * 100;
@@ -2281,7 +2306,6 @@ finderRouter.post("/find-stocks", async (req, res) => {
         classification
       };
     });
-
 
     // 5) Policy filters (type + horizon) + minGrowth floor
     const accept = (row) => {
@@ -2318,57 +2342,44 @@ finderRouter.post("/find-stocks", async (req, res) => {
     const out = filtered.slice(0, topK);
 
     // === optional per-pick AI Advisor (topK only) ===
-if (includeAdvisor && out.length) {
-  try {
-    const hasAuthHeader = /^Bearer\s+/.test(req.headers.authorization || "");
-    const hasUidHeader  = !!req.headers['x-user-id'];
-    const profile = await getUserProfile(req); // from your helper
-
-    await mapLimit(out, 3, async (row) => {
-      const baseAdvice =
-        row.classification === "growth"
-          ? `Projected to grow ~${row.growthPct?.toFixed(2)}%. Quality score ${row.score}.`
-          : row.classification === "stable"
-          ? `Projected to be stable (~${row.growthPct?.toFixed(2)}%). Quality score ${row.score}.`
-          : `Uncertain projection. Quality score ${row.score}.`;
-
-      let suggestion = null;
+    if (includeAdvisor && out.length) {
       try {
-        suggestion = await buildAdvisorSuggestion({
-          symbol: row.symbol,
-          profile,          // may be null; CF prompt already tolerates {}
-          baseAdvice,
-          fundamentals: null,
-          technical: null,
-          metrics: {
-            currentPrice: row.price,
-            avgVolume: row.avgVol,
-            growthPct: row.growthPct,
-            qualityScore: row.score,
-            classification: row.classification,
-          },
+        const profile = await getUserProfile(req); // may be null
+        await mapLimit(out, 3, async (row) => {
+          const baseAdvice =
+            row.classification === "growth"
+              ? `Projected to grow ~${row.growthPct?.toFixed(2)}%. Quality score ${row.score}.`
+              : row.classification === "stable"
+              ? `Projected to be stable (~${row.growthPct?.toFixed(2)}%). Quality score ${row.score}.`
+              : `Uncertain projection. Quality score ${row.score}.`;
+
+          const suggestion = await buildAdvisorSuggestion({
+            symbol: row.symbol,
+            profile,
+            baseAdvice,
+            fundamentals: null,
+            technical: null,
+            metrics: {
+              currentPrice: row.price,
+              avgVolume: row.avgVol,
+              growthPct: row.growthPct,
+              qualityScore: row.score,
+              classification: row.classification,
+            },
+          }).catch(() => null);
+
+          if (suggestion && String(suggestion).trim()) {
+            row.advisorSuggestion = String(suggestion).trim();
+          } else if (profile) {
+            row.advisorSuggestion = `Advisor Suggestion: ${baseAdvice}`;
+          } else {
+            row.advisorSuggestion = "Advisor Suggestion: Sign in for a personalized plan, or open the Stock Checker for deeper analysis.";
+          }
         });
       } catch (e) {
-        console.warn("Advisor CF error:", e.message);
+        console.warn("Finder advisor step:", e.message);
       }
-
-      // Decide what to show:
-      if (suggestion && String(suggestion).trim()) {
-        row.advisorSuggestion = String(suggestion).trim();
-      } else if (profile || hasAuthHeader || hasUidHeader) {
-        // You ARE signed in (or at least sent identity), but CF gave nothing → show generic, not "sign in"
-        row.advisorSuggestion = `Advisor Suggestion: ${baseAdvice}`;
-      } else {
-        // Truly anonymous → show the sign-in nudge
-        row.advisorSuggestion = "Advisor Suggestion: Sign in for a personalized plan, or open the Stock Checker for deeper analysis.";
-      }
-    });
-  } catch (e) {
-    console.warn("Finder advisor step:", e.message);
-  }
-}
-
-
+    }
 
     return res.json({ stocks: out, meta: { horizon, minGrowthPct, topK, universeLimit } });
   } catch (err) {
@@ -2379,6 +2390,7 @@ if (includeAdvisor && out.length) {
 
 
 app.use(["/api", "/finder/api"], finderRouter);
+
 
 
 /*──────────────────────────────────────────
