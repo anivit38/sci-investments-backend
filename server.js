@@ -1043,6 +1043,16 @@ const findStockLimiter = rateLimit({
 |  11) Auth Endpoints                      |
 └──────────────────────────────────────────*/
 app.get("/", (_req, res) => res.send("✅ Combined Server is running!"));
+// Lightweight health check for the dashboard warm-up
+app.get("/api/health", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    now: new Date().toISOString(),
+  });
+});
+
 
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
