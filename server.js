@@ -2717,20 +2717,22 @@ async function refreshAllHistoricalData() {
   }
 }
 
-// initial run at boot
-refreshAllHistoricalData();
-
-// run once every 24 h
-setInterval(() => {
-  console.log("⏰ Running daily refreshAllHistoricalData…");
-  refreshAllHistoricalData();
-}, ONE_DAY);
+ if (!DISABLE_BG) {
+   // initial run at boot
+   refreshAllHistoricalData();
+   // run once every 24 h
+   setInterval(() => {
+     console.log("⏰ Running daily refreshAllHistoricalData…");
+     refreshAllHistoricalData();
+   }, ONE_DAY);
+ }
 
 
 // ────────────────────────────────────────────────────────────
 // 18-C) Daily fundamentals refresh at 2:00 AM ET, weekdays
 // ────────────────────────────────────────────────────────────
 const cron = require('node-cron');
+const DISABLE_BG = process.env.DISABLE_BACKGROUND_JOBS === '1';
 
 // Build a watchlist — prefer portfolio if present, with a small fallback
 const watchlist = Array.from(new Set(
@@ -2747,10 +2749,12 @@ async function pullCompanyFundamentals(symbol) {
   }
 }
 
-cron.schedule('0 2 * * 1-5', () => {
-  console.log('⏰ Running daily pullCompanyFundamentals…');
-  watchlist.forEach(sym => pullCompanyFundamentals(sym));
-}, { timezone: 'America/New_York' });
+ if (!DISABLE_BG) {
+   cron.schedule('0 2 * * 1-5', () => {
+     console.log('⏰ Running daily pullCompanyFundamentals…');
+     watchlist.forEach(sym => pullCompanyFundamentals(sym));
+   }, { timezone: 'America/New_York' });
+ }
 
 
 /*──────────────────────────────────────────
