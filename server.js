@@ -108,6 +108,47 @@ app.use(express.static(path.join(__dirname, "../public")));
 
 
 
+// put this helper near the top of server.js (or above the route)
+function normalizeOnboarding(a = {}) {
+  const n = { ...a };
+
+  // Map portfolio buckets → representative numbers
+  const psMap = {
+    '<10K':       5_000,
+    '10K-50K':    30_000,
+    '50K-200K':   125_000,
+    '200K+':      250_000
+  };
+  if (typeof a.portfolioSize === 'string') {
+    if (psMap[a.portfolioSize]) {
+      n.portfolioSizeBucket = a.portfolioSize;  // keep the chosen bucket (string)
+      n.portfolioSize = psMap[a.portfolioSize]; // store a Number for the schema
+    } else {
+      // fall back: strip non-digits like "$" and "K" and try to parse
+      const val = Number(String(a.portfolioSize).replace(/[^\d.]/g, ''));
+      n.portfolioSize = Number.isFinite(val) ? val : null;
+    }
+  }
+
+  // Make sure numeric fields are actually numbers
+  const toNum = (x) => (x === '' || x == null ? null : Number(x));
+  n.currentAge   = toNum(a.currentAge);
+  n.retireAge    = toNum(a.retireAge);
+  n.retireIncome = toNum(a.retireIncome);
+
+  // % of income to invest: "<10%" → 10, "10-25%" → 10 (use first number)
+  if (typeof a.investPct === 'string') {
+    const m = a.investPct.match(/(\d+(\.\d+)?)/);
+    if (m) n.investPct = Number(m[1]);
+    n.investPctBucket = a.investPct; // keep the original label too
+  }
+
+  return n;
+}
+
+
+
+
 const newsletterRouter = require('./routes/newsletter');
 app.use('/api/newsletter', newsletterRouter);
 
@@ -707,11 +748,12 @@ app.post(
     try {
       const userId  = req.user.userId;
       const answers = req.body;
+      const payload  = normalizeOnboarding(answers);
 
       // 1) Save all answers into your UserProfile collection
       await UserProfile.findOneAndUpdate(
         { userId },
-        { userId, ...answers },
+        { userId, ...payload },
         { upsert: true, new: true }
       );
 
@@ -751,12 +793,11 @@ Please generate a friendly, concise welcome message (under 100 words) that:
       // 4) Send back welcome text
       return res.json({ welcomeText: cfResp.data.text });
     } catch (err) {
-      console.error("completeOnboarding error:", err);
-      const status = err.response?.status || 500;
-      return res.status(status).json({ error: err.message });
-    }
+    console.error("completeOnboarding error:", err);
+    const status = err.response?.status || 500;
+    return res.status(status).json({ error: err.message });
   }
-);
+});
 
 // ─── ROUTES MOUNT ──────────────────────────────────────────────────────────────
 app.use('/api', analyzeRouter);
