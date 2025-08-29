@@ -35,6 +35,10 @@ const pdfParse  = require('pdf-parse');
 const chokidar  = require('chokidar');
 const RESEARCH_DIR = path.join(__dirname, '..', 'research'); // your folder outside backend
 
+const cron = require('node-cron');
+const DISABLE_BG = process.env.DISABLE_BACKGROUND_JOBS === '1';
+
+
 // ---- Firebase Admin init (uses GOOGLE_SERVICE_ACCOUNT_KEY from env) ----
 const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
 if (!raw) {
@@ -2731,8 +2735,6 @@ async function refreshAllHistoricalData() {
 // ────────────────────────────────────────────────────────────
 // 18-C) Daily fundamentals refresh at 2:00 AM ET, weekdays
 // ────────────────────────────────────────────────────────────
-const cron = require('node-cron');
-const DISABLE_BG = process.env.DISABLE_BACKGROUND_JOBS === '1';
 
 // Build a watchlist — prefer portfolio if present, with a small fallback
 const watchlist = Array.from(new Set(
