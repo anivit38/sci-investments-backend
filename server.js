@@ -18,6 +18,7 @@ const yahooFinance = require('yahoo-finance2').default;
 const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
+const https      = require('https'); // keep-alive agent
 const { getFundamentals } = require('./services/FundamentalsService');
 const { getTechnical, getTechnicalForUser } = require('./services/TechnicalService');
 const { getIntradayIndicators } = require('./services/IntradayService'); 
@@ -37,7 +38,9 @@ const RESEARCH_DIR = path.join(__dirname, '..', 'research'); // your folder outs
 
 const cron = require('node-cron');
 const DISABLE_BG = process.env.DISABLE_BACKGROUND_JOBS === '1';
-
+const sciV1 = require('./services/sciV1Engine');
+const modelPath = path.join(__dirname, 'model', 'sci_v1_regression.json');
+sciV1.loadModelFromDisk(modelPath);
 
 // ---- Firebase Admin init (uses GOOGLE_SERVICE_ACCOUNT_KEY from env) ----
 const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -47,10 +50,14 @@ if (!raw) {
 }
 let serviceAccount;
 try {
-  serviceAccount = JSON.parse(raw); // <- this is the line you asked about
-} catch (e) {
-  console.error('GOOGLE_SERVICE_ACCOUNT_KEY is not valid JSON (did you paste one-line JSON into .env?):', e.message);
-  process.exit(1);
+  serviceAccount = JSON.parse(raw);
+} catch (_) {
+  try {
+    serviceAccount = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+  } catch (e2) {
+    console.error('GOOGLE_SERVICE_ACCOUNT_KEY invalid (raw or base64):', e2.message);
+    process.exit(1);
+  }
 }
 
 if (!admin.apps.length) {
@@ -59,17 +66,17 @@ if (!admin.apps.length) {
   });
 }
 
-
 // ---- Express app ----
 const app = express();
-app.use(express.json());
+// set JSON body limit explicitly
+app.use(express.json({ limit: '1mb' }));
 
 // ─── CORS (single global config, hardened) ─────────────────────────────────────
 app.set('trust proxy', 1); // required behind Render's proxy
 
 const ALLOWLIST = new Set([
   'https://sci-investments.web.app',
-  'https://sci-investments.firebaseapp.com',  // add Firebase's legacy host too
+  'https://sci-investments.firebaseapp.com',
   'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500',
@@ -85,7 +92,8 @@ const corsOptionsDelegate = (req, cb) => {
     origin: allowed ? origin : false,     // echo the exact allowed origin
     credentials: true,
     methods: ['GET','POST','OPTIONS'],
-    allowedHeaders: ['Content-Type','Authorization','Accept','x-user-id'],
+    // 🔒 removed 'x-user-id'
+    allowedHeaders: ['Content-Type','Authorization','Accept'],
     optionsSuccessStatus: 204,
   });
 };
@@ -99,14 +107,13 @@ app.options('*', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,x-user-id');
+    // 🔒 removed 'x-user-id'
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept');
   }
-  res.sendStatus(204);
+  res.setHeader('Access-Control-Max-Age', '600');
+  return res.sendStatus(204);
 });
-
 app.use(express.static(path.join(__dirname, "../public")));
-
-
 
 // put this helper near the top of server.js (or above the route)
 function normalizeOnboarding(a = {}) {
@@ -146,16 +153,12 @@ function normalizeOnboarding(a = {}) {
   return n;
 }
 
-
-
-
 const newsletterRouter = require('./routes/newsletter');
 app.use('/api/newsletter', newsletterRouter);
 
 // Best-buys cache (10 min)
 const BEST_BUYS_CACHE = { ts: 0, data: null };
 const BEST_BUYS_TTL_MS = 10 * 60 * 1000;
-
 
 // simple timeout wrapper for any promise
 function withTimeout(promise, ms = 4000) {
@@ -164,10 +167,6 @@ function withTimeout(promise, ms = 4000) {
     new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))
   ]);
 }
-
-
-
-
 
 // ─── INDEXER ─────────────────────────────────────────────────────────────
 const researchIndex = new Map(); // key: SYMBOL -> { docs:[{title, date, text, path}], mergedText }
@@ -210,7 +209,6 @@ if (fs.existsSync(RESEARCH_DIR)) {
 }
 
 // ────── ACCESSOR ─────────────────────────────────────────────────────────────────────
-
 function getResearchForSymbol(symbol) {
   const e = researchIndex.get(String(symbol || '').toUpperCase());
   if (!e) return null;
@@ -221,6 +219,11 @@ function getResearchForSymbol(symbol) {
   return joined.slice(0, 120000); // ~120k chars max (you can lower)
 }
 
+// ─── Security headers & Compression ─────────────────────────────────────────────────────────────
+const helmet = require('helmet');
+const compression = require('compression');
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }}));
+app.use(compression());
 
 // ─── CHAT ─────────────────────────────────────────────────────────────
 
@@ -290,6 +293,8 @@ async function callChatServiceAdaptive({ system, messages }) {
   return ''; // important: don't throw → caller can build an offline reply
 }
 
+// create a keep-alive agent for Yahoo requests
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 // ultra-light quote: price/vol/day/52w only
 async function getLightQuote(symbol) {
@@ -315,12 +320,8 @@ async function getLightQuote(symbol) {
   } catch { return null; }
 }
 
-
-
 // ─── BODY PARSER ───────────────────────────────────────────────────────────────
-app.use(bodyParser.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
-
 
 // ─── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
 async function authenticate(req, res, next) {
@@ -341,7 +342,6 @@ async function authenticate(req, res, next) {
   }
 }
 
-
 // ─── BIG BRAIN ────────────────────────────────────────────────────────
 
 // server.js (add near other helpers)
@@ -353,7 +353,6 @@ async function buildResearchPack(symbol) {
   const summary   = y?.summaryDetail || {};
   const finData   = y?.financialData || {};
   const researchText = getResearchForSymbol(symbol);
-
 
   const checkerMetrics = {
     volume:           priceData.regularMarketVolume ?? null,
@@ -482,7 +481,7 @@ async function buildResearchPack(symbol) {
   // light news
   let news = [];
   try {
-    const feed = await rssParser.parseURL(`https://news.google.com/rss/search?q=${symbol}`);
+    const feed = await rssParser.parseURL(`https://news.google.com/rss/search?q=${encodeURIComponent(symbol)}`);
     news = (feed.items || []).slice(0, 5).map(i => ({ title: i.title, url: i.link }));
   } catch {}
 
@@ -518,23 +517,22 @@ async function buildResearchPack(symbol) {
   };
 }
 
-
 const ChatMemory = require('./models/ChatMemory');
 
-// --- Helper: get user profile from auth header or x-user-id ---
+// --- Helper: get user profile from auth header (no x-user-id)
 async function getUserProfile(req) {
   try {
-    let userId = null;
+    // prefer req.user populated by authenticate(); otherwise verify Bearer softly
+    if (req.user?.userId) {
+      return await UserProfile.findOne({ userId: req.user.userId }).lean();
+    }
     const header = req.headers.authorization || '';
     if (header.startsWith('Bearer ')) {
       const idToken = header.split(' ')[1];
       const decoded = await admin.auth().verifyIdToken(idToken);
-      userId = decoded.uid;
-    } else if (req.headers['x-user-id']) {
-      userId = req.headers['x-user-id'];
+      return await UserProfile.findOne({ userId: decoded.uid }).lean();
     }
-    if (!userId) return null;
-    return await UserProfile.findOne({ userId }).lean();
+    return null;
   } catch (e) {
     console.warn('getUserProfile:', e.message);
     return null;
@@ -563,8 +561,8 @@ Return a concise paragraph (<=120 words) that starts with "Advisor Suggestion:".
 User profile (JSON): ${JSON.stringify(profile || {}, null, 2)}
 Symbol: ${symbol}
 Metrics: ${JSON.stringify(metrics || {})}
-Fundamentals: ${JSON.stringify(fundamentals ? {
-  valuation: fundamentals.valuation, rating: fundamentals.rating, weaknesses: fundamentals.weaknesses
+Fundamentals: ${JSON.stringify(techNorm ? {
+  valuation: fundamentals?.valuation, rating: fundamentals?.rating, weaknesses: fundamentals?.weaknesses
 } : {})}
 Technical: ${JSON.stringify(techNorm || {})}
 Raw system advice: ${baseAdvice || "N/A"}
@@ -580,8 +578,6 @@ If the raw advice conflicts with the user's risk tolerance, horizon, diversifica
     return null;
   }
 }
-
-
 
 // ─── AI Advisor Picks (personalized from chat memory) ─────────────────────────
 // ─── AI Advisor Picks (from chats + for-you discovery) ───────────────────────
@@ -725,9 +721,6 @@ app.get('/api/ai-picks', authenticate, async (req, res) => {
   }
 });
 
-
-
-
 /*──────────────────────────────────────────
 |  GLOBAL DATA                             |
 └──────────────────────────────────────────*/
@@ -736,7 +729,6 @@ const symbolsList = JSON.parse(
 );
 
 const { predictNextDay } = require("./data/trainGRU"); // GRU helper
-
 
 // Make sure this comes after `app.use(bodyParser.json());`
 // Complete onboarding: save profile + get welcome text from CF
@@ -804,15 +796,13 @@ app.use('/api', analyzeRouter);
 app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
 app.use('/api', advisorRouter);
 
-
 /* extras */
 const crypto      = require("crypto");
 const fetchNative = require("node-fetch");
 const cheerio     = require("cheerio");
 
-
 /*──────────────────────────────────────────
-|  TIME‑SERIES CONFIG                      |
+|  TIME-SERIES CONFIG                      |
 └──────────────────────────────────────────*/
 const TIME_SERIES_WINDOW    = 30;
 const FORECAST_FEATURE_KEYS = [
@@ -892,7 +882,12 @@ mongoose.connect(process.env.MONGODB_URI||"mongodb://127.0.0.1:27017/sci_investm
   socketTimeoutMS:45000,
 }).then(()=>console.log("✅ Connected to MongoDB"))
   .catch(e=>console.error("❌ MongoDB:",e.message));
-mongoose.set("debug",true);
+if (process.env.NODE_ENV !== 'production') {
+  mongoose.set('debug', true);
+}
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET required in production');
+}
 
 /*──────────────────────────────────────────
 |  Forecast model load (unchanged)         |
@@ -911,18 +906,18 @@ let forecastModel=null, normalizationParams=null;
 |  Caches                                  |
 └──────────────────────────────────────────*/
 const forecastCache={};
-const FORECAST_CACHE_TTL = 24*60*60*1000; // 24 h
+const FORECAST_CACHE_TTL = 24*60*60*1000; // 24 h
 
 const stockDataCache={};
-const CACHE_TTL=60*60*1000;               // 60 min (was 15)
+const CACHE_TTL=60*60*1000;               // 60 min (was 15)
 
 /*──────────────────────────────────────────
 |  Yahoo fetch wrapper                     |
 └──────────────────────────────────────────*/
-
 const requestOptions = {
   headers: { "User-Agent": "Mozilla/5.0" },
   redirect: "follow",
+  agent: keepAliveAgent, // keep-alive for speed
 };
 
 async function fetchStockData(symbol) {
@@ -984,7 +979,7 @@ async function fetchStockData(symbol) {
 }
 
 /*──────────────────────────────────────────
-|  Time‑series from cached CSV             |
+|  Time-series from cached CSV             |
 └──────────────────────────────────────────*/
 async function fetchTimeSeriesData(symbol,days=TIME_SERIES_WINDOW){
   const hist=getCachedHistoricalData(symbol);
@@ -1043,32 +1038,26 @@ async function buildForecastPrice(symbol, price){
   return final;
 }
 
-
-
 /*──────────────────────────────────────────
 |  Symbol validator (used by multiple routes)
 └──────────────────────────────────────────*/
 function isValidSymbol(s) {
   if (!s) return false;
   const sym = String(s).trim().toUpperCase();
-
-  // Keep the pattern conservative; expand if you store dots/hyphens in symbols.json
+  // conservative pattern; relax if your symbols.json includes . or -
   if (!/^[A-Z]{1,5}$/.test(sym)) return false;
-
-  // Check against your symbols.json
   return symbolsList.some(x => (typeof x === 'string' ? x : x.symbol) === sym);
 }
 
-
 /*──────────────────────────────────────────
-|  Rate‑limits                             |
+|  Rate-limits                             |
 └──────────────────────────────────────────*/
 const stockCheckerLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.method === 'OPTIONS',   // <-- key
+  skip: (req) => req.method === 'OPTIONS',
 });
 app.use("/api/check-stock", stockCheckerLimiter);
 
@@ -1079,6 +1068,25 @@ const findStockLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => req.method === 'OPTIONS',
 });
+
+const heavyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
+});
+app.use(['/api/sci/score', '/api/sci/train', '/api/intraday', '/api/stock-history'], heavyLimiter);
+
+// put near other limiters
+const communityLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
+});
+app.use('/api/community-posts', communityLimiter);
 
 /*──────────────────────────────────────────
 |  ===  REST ENDPOINTS (all original)  === |
@@ -1097,7 +1105,6 @@ app.get("/api/health", (_req, res) => {
     now: new Date().toISOString(),
   });
 });
-
 
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
@@ -1145,8 +1152,6 @@ app.get("/protected", (req, res) => {
     return res.status(401).json({ message: "Invalid or expired token." });
   }
 });
-
-
 
 app.get("/api/fundamentals/:symbol", async (req, res) => {
   const symbol = (req.params.symbol || "").toUpperCase();
@@ -1220,9 +1225,6 @@ app.get("/api/fundamentals/:symbol", async (req, res) => {
   }
 });
 
-
-
-
 // GET /api/technical/:symbol
 app.get('/api/technical/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
@@ -1234,7 +1236,6 @@ app.get('/api/technical/:symbol', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /*──────────────────────────────────────────
 |  12) STOCK CHECKER                       |
@@ -1304,7 +1305,6 @@ app.post("/api/check-stock", async (req, res) => {
       if (pos > 0.8) quickRating -= 2;
     }
 
-    // 2) Forecast (short horizon)
     // 2) Forecast (short horizon — expected move model)
     let forecastPrice = metrics.currentPrice;
     let growthPct = 0;
@@ -1329,13 +1329,11 @@ app.post("/api/check-stock", async (req, res) => {
       } catch { /* keep defaults */ }
     }
 
-
-    // 3) News sentiment — LITE (RSS only, no per-article fetch)
-    // keeps this endpoint fast/reliable on free hosting
+    // 3) News sentiment — LITE (RSS only)
     let news = { averageSentiment: 0, topStories: [] };
     try {
       const feed = await withTimeout(
-        rssParser.parseURL(`https://news.google.com/rss/search?q=${upper}`),
+        rssParser.parseURL(`https://news.google.com/rss/search?q=${encodeURIComponent(upper)}`),
         3000
       );
       const items = (feed.items || []).slice(0, 5).map(i => {
@@ -1349,15 +1347,12 @@ app.post("/api/check-stock", async (req, res) => {
       // swallow; keep default empty news
     }
 
-
-
     // 4) Fundamental detail (only when requested or overall)
     let fundamentalDetail = null;
     if (category === "fundamental" || category === "overall") {
       try {
         const fund = await getFundamentals(upper);
         if (fund) {
-          // keep your valuation fallback logic
           const { peRatio, priceToSales } = fund.ratios || {};
           const { peRatio: bmPE, priceToSales: bmPS } = fund.benchmarks || {};
           const cp = metrics.currentPrice;
@@ -1410,10 +1405,9 @@ app.post("/api/check-stock", async (req, res) => {
     let technicalDetail = null;
     if (category === "technical" || category === "overall") {
       try {
-        const userId = req.user?.userId || req.headers['x-user-id'] || null;
+        const userId = req.user?.userId || null; // 🔒 no x-user-id
         const t = await getTechnicalForUser(upper, userId);
 
-        // Only include plain JSON-safe fields (NO raw object)
         const ind = t?.indicators || {};
         const lev = t?.levels || {};
         technicalDetail = {
@@ -1438,15 +1432,11 @@ app.post("/api/check-stock", async (req, res) => {
           suggestion:   t?.suggestion ?? null,
           instructions: t?.instructions ?? null,
           chartUrl:     (typeof t?.chartUrl === 'string') ? t.chartUrl : null
-          // DO NOT: raw: t
         };
       } catch (e) {
         console.warn(`TechnicalService failed for ${upper}:`, e.message);
       }
     }
-
-
-
 
     // 6) Build the base payload
     const base = {
@@ -1477,10 +1467,10 @@ app.post("/api/check-stock", async (req, res) => {
         ? "Minimal growth expected. Hold or monitor."
         : "Projected to decline. Consider selling or avoiding.";
 
-    // Personalized Advisor Suggestion
+    // Personalized Advisor Suggestion (only if token is present → profile available)
     let advisorSuggestion = null;
     try {
-      const profile = await getUserProfile(req); // pulls from Firebase token or x-user-id
+      const profile = await getUserProfile(req);
       advisorSuggestion = await buildAdvisorSuggestion({
         symbol: upper,
         profile,
@@ -1515,12 +1505,11 @@ app.post("/api/check-stock", async (req, res) => {
       console.error("check-stock serialize error:", e);
       return res.status(500).json({ message: `serialize-failed: ${e.message}` });
     }
-    } catch (err) {
-      console.error("check-stock route error:", err);
-      return res.status(500).json({ message: "Server error." });
-    }
-    });
-
+  } catch (err) {
+    console.error("check-stock route error:", err);
+    return res.status(500).json({ message: "Server error." });
+  }
+});
 
 // POST /api/advisor/chat  (requires Firebase auth)
 function mergeFacts(oldFacts = {}, inc = {}) {
@@ -1560,7 +1549,6 @@ Return ONLY compact JSON with optional keys:
   }
 }
 
-
 app.get('/api/research-pack/:symbol', authenticate, async (req,res)=>{
   try{
     const sym = String(req.params.symbol||'').toUpperCase();
@@ -1572,8 +1560,6 @@ app.get('/api/research-pack/:symbol', authenticate, async (req,res)=>{
     res.status(500).json({message:'failed'});
   }
 });
-
-
 
 function detectHorizonFromMessages(messages = []) {
   const text = [...messages]
@@ -1589,10 +1575,8 @@ function detectHorizonFromMessages(messages = []) {
 
   if (longHits.test(text)) return 'long';
   if (shortHits.test(text)) return 'short';
-  return 'auto'; // default → we’ll choose based on user profile or fall back to short for trading phrases
+  return 'auto';
 }
-
-
 
 // POST /api/advisor/chat  (requires Firebase auth)
 app.post('/api/advisor/chat', authenticate, async (req, res) => {
@@ -1844,9 +1828,6 @@ Picks:   ${JSON.stringify(picksLite || [])}
   }
 });
 
-
-
-
 app.get('/api/price/:symbol', authenticate, async (req, res) => {
   try {
     const sym = String(req.params.symbol || '').toUpperCase();
@@ -1882,10 +1863,8 @@ app.get("/api/model/shortterm/:symbol", async (req, res) => {
   }
 });
 
-
-
 /*──────────────────────────────────────────
-|  STOCK‑HISTORY  –  daily candles         |
+|  STOCK-HISTORY  –  daily candles         |
 └──────────────────────────────────────────*/
 app.post("/api/stock-history*", async (req, res) => {
   try {
@@ -1900,10 +1879,13 @@ app.post("/api/stock-history*", async (req, res) => {
     const end = new Date();
     const start = new Date(end.getTime() - dayCount * 24 * 60 * 60 * 1000);
 
-    const rows = await yahooFinance.historical(
-      symbol,
-      { period1: start, period2: end, interval: "1d" },
-      { fetchOptions: requestOptions }
+    const rows = await withTimeout(
+      yahooFinance.historical(
+        symbol,
+        { period1: start, period2: end, interval: "1d" },
+        { fetchOptions: requestOptions }
+      ),
+      8000
     );
 
     if (!rows || !rows.length) return res.json({ data: [] });
@@ -1923,13 +1905,9 @@ app.post("/api/stock-history*", async (req, res) => {
   }
 });
 
-
 // ────────────────────────────────────────────────────────────
 // Intraday Indicators Endpoint
 // ────────────────────────────────────────────────────────────
-
-
-
 app.get("/api/intraday/:symbol", async (req, res) => {
   try {
     const symbol = (req.params.symbol || "").toUpperCase();
@@ -1947,13 +1925,10 @@ app.get("/api/intraday/:symbol", async (req, res) => {
   }
 });
 
-
 /*──────────────────────────────────────────
 |  Short-term expected move (T+1, daily)   |
 |  Probability × Magnitude model           |
 └──────────────────────────────────────────*/
-
-// tiny cache to avoid recomputing repeatedly (10 min)
 const ST_EXPECTED_CACHE = new Map();
 const ST_TTL_MS = 10 * 60 * 1000;
 
@@ -1964,10 +1939,13 @@ const stSigmoid = z => 1 / (1 + Math.exp(-z));
 async function stGetDaily(symbol, days = 120) {
   const end = new Date();
   const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
-  const rows = await yahooFinance.historical(
-    symbol,
-    { period1: start, period2: end, interval: "1d" },
-    { fetchOptions: requestOptions }
+  const rows = await withTimeout(
+    yahooFinance.historical(
+      symbol,
+      { period1: start, period2: end, interval: "1d" },
+      { fetchOptions: requestOptions }
+    ),
+    8000
   );
   const data = (rows || [])
     .map(r => ({
@@ -2085,12 +2063,12 @@ async function computeShortTermExpectedMove(symbol) {
   const obvZ = stZ(obvSeries);
 
   // Normalize into bounded features
-  const rsiN   = (RSI != null) ? stClamp((RSI - 50) / 10, -3, 3) : 0;         // ±30pts → ±3
-  const macdN  = (MACDh != null && ATR) ? stClamp(MACDh / ATR, -3, 3) : 0;    // MACD hist vs ATR
-  const mom5N  = stClamp(mom5 / 0.05, -3, 3);                                  // 5% → 1.0
-  const gapN   = stClamp(gapPct / 0.01, -3, 3);                                 // 1% gap → 1.0
-  const rngN   = stClamp(rangePct / 0.03, 0, 3);                                // 3% range → 1.0
-  const bbN    = (pctB != null) ? stClamp((pctB - 0.5) * 2, -2, 2) : 0;        // [-1..+1] → [-2..2]
+  const rsiN   = (RSI != null) ? stClamp((RSI - 50) / 10, -3, 3) : 0;
+  const macdN  = (MACDh != null && ATR) ? stClamp(MACDh / ATR, -3, 3) : 0;
+  const mom5N  = stClamp(mom5 / 0.05, -3, 3);
+  const gapN   = stClamp(gapPct / 0.01, -3, 3);
+  const rngN   = stClamp(rangePct / 0.03, 0, 3);
+  const bbN    = (pctB != null) ? stClamp((pctB - 0.5) * 2, -2, 2) : 0;
   const volN   = stClamp(volZ, -3, 3);
   const obvN   = stClamp(obvZ, -3, 3);
 
@@ -2106,7 +2084,7 @@ async function computeShortTermExpectedMove(symbol) {
     + 0.10 * obvN
     - 0.2  * rngN;
 
-  const pUp = stSigmoid(z);
+  const pUp = 1 / (1 + Math.exp(-z));
 
   // Magnitude = expected |move| (%)
   const magnitude = stClamp(
@@ -2116,7 +2094,7 @@ async function computeShortTermExpectedMove(symbol) {
       + 0.20 * Math.abs(gapN)
       + 0.25 * Math.abs(mom5N)
     ),
-    0.002, 0.08   // 0.2% .. 8%
+    0.002, 0.08
   );
 
   const expectedReturn   = (2 * pUp - 1) * magnitude; // signed %
@@ -2124,7 +2102,7 @@ async function computeShortTermExpectedMove(symbol) {
 
   const out = {
     pUp,                       // 0..1
-    magnitude,                 // abs move, as decimal (e.g. 0.012 = 1.2%)
+    magnitude,                 // abs move, as decimal
     expectedReturn,            // signed decimal
     expectedIncrease,          // decimal
     diagnostics: { RSI, MACDh, pctB, atrPct, ret1d, mom5, rangePct, gapPct, volZ, obvZ }
@@ -2132,8 +2110,6 @@ async function computeShortTermExpectedMove(symbol) {
   ST_EXPECTED_CACHE.set(symbol, { val: out, ts: Date.now() });
   return out;
 }
-
-
 
 /*──────────────────────────────────────────
 |  13) FINDER (v2.2, light+heavy passes)   |
@@ -2399,7 +2375,7 @@ finderRouter.post("/find-stocks", async (req, res) => {
     // === optional per-pick AI Advisor (topK only) ===
     if (includeAdvisor && out.length) {
       try {
-        const profile = await getUserProfile(req); // may be null
+        const profile = await getUserProfile(req); // may be null (no token)
         await mapLimit(out, 3, async (row) => {
           const baseAdvice =
             row.classification === "growth"
@@ -2443,10 +2419,7 @@ finderRouter.post("/find-stocks", async (req, res) => {
   }
 });
 
-
 app.use(["/api", "/finder/api"], finderRouter);
-
-
 
 /*──────────────────────────────────────────
 |  14) Dashboard helper endpoints          |
@@ -2459,7 +2432,7 @@ const chunk = (arr, n) => {
   return out;
 };
 
-/* 1️⃣  MOST‑TRADED POPULAR STOCKS  */
+/* 1️⃣  MOST-TRADED POPULAR STOCKS  */
 app.get("/api/popular-stocks*", async (_req, res) => {
   try {
     const popular = ["AAPL", "TSLA", "AMZN", "NVDA", "META", "GOOG", "MSFT"];
@@ -2487,7 +2460,7 @@ app.get("/api/popular-stocks*", async (_req, res) => {
   }
 });
 
-/* 2️⃣  TOP‑FORECASTED (first 200 tickers, batched) */
+/* 2️⃣  TOP-FORECASTED (first 200 tickers, batched) */
 app.get("/api/top-forecasted*", async (_req, res) => {
   try {
     const sample = symbolsList
@@ -2511,7 +2484,7 @@ app.get("/api/top-forecasted*", async (_req, res) => {
     gains.sort((a, b) => b.gain - a.gain);
     return res.json({ forecasts: gains.slice(0, 5) });
   } catch (e) {
-    console.error("top‑forecasted:", e.message);
+    console.error("top-forecasted:", e.message);
     return res.status(500).json({ forecasts: [] });
   }
 });
@@ -2519,18 +2492,16 @@ app.get("/api/top-forecasted*", async (_req, res) => {
 /* 1.5️⃣  BEST-BUYS (short-term, probability-based) — cached + lighter */
 app.get("/api/best-buys*", async (_req, res) => {
   try {
-    // serve cached result if fresh
     if (BEST_BUYS_CACHE.data && (Date.now() - BEST_BUYS_CACHE.ts) < BEST_BUYS_TTL_MS) {
       return res.json({ picks: BEST_BUYS_CACHE.data });
     }
 
-    // smaller universe + polite batching keeps Render happy
     const sample = symbolsList
-      .slice(0, 120) // was 200 — tighten for latency on free tier
+      .slice(0, 120)
       .map(s => (typeof s === "string" ? s : s.symbol));
 
     const results = [];
-    for (const group of chunk(sample, 10)) {           // smaller batch than before
+    for (const group of chunk(sample, 10)) {
       const batch = await Promise.all(
         group.map(async (sym) => {
           try {
@@ -2557,8 +2528,6 @@ app.get("/api/best-buys*", async (_req, res) => {
     results.sort((a, b) => (b.pUp - a.pUp) || (b.expectedReturnPct - a.expectedReturnPct));
 
     const picks = results.slice(0, 5);
-
-    // cache & return
     BEST_BUYS_CACHE.ts = Date.now();
     BEST_BUYS_CACHE.data = picks;
 
@@ -2568,9 +2537,6 @@ app.get("/api/best-buys*", async (_req, res) => {
     return res.status(500).json({ picks: [] });
   }
 });
-
-
-
 
 /* 3️⃣  TOP NEWS HEADLINES */
 app.get("/api/top-news*", async (_req, res) => {
@@ -2584,7 +2550,7 @@ app.get("/api/top-news*", async (_req, res) => {
     }));
     return res.json({ headlines });
   } catch (e) {
-    console.error("top‑news:", e.message);
+    console.error("top-news:", e.message);
     return res.status(500).json({ headlines: [] });
   }
 });
@@ -2594,14 +2560,13 @@ app.get("/api/notifications*", (_req, res) => {
   res.json({ notifications: [] });
 });
 
-
 /*──────────────────────────────────────────
 |  15) Community                           |
 └──────────────────────────────────────────*/
 app.get("/api/community-posts", async (_req,res)=>{
   res.json({ posts: await CommunityPost.find().sort({createdAt:-1}) });
 });
-app.post("/api/community-posts", async (req,res)=>{
+app.post("/api/community-posts", authenticate, async (req,res)=>{
   const { username,message } = req.body;
   if(!username||!message) return res.status(400).json({ message:"username & message required" });
   await new CommunityPost({username,message}).save();
@@ -2647,11 +2612,9 @@ app.post("/resetPassword", async (req,res)=>{
 });
 
 /*──────────────────────────────────────────
-|  17) Automated‑investor & daily job      |
+|  17) Automated-investor & daily job      |
 └──────────────────────────────────────────*/
-// ────────────────────────────────────────────────────────────
 // 18) AUTOMATED INVESTOR SECTION
-// ────────────────────────────────────────────────────────────
 const SYMBOLS_JSON_PATH   = path.join(__dirname, "symbols.json");
 const PORTFOLIO_JSON_PATH = path.join(__dirname, "portfolio.json");
 
@@ -2730,7 +2693,7 @@ async function autoBuyStocks() {
 
 async function autoSellStocks() {
   if (!isMarketOpen()) return;
-  //  – implement your auto‑sell logic here –
+  //  – implement your auto-sell logic here –
 }
 
 // Example scheduler (disabled by default):
@@ -2739,12 +2702,12 @@ async function autoSellStocks() {
 //     await autoBuyStocks();
 //     await autoSellStocks();
 //   } catch (err) {
-//     console.error("Automated‑investor task error:", err.message);
+//     console.error("Automated-investor task error:", err.message);
 //   }
 // }, 60_000);
 
 // ────────────────────────────────────────────────────────────
-// 18‑B) Daily Job: Refresh All Historical Data
+// 18-B) Daily Job: Refresh All Historical Data
 // ────────────────────────────────────────────────────────────
 const ONE_DAY = 24 * 60 * 60 * 1000;
 
@@ -2756,7 +2719,7 @@ async function refreshAllHistoricalData() {
     }
 
     const symbols = JSON.parse(fs.readFileSync(SYMBOLS_JSON_PATH, "utf-8"));
-    await fetchAllSymbolsHistoricalData(symbols, 1);   // 1‑day look‑back
+    await fetchAllSymbolsHistoricalData(symbols, 1);   // 1-day look-back
   } catch (err) {
     console.error("Error in refreshAllHistoricalData:", err.message);
   }
@@ -2772,17 +2735,127 @@ async function refreshAllHistoricalData() {
    }, ONE_DAY);
  }
 
+// GET /api/sci/score/:symbol  -> rule decision, confidence, and optional regression
+app.get('/api/sci/score/:symbol', async (req, res) => {
+  try {
+    const sym = String(req.params.symbol || '').toUpperCase();
+    if (!isValidSymbol(sym)) return res.status(400).json({ message: 'unknown symbol' });
 
-// ────────────────────────────────────────────────────────────
+    // use same daily fetch you already have
+    const rows = await stGetDaily(sym, 300); // ~300 bars
+    const rule = sciV1.scoreWithRows(rows);
+
+    // optional regression prediction if a model is loaded
+    let rhat = null, regClass = null;
+    if (rule.in_universe) {
+      const f = sciV1.computeIndicators(rows);
+      rhat = sciV1.predictReturnFromIndicators(f); // next-day log return
+      if (typeof rhat === 'number') {
+        const band = 0.003; // ±0.30% neutral band
+        regClass = rhat > +band ? 'Up' : rhat < -band ? 'Down' : 'Neutral';
+      }
+    }
+
+    // fused call (conservative): prefer rules unless regression strongly disagrees
+    let fused = rule.decision.final;
+    let explanation = null;
+    if (regClass) {
+      if (fused === 'Neutral') fused = regClass;
+      else if ((fused === 'Up' && regClass === 'Down') || (fused === 'Down' && regClass === 'Up')) {
+        if (Math.abs(rhat) > 0.006) fused = 'Neutral';
+      }
+    }
+
+    if (req.query.explain === '1') {
+      const system = 'Explain succinctly the rule decision using the provided indicators and gaps. ≤100 words.';
+      const payload = {
+        symbol: sym,
+        final: fused,
+        rule: rule.decision,
+        regression: { rhat, regClass },
+        indicators: {
+          zS: rule.indicators.zS,
+          z_dS: rule.indicators.z_dS,
+          z_dHist: rule.indicators.z_dHist,
+          K: rule.indicators.K,
+          pctB: rule.indicators.pctB,
+          CLV: rule.indicators.CLV,
+          logRV: rule.indicators.logRV,
+          z_dLogRV: rule.indicators.z_dLogRV,
+          obvSlope10: rule.indicators.obvSlope10,
+          z_obvSl: rule.indicators.z_obvSl,
+          atrPct: rule.indicators.atrPct,
+          z_ATRPct: rule.indicators.z_ATRPct,
+          BBW: rule.indicators.BBW,
+          z_dBBW: rule.indicators.z_dBBW,
+          g: rule.indicators.g,
+          gapNorm: rule.indicators.gapNorm,
+          fill: rule.indicators.fill
+        }
+      };
+      const text = await callChatServiceAdaptive({
+        system,
+        messages: [{ role: 'user', content: JSON.stringify(payload) }]
+      });
+      explanation = text;
+    }
+
+    res.json({
+      symbol: sym,
+      in_universe: rule.in_universe,
+      rule: rule.decision,
+      indicators: rule.indicators,
+      regression: { rhat, regClass },
+      final: fused,
+      explanation
+    });
+  } catch (e) {
+    console.error('sci/score:', e.message);
+    res.status(500).json({ message: 'sci/score failed' });
+  }
+});
+
+// POST /api/sci/train  { symbols?:[...], days?:600, lambda?:0.01 }
+app.post('/api/sci/train', authenticate, async (req, res) => {
+  try {
+    const { symbols, days = 600, lambda = 1e-2 } = req.body || {};
+    const pool = (Array.isArray(symbols) && symbols.length ? symbols
+                  : symbolsList.slice(0, 80).map(s => (typeof s === 'string' ? s : s.symbol)));
+
+    // gather samples across symbols
+    const samples = [];
+    for (const s of pool) {
+      try {
+        const rows = await stGetDaily(s, Math.max(130, days));
+        const local = sciV1.buildDatasetFromRows(rows);
+        samples.push(...local);
+      } catch {}
+    }
+    if (samples.length < 1000) return res.status(400).json({ message: 'not enough samples' });
+
+    // standardize + fit ridge
+    const { X, y, means, stds } = sciV1.standardizeXY(samples);
+    const w = await sciV1.ridgeFit(X, y, lambda);
+
+    // store in the module and persist to disk
+    const modelPath = path.join(__dirname, 'model', 'sci_v1_regression.json');
+    sciV1.loadModelFromDisk(); // ensure structure exists
+    const REG = { loaded: true, w, means, stds, lambda };
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, JSON.stringify(REG, null, 2));
+
+    res.json({ ok: true, symbols: pool.length, samples: samples.length, d: w.length, lambda, modelPath });
+  } catch (e) {
+    console.error('sci/train:', e.message);
+    res.status(500).json({ message: 'sci/train failed' });
+  }
+});
+
 // 18-C) Daily fundamentals refresh at 2:00 AM ET, weekdays
-// ────────────────────────────────────────────────────────────
-
-// Build a watchlist — prefer portfolio if present, with a small fallback
 const watchlist = Array.from(new Set(
   (portfolio || []).map(p => p.symbol).filter(Boolean).concat(['AAPL','MSFT','NVDA'])
 ));
 
-// Use your existing FundamentalsService to warm cache / refresh
 async function pullCompanyFundamentals(symbol) {
   try {
     await getFundamentals(symbol);
@@ -2799,9 +2872,17 @@ async function pullCompanyFundamentals(symbol) {
    }, { timezone: 'America/New_York' });
  }
 
-
 /*──────────────────────────────────────────
 |  Start server                            |
 └──────────────────────────────────────────*/
 const PORT = process.env.PORT || 5000;
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+  process.exit(1);
+});
+
 app.listen(PORT, () => console.log(`✅ Combined server running on port ${PORT}`));
