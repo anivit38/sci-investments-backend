@@ -1,0 +1,50 @@
+{
+  "generatedAt": "2025-09-15T20:36:49.395Z",
+  "model": "gpt-4o-mini",
+  "version": "shortterm_ai_v1",
+  "feature_order": [
+    "zS",
+    "z_dS",
+    "z_dHist",
+    "logRV",
+    "z_dLogRV",
+    "obvSlope10_scaled",
+    "z_obvSl",
+    "K",
+    "pctB",
+    "CLV",
+    "atrPct",
+    "z_ATRPct",
+    "BBW",
+    "z_dBBW",
+    "gapNorm",
+    "fill"
+  ],
+  "sigmoid": {
+    "intercept": -0.1,
+    "weights": {
+      "zS": -0.5,
+      "z_dS": -0.3,
+      "z_dHist": -0.4,
+      "logRV": 0.2,
+      "z_dLogRV": 0.1,
+      "obvSlope10_scaled": 0.3,
+      "z_obvSl": -0.2,
+      "K": 0.4,
+      "pctB": 0.5,
+      "CLV": 0.2,
+      "atrPct": 0.1,
+      "z_ATRPct": -0.3,
+      "BBW": 0.4,
+      "z_dBBW": 0.2,
+      "gapNorm": 0.1,
+      "fill": -0.1
+    }
+  },
+  "rules": {
+    "minConf": 0.45,
+    "atrMax": 0.045,
+    "minTemp": 1,
+    "longShort": true
+  }
+}

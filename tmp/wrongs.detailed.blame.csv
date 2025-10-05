@@ -1,0 +1,9 @@
+metric,wrong_calls,total_wrong_contrib,avg_wrong_contrib,avg_raw_on_wrongs,avg_score_on_wrongs,pct_high_conf_wrong,pct_regime_shock,gap_reversal_rate,sample_reason
+stochK,972,562.0604,0.5783,61.36,0.5783,96.1%,0.0%,33.7%,stochK=61.36 (≥60 up-bias)
+gapNorm,402,231.0595,0.5748,1.550,0.5748,91.3%,0.0%,100.0%,gapNorm=1.550 ≥ 0.5 → gap-up continuation bias
+OBV,746,186.5000,0.2500,1791218930,0.2500,92.6%,0.0%,37.5%,OBV sign + (buy-volume bias)
+pctB,760,149.2270,0.1964,0.7854,0.1964,92.9%,0.0%,38.3%,pctB=0.7854 (mid)
+RSI,607,105.4926,0.1738,59.52,0.1738,99.7%,0.0%,33.1%,RSI=59.52 (neutral)
+MACD,850,98.7215,0.1161,0.2323,0.1161,94.1%,0.0%,33.5%,MACD/ATR=0.2323 (bullish momentum)
+volZ,512,82.7720,0.1617,0.7474,0.1617,90.2%,0.0%,37.5%,volZ=0.7474
+deltaATRpct,493,0.3158,0.0006,0.0013,0.0006,90.1%,0.0%,34.7%,ΔATR%=0.0013 rising vol → continuation amplification

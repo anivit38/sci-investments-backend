@@ -19,6 +19,76 @@ const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
 const https      = require('https'); // keep-alive agent
+
+// --- 1m technical advice helpers (no new npm deps) ---
+const MS = 60 * 1000;
+function sma(arr, n) {
+  if (!Array.isArray(arr) || arr.length < n) return null;
+  let s = 0;
+  for (let i = arr.length - n; i < arr.length; i++) s += arr[i];
+  return s / n;
+}
+function std(arr, n) {
+  const m = sma(arr, n);
+  if (m == null) return null;
+  let v = 0;
+  for (let i = arr.length - n; i < arr.length; i++) v += (arr[i] - m) ** 2;
+  return Math.sqrt(v / n);
+}
+function ema(prevEma, price, k) {
+  return prevEma == null ? price : prevEma + k * (price - prevEma);
+}
+function macdSeries(closes, fast=12, slow=26, sig=9) {
+  const kFast = 2 / (fast + 1), kSlow = 2 / (slow + 1), kSig = 2 / (sig + 1);
+  let eFast=null, eSlow=null, macd=[], signal=null, hist=[];
+  for (const p of closes) {
+    eFast = ema(eFast, p, kFast);
+    eSlow = ema(eSlow, p, kSlow);
+    const line = (eFast??0) - (eSlow??0);
+    macd.push(line);
+    signal = ema(signal, line, kSig);
+    hist.push(line - (signal??0));
+  }
+  return { macd, signal, hist };
+}
+function stochastic(closes, highs, lows, kLen=14, dLen=3) {
+  const k = [];
+  for (let i = 0; i < closes.length; i++) {
+    const start = Math.max(0, i - kLen + 1);
+    const h = Math.max(...highs.slice(start, i + 1));
+    const l = Math.min(...lows.slice(start, i + 1));
+    k.push(h === l ? 50 : ((closes[i] - l) / (h - l)) * 100);
+  }
+  const d = [];
+  for (let i = 0; i < k.length; i++) {
+    const start = Math.max(0, i - dLen + 1);
+    d.push(k.slice(start, i + 1).reduce((a,b)=>a+b,0) / (i - start + 1));
+  }
+  return { k, d };
+}
+function rsiSeries(closes, n=14) {
+  const rsis = new Array(closes.length).fill(50);
+  let ag=0, al=0; let init=false;
+  for (let i=1;i<closes.length;i++){
+    const ch = closes[i]-closes[i-1];
+    const g = Math.max(ch,0), l = Math.max(-ch,0);
+    if (i<=n){ ag+=g; al+=l; if(i===n){ ag/=n; al/=n; init=true; } }
+    else { ag = (ag*(n-1)+g)/n; al=(al*(n-1)+l)/n; }
+    if (init){ const rs = ag/(al||1e-9); rsis[i] = 100 - 100/(1+rs); }
+  }
+  return rsis;
+}
+function vwapFromMinute(candles) {
+  let pv=0, tv=0;
+  for (const c of candles) {
+    const price = (c.high + c.low + c.close) / 3;
+    const vol = c.volume || 0;
+    pv += price * vol; tv += vol;
+  }
+  return tv ? pv/tv : candles.at(-1)?.close ?? null;
+}
+
+
 const { getFundamentals } = require('./services/FundamentalsService');
 const { getTechnical, getTechnicalForUser } = require('./services/TechnicalService');
 const { getIntradayIndicators } = require('./services/IntradayService'); 
@@ -41,6 +111,9 @@ const DISABLE_BG = process.env.DISABLE_BACKGROUND_JOBS === '1';
 const sciV1 = require('./services/sciV1Engine');
 const modelPath = path.join(__dirname, 'model', 'sci_v1_regression.json');
 sciV1.loadModelFromDisk(modelPath);
+const SCI = require('./services/sci-formula-engine');
+const sciCombiner = require('./services/sciCombiner');
+
 
 // ---- Firebase Admin init (uses GOOGLE_SERVICE_ACCOUNT_KEY from env) ----
 const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -114,6 +187,11 @@ app.options('*', (req, res) => {
   return res.sendStatus(204);
 });
 app.use(express.static(path.join(__dirname, "../public")));
+
+
+// After your other routes:
+app.use('/api/formula3', require('./routes/formula3'));
+
 
 // put this helper near the top of server.js (or above the route)
 function normalizeOnboarding(a = {}) {
@@ -838,6 +916,80 @@ function sendSellNotification(symbol, price, reasons) {
   );
 }
 
+
+/*──────────────────────────────────────────
+|  Testing Route                           |
+└──────────────────────────────────────────*/
+
+app.get('/api/model/shortterm-at/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase().trim();
+    const asOfStr = String(req.query.asOf || '').slice(0, 10); // YYYY-MM-DD
+    if (!symbol || !asOfStr || !/^\d{4}-\d{2}-\d{2}$/.test(asOfStr)) {
+      return res.status(400).json({ error: 'Provide ?asOf=YYYY-MM-DD' });
+    }
+
+    // end = asOf at 00:00 local (exclusive in Yahoo query, so add 1 day)
+    const asOf = new Date(asOfStr + 'T00:00:00');
+    const period2 = new Date(asOf); period2.setDate(period2.getDate() + 1);
+    const period1 = new Date(asOf); period1.setDate(period1.getDate() - 420); // ~20 months
+
+    // Fetch only history available *up to asOf*
+    const candles = await yahooFinance.historical(symbol, {
+      period1,
+      period2,
+      interval: '1d',
+    });
+
+    if (!Array.isArray(candles) || candles.length < 60) {
+      return res.status(422).json({ error: 'Not enough history before asOf' });
+    }
+
+    // ===== IMPORTANT =====
+    // Reuse your live model’s logic here. If your current /api/model/shortterm
+    // already builds features off `candles` and returns { pUp, magnitudePct },
+    // move that logic into a small function and call it here.
+    //
+    // For now, this fallback uses a simple technical blend so the endpoint works
+    // immediately; replace this block with your live model calculation.
+
+    const closes = candles.map(c => Number(c.close));
+    const last = closes.at(-1);
+    const prev = closes.at(-2);
+
+    // Minimal features (replace with your model):
+    const rsi14 = (() => {
+      const gains = [], losses = [];
+      for (let i = 1; i < closes.length; i++) {
+        const ch = closes[i] - closes[i - 1];
+        gains.push(Math.max(ch, 0));
+        losses.push(Math.max(-ch, 0));
+      }
+      const n = 14;
+      if (gains.length < n) return 50;
+      let ag = gains.slice(0, n).reduce((a,b)=>a+b,0)/n;
+      let al = losses.slice(0, n).reduce((a,b)=>a+b,0)/n;
+      for (let i = n; i < gains.length; i++) {
+        ag = (ag*(n-1) + gains[i]) / n;
+        al = (al*(n-1) + losses[i]) / n;
+      }
+      const rs = ag / (al || 1e-9);
+      return 100 - 100/(1+rs);
+    })();
+
+    // Very small heuristic: higher RSI → higher pUp; include last return sign
+    const ret = (last - prev) / prev;
+    const pUp = Math.max(0.01, Math.min(0.99, 0.45 + (rsi14 - 50) * 0.006 + Math.sign(ret)*0.03));
+    const magnitudePct = Math.min(4, Math.max(0.2, Math.abs(ret) * 100 * 1.2));
+
+    return res.json({ pUp, magnitudePct, asOf: asOfStr, usedCandles: candles.length });
+  } catch (err) {
+    console.error('shortterm-at error', err);
+    res.status(500).json({ error: 'shortterm-at failed' });
+  }
+});
+
+
 /*──────────────────────────────────────────
 |  Small helpers                           |
 └──────────────────────────────────────────*/
@@ -1076,7 +1228,7 @@ const heavyLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => req.method === 'OPTIONS',
 });
-app.use(['/api/sci/score', '/api/sci/train', '/api/intraday', '/api/stock-history'], heavyLimiter);
+app.use(['/api/sci/score', '/api/sci/train', '/api/intraday', '/api/stock-history', '/api/sci/chart'], heavyLimiter);
 
 // put near other limiters
 const communityLimiter = rateLimit({
@@ -1401,15 +1553,176 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // 5) Technical detail (only when requested or overall)
+    // 5) Technical detail (only when requested or overall) — SAME SHAPE, new advice logic (1-minute SR/VWAP/MACD/Stoch/RSI)
     let technicalDetail = null;
     if (category === "technical" || category === "overall") {
       try {
-        const userId = req.user?.userId || null; // 🔒 no x-user-id
-        const t = await getTechnicalForUser(upper, userId);
+        const userId = req.user?.userId || null;
+        const t = await getTechnicalForUser(upper, userId); // keep your existing indicators/trend as baseline
 
+        // ======== Minute-based “advice builder” (local, no new routes) ========
+        // small helpers (scoped here to avoid polluting global file)
+        const MS = 60 * 1000;
+        const ema = (prev, x, k) => (prev == null ? x : prev + k * (x - prev));
+        const macdSeries = (cl, f=12, s=26, g=9) => {
+          const kf = 2/(f+1), ks = 2/(s+1), kg = 2/(g+1);
+          let ef=null, es=null, sig=null;
+          const macd=[], hist=[];
+          for (const p of cl) {
+            ef = ema(ef, p, kf); es = ema(es, p, ks);
+            const ln = (ef??0)-(es??0);
+            macd.push(ln);
+            sig = ema(sig, ln, kg);
+            hist.push(ln-(sig??0));
+          }
+          return { macd, signal: sig, hist };
+        };
+        const rsiSeries = (cl, n=14) => {
+          const rsis = new Array(cl.length).fill(50);
+          let ag=0, al=0, seeded=false;
+          for (let i=1;i<cl.length;i++){
+            const ch = cl[i]-cl[i-1], g=Math.max(ch,0), l=Math.max(-ch,0);
+            if (i<=n){ ag+=g; al+=l; if(i===n){ ag/=n; al/=n; seeded=true; } }
+            else { ag=(ag*(n-1)+g)/n; al=(al*(n-1)+l)/n; }
+            if (seeded){ const rs=ag/(al||1e-9); rsis[i]=100-100/(1+rs); }
+          }
+          return rsis;
+        };
+        const vwapFromMinute = (bars) => {
+          let pv=0, tv=0;
+          for (const b of bars) {
+            const price = (b.high + b.low + b.close) / 3;
+            const vol = b.volume || 0;
+            pv += price * vol; tv += vol;
+          }
+          return tv ? pv/tv : bars.at(-1)?.close ?? null;
+        };
+        const localExtremaIdx = (arr, w, type) => {
+          const out = [];
+          for (let i=w;i<arr.length-w;i++){
+            const seg = arr.slice(i-w,i+w+1);
+            if (type==='peak' && arr[i]===Math.max(...seg)) out.push(i);
+            if (type==='dip'  && arr[i]===Math.min(...seg)) out.push(i);
+          }
+          return out;
+        };
+
+        // Pull 1m chart ~last 2h; use last ~75 mins for SR/VWAP logic
+        const now = new Date();
+        const period2 = new Date(now.getTime() + 1*MS);
+        const period1 = new Date(now.getTime() - 2*60*MS);
+        const intraday = await yahooFinance.chart(upper, {
+          period1, period2, interval: '1m', includePrePost: false
+        }, { fetchOptions: requestOptions }).catch(() => null);
+
+        let minute = (intraday?.quotes || []).map(q => ({
+          time: new Date(q.date || q.timestamp || Date.now()),
+          open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
+        })).filter(c => Number.isFinite(c.close));
+
+        // If market closed or thin 1m data, gracefully fallback to a small 5m window
+        if (minute.length < 30) {
+          const intraday5 = await yahooFinance.chart(upper, {
+            period1, period2, interval: '5m', includePrePost: false
+          }, { fetchOptions: requestOptions }).catch(() => null);
+          minute = (intraday5?.quotes || []).map(q => ({
+            time: new Date(q.date || q.timestamp || Date.now()),
+            open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
+          })).filter(c => Number.isFinite(c.close));
+        }
+
+        // compute advice inputs only if we have enough bars
+        let adviceSuggestion = null, adviceInstructions = null, srLevels = {};
+        if (minute.length >= 30) {
+          const recent = minute.slice(-75);
+          const closes = recent.map(c => c.close);
+          const highs  = recent.map(c => c.high);
+          const lows   = recent.map(c => c.low);
+          const last   = closes.at(-1);
+
+          // Support/Resistance from last hour (local peaks/dips) with simple proximity filter
+          const m = closes.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, closes.length);
+          const sd = Math.sqrt(
+            closes.slice(-20).reduce((a,b)=>a+(b-m)*(b-m),0) / Math.min(20, closes.length)
+          ) || (last*0.01);
+          const peaks = localExtremaIdx(highs, 3, 'peak')
+            .map(i => highs[i]).filter(v => Math.abs(v - m) <= sd).slice(-10);
+          const dips  = localExtremaIdx(lows, 3, 'dip')
+            .map(i => lows[i]).filter(v => Math.abs(v - m) <= sd).slice(-10);
+          const resistance = peaks.length ? peaks.reduce((a,b)=>a+b,0)/peaks.length : Math.max(...highs.slice(-30));
+          const support    = dips.length  ? dips.reduce((a,b)=>a+b,0)/dips.length   : Math.min(...lows.slice(-30));
+          srLevels = { support, resistance };
+
+          // VWAP (session approx over recent window)
+          const vwap = vwapFromMinute(recent);
+          const vwapBias = last >= vwap ? 'Bullish' : 'Bearish';
+
+          // MACD, Stoch, RSI
+          const { macd: mac, signal: macSig } = macdSeries(closes);
+          const macTiltUp = (mac.at(-1) ?? 0) > (macSig ?? 0);
+          // fast stochastic on closes/highs/lows
+          const stochK = (() => {
+            const k = [];
+            for (let i=0;i<closes.length;i++){
+              const start = Math.max(0, i-14+1);
+              const h = Math.max(...highs.slice(start, i+1));
+              const l = Math.min(...lows.slice(start, i+1));
+              k.push(h===l ? 50 : ((closes[i]-l)/(h-l))*100);
+            }
+            return k;
+          })();
+          const stochUp = (stochK.at(-1) ?? 50) > 55;
+
+          const rsis = rsiSeries(closes, 14);
+          // build “rapid” RSI refs
+          const upRSIs = [], dnRSIs = [];
+          for (let i=1;i<closes.length;i++){
+            const r = (closes[i]-closes[i-1])/(closes[i-1]||1);
+            if (r>0.003 && Number.isFinite(rsis[i])) upRSIs.push(rsis[i]);
+            if (r<-0.003 && Number.isFinite(rsis[i])) dnRSIs.push(rsis[i]);
+          }
+          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a,b)=>a+b,0)/upRSIs.length : 60;
+          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a,b)=>a+b,0)/dnRSIs.length : 40;
+          const rsiNow = rsis.at(-1) ?? 50;
+
+          // Advice (short, no fluff; your style)
+          const whereNow =
+            last >= resistance ? 'Above resistance' :
+            last <= support    ? 'At/Below support' :
+                                'Between S/R';
+          const momentum =
+            (stochUp && macTiltUp) ? 'Momentum opening UP' :
+            (!stochUp && !macTiltUp) ? 'Momentum opening DOWN' :
+            'Momentum mixed';
+
+          const suggestLine = (() => {
+            if (whereNow === 'Above resistance') return 'Treat as breakout; manage risk with ATR-based stop.';
+            if (whereNow === 'At/Below support') return 'Caution on longs; wait for VWAP reclaim before risk-on.';
+            if (vwapBias === 'Bullish') return 'Bias long above VWAP; buy dips toward VWAP/support, scale out near resistance.';
+            if (vwapBias === 'Bearish') return 'Bias short below VWAP; fade pops into resistance, cover near support.';
+            return 'Wait for structure around VWAP or S/R.';
+          })();
+
+          const extra = [];
+          if (momentum.includes('UP'))   extra.push('Stoch + MACD aligned up.');
+          if (momentum.includes('DOWN')) extra.push('Stoch + MACD aligned down.');
+          if (rsiNow < rsiDnRef)         extra.push('RSI near “plunge” ref → risk of further downside.');
+          if (rsiNow > rsiUpRef)         extra.push('RSI above “surge” ref → stretched; expect mean reversion.');
+
+          adviceSuggestion   = suggestLine;
+          adviceInstructions = [
+            `Levels: S ${support.toFixed(2)} / R ${resistance.toFixed(2)} / VWAP ${(vwap??last).toFixed(2)}`,
+            `Where: ${whereNow} | Bias: ${vwapBias} | Momentum: ${momentum}`,
+            ...extra
+          ].join('  •  ');
+        }
+
+        // ======== Build technicalDetail with SAME shape you already use ========
         const ind = t?.indicators || {};
         const lev = t?.levels || {};
+        const computedSupport    = srLevels.support;
+        const computedResistance = srLevels.resistance;
+
         technicalDetail = {
           rsi14:  Number.isFinite(ind.RSI14)  ? ind.RSI14  : null,
           macd:   Number.isFinite(ind.MACD)   ? ind.MACD   : null,
@@ -1424,19 +1737,26 @@ app.post("/api/check-stock", async (req, res) => {
             return "sideways";
           })(),
           levels: {
-            support: Number.isFinite(lev.support)    ? lev.support    :
-                    (Number.isFinite(metrics.dayLow) ? metrics.dayLow : metrics.fiftyTwoWeekLow ?? null),
-            resistance: Number.isFinite(lev.resistance) ? lev.resistance :
-                        (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh : metrics.fiftyTwoWeekHigh ?? null),
+            // Prefer minute-based S/R if we computed them; otherwise keep your old behavior
+            support: Number.isFinite(computedSupport) ? computedSupport :
+                    (Number.isFinite(lev.support)    ? lev.support    :
+                      (Number.isFinite(metrics.dayLow) ? metrics.dayLow :
+                      metrics.fiftyTwoWeekLow ?? null)),
+            resistance: Number.isFinite(computedResistance) ? computedResistance :
+                        (Number.isFinite(lev.resistance) ? lev.resistance :
+                        (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh :
+                          metrics.fiftyTwoWeekHigh ?? null)),
           },
-          suggestion:   t?.suggestion ?? null,
-          instructions: t?.instructions ?? null,
+          // <<< here is what you actually wanted to change: advice text + how it’s derived >>>
+          suggestion:   adviceSuggestion   ?? t?.suggestion ?? null,
+          instructions: adviceInstructions ?? t?.instructions ?? null,
           chartUrl:     (typeof t?.chartUrl === 'string') ? t.chartUrl : null
         };
       } catch (e) {
-        console.warn(`TechnicalService failed for ${upper}:`, e.message);
+        console.warn(`TechnicalService (minute-advice) failed for ${upper}:`, e.message);
       }
     }
+
 
     // 6) Build the base payload
     const base = {
@@ -1905,6 +2225,145 @@ app.post("/api/stock-history*", async (req, res) => {
   }
 });
 
+
+
+// ────────────────────────────────────────────────────────────
+// SCI: build SCORE | MOVE | %CHANGE dataset for a symbol
+// GET /api/sci/chart/:symbol?days=420&csv=1&save=1
+// ────────────────────────────────────────────────────────────
+app.get('/api/sci/chart/:symbol', async (req, res) => {
+  try {
+    const sym = String(req.params.symbol || '').toUpperCase();
+    if (!isValidSymbol(sym)) return res.status(400).send('unknown symbol');
+
+    const days = Math.max(120, Math.min(1200, Number(req.query.days) || 420));
+    const rows = await stGetDaily(sym, days); // you already have this helper
+    if (!rows || rows.length < 60) return res.status(422).send('not enough history');
+
+    const n = rows.length;
+    const close = rows.map(r => r.close);
+    const open  = rows.map(r => r.open);
+    const high  = rows.map(r => r.high);
+    const low   = rows.map(r => r.low);
+    const vol   = rows.map(r => r.volume);
+
+    // --- vector indicators (compact, per-bar) ---
+    const ret1 = Array(n).fill(NaN); // 1-day return
+    const gap  = Array(n).fill(NaN); // open vs prior close
+    const mom5 = Array(n).fill(NaN);
+    for (let i = 1; i < n; i++) {
+      ret1[i] = (close[i] - close[i - 1]) / close[i - 1];
+      gap[i]  = (open[i] / close[i - 1]) - 1;
+    }
+    for (let i = 5; i < n; i++) {
+      mom5[i] = (close[i] / close[i - 5]) - 1;
+    }
+
+    function seriesRSI14(closes, p = 14) {
+      const m = closes.length, out = Array(m).fill(NaN);
+      if (m < p + 1) return out;
+      let g = 0, l = 0;
+      for (let i = 1; i <= p; i++) {
+        const d = closes[i] - closes[i - 1];
+        if (d >= 0) g += d; else l -= d;
+      }
+      g /= p; l /= p;
+      out[p] = 100 - 100 / (1 + g / (l || 1e-9));
+      for (let i = p + 1; i < m; i++) {
+        const d = closes[i] - closes[i - 1];
+        const gg = d > 0 ? d : 0, ll = d < 0 ? -d : 0;
+        g = (g * (p - 1) + gg) / p;
+        l = (l * (p - 1) + ll) / p;
+        out[i] = 100 - 100 / (1 + g / (l || 1e-9));
+      }
+      return out;
+    }
+
+    function seriesATR14(rows, p = 14) {
+      const m = rows.length, out = Array(m).fill(NaN);
+      if (m < p + 1) return out;
+      const TR = Array(m).fill(NaN);
+      for (let i = 1; i < m; i++) {
+        const h = rows[i].high, lw = rows[i].low, pc = rows[i - 1].close;
+        TR[i] = Math.max(h - lw, Math.abs(h - pc), Math.abs(lw - pc));
+      }
+      out[p] = (TR.slice(1, p + 1).reduce((a, x) => a + x, 0)) / p;
+      for (let i = p + 1; i < m; i++) out[i] = (out[i - 1] * (p - 1) + TR[i]) / p;
+      return out;
+    }
+
+    function seriesPctB(closes, p = 20) {
+      const m = closes.length, out = Array(m).fill(NaN);
+      const q = [];
+      for (let i = 0; i < m; i++) {
+        q.push(closes[i]);
+        if (q.length > p) q.shift();
+        if (q.length < p) continue;
+        const sma = q.reduce((a,b)=>a+b,0)/p;
+        const std = Math.sqrt(q.reduce((s,x)=>s+(x-sma)**2,0)/p);
+        const upper = sma + 2*std, lower = sma - 2*std;
+        out[i] = (closes[i] - lower) / Math.max(upper - lower, 1e-9);
+      }
+      return out;
+    }
+
+    function seriesOBV(rows) {
+      const out = Array(rows.length).fill(NaN);
+      let v = 0;
+      out[0] = 0;
+      for (let i = 1; i < rows.length; i++) {
+        const dir = Math.sign(rows[i].close - rows[i - 1].close);
+        v += dir * rows[i].volume;
+        out[i] = v;
+      }
+      return out;
+    }
+
+    const RSI14   = seriesRSI14(close, 14);
+    const ATR14   = seriesATR14(rows, 14);
+    const atrPct  = ATR14.map((a, i) => (Number.isFinite(a) && Number.isFinite(close[i])) ? a / close[i] : NaN);
+    const pctB20  = seriesPctB(close, 20).map(x => Number.isFinite(x) ? (x - 0.5) * 2 : NaN); // center to ~0
+    const OBV     = seriesOBV(rows);
+
+    // --- robust rolling z-scores (median/MAD) ---
+    const L = Math.min(252, Math.max(40, Math.floor(n * 0.6))); // sensible window
+    const zRET1   = SCI.rollingRobustZ(ret1,  L);
+    const zMOM5   = SCI.rollingRobustZ(mom5,  L);
+    const zRSI14  = SCI.rollingRobustZ(RSI14, L);
+    const zATRpct = SCI.rollingRobustZ(atrPct,L);
+    const zGAP    = SCI.rollingRobustZ(gap,   L);
+    const zVOL    = SCI.rollingRobustZ(vol,   L);
+    const zOBV    = SCI.rollingRobustZ(OBV,   L);
+    const zPctB   = SCI.rollingRobustZ(pctB20,L);
+
+    // --- build composite score S with YOUR formula ---
+    const Z = { zRET1, zMOM5, zRSI14, zATRpct, zGAP, zVOL, zOBV, zPctB };
+    const S = SCI.buildCompositeScore(Z, (Zmap, t) => sciCombiner(Zmap, t));
+
+    // --- format rows for chart ---
+    const triples = SCI.toChartTriples(S, close);
+
+    // optional CSV + save
+    const asCSV = String(req.query.csv || '') === '1';
+    const doSave = String(req.query.save || '') === '1';
+    if (doSave) {
+      const outDir = path.join(__dirname, 'output');
+      fs.mkdirSync(outDir, { recursive: true });
+      fs.writeFileSync(path.join(outDir, `SCI_${sym}_score_move_pct.csv`), SCI.rowsToCSV(triples));
+    }
+
+    if (asCSV) {
+      res.setHeader('Content-Type', 'text/csv');
+      return res.send(SCI.rowsToCSV(triples));
+    }
+    return res.json({ symbol: sym, rows: triples });
+  } catch (e) {
+    console.error('sci/chart:', e.message);
+    res.status(500).json({ error: 'chart build failed' });
+  }
+});
+
+
 // ────────────────────────────────────────────────────────────
 // Intraday Indicators Endpoint
 // ────────────────────────────────────────────────────────────
@@ -2042,19 +2501,18 @@ async function computeShortTermExpectedMove(symbol) {
   const vols   = rows.map(r => r.volume);
   const last   = rows[rows.length - 1];
 
-  // Feature engineering (t uses last bar)
-  const ret1d   = (closes[closes.length - 1] / closes[closes.length - 2]) - 1;
-  const mom5    = (closes[closes.length - 1] / closes[closes.length - 6]) - 1;
-  const rangePct= (last.high - last.low) / last.close;
-  const gapPct  = (last.open / closes[closes.length - 2]) - 1;
+  // --- features ---
+  const mom5     = (closes[closes.length - 1] / closes[closes.length - 6]) - 1;
+  const rangePct = (last.high - last.low) / last.close;
+  const gapPct   = (last.open / closes[closes.length - 2]) - 1;
 
-  const RSI     = stRSI14(closes, 14);
+  const RSI      = stRSI14(closes, 14);
   const { hist: MACDh } = stMACD(closes);
   const { pctB } = stBBands(closes, 20);
-  const ATR     = stATR14(rows, 14);
-  const atrPct  = ATR ? ATR / last.close : 0.01;
+  const ATR      = stATR14(rows, 14);
+  const atrPct   = ATR ? ATR / last.close : 0.01;
 
-  // volume/OBV z-scores over 60d
+  // volume/OBV z-scores
   const volZ = stZ(vols.slice(-60));
   const obvSeries = [];
   for (let i = rows.length - 60; i < rows.length; i++) {
@@ -2062,54 +2520,71 @@ async function computeShortTermExpectedMove(symbol) {
   }
   const obvZ = stZ(obvSeries);
 
-  // Normalize into bounded features
-  const rsiN   = (RSI != null) ? stClamp((RSI - 50) / 10, -3, 3) : 0;
-  const macdN  = (MACDh != null && ATR) ? stClamp(MACDh / ATR, -3, 3) : 0;
-  const mom5N  = stClamp(mom5 / 0.05, -3, 3);
-  const gapN   = stClamp(gapPct / 0.01, -3, 3);
-  const rngN   = stClamp(rangePct / 0.03, 0, 3);
-  const bbN    = (pctB != null) ? stClamp((pctB - 0.5) * 2, -2, 2) : 0;
-  const volN   = stClamp(volZ, -3, 3);
-  const obvN   = stClamp(obvZ, -3, 3);
+  // --- normalize (tighter mom clamp) ---
+  const mom5N = stClamp(mom5 / 0.03, -2, 2);
+  const gapN  = stClamp(gapPct / 0.01, -3, 3);
+  const rngN  = stClamp(rangePct / 0.03, 0, 3);
+  const bbN   = (pctB != null) ? stClamp((pctB - 0.5) * 2, -2, 2) : 0;
+  const volN  = stClamp(volZ, -3, 3);
+  const obvN  = stClamp(obvZ, -3, 3);
 
-  // Direction probability (logistic blend) – tunable weights
-  const z =
-      0.15
-    + 0.8  * rsiN
-    + 0.6  * macdN
-    + 0.5  * mom5N
-    + 0.3  * gapN
-    + 0.2  * bbN
+  // RSI split: favor mid momentum; penalize overbought extremes (mean-revert next day)
+  const rsiMid = (RSI != null) ? stClamp((RSI - 60) / 10, -2, 2) : 0;
+  const rsiOb  = (RSI != null) ? Math.max(0, (RSI - 70) / 10) : 0;
+
+  // MACD scaled by ATR
+  const macdN = (MACDh != null && ATR) ? stClamp(MACDh / ATR, -3, 3) : 0;
+
+  // --- linear blend (updated weights) ---
+  let z =
+      0.10
+    + 0.30 * rsiMid
+    - 0.60 * rsiOb
+    + 0.30 * macdN
+    + 0.40 * mom5N
+    - 0.20 * gapN
+    + 0.10 * bbN
     + 0.15 * volN
     + 0.10 * obvN
-    - 0.2  * rngN;
+    - 0.20 * rngN;
 
-  const pUp = 1 / (1 + Math.exp(-z));
+  // Volatility penalty
+  const ATR_MAX = Number(process.env.ST_ATR_MAX || 0.03);
+  if (atrPct > ATR_MAX) z *= 0.5;
 
-  // Magnitude = expected |move| (%)
+  // Temperature & clamp for calibration
+  const TEMP   = Number(process.env.ST_TEMP || 1.5);
+  const PMIN   = Number(process.env.ST_PMIN || 0.15);
+  const PMAX   = Number(process.env.ST_PMAX || 0.85);
+  let pUp = 1 / (1 + Math.exp(-(z / TEMP)));
+  pUp = stClamp(pUp, PMIN, PMAX);
+
+  // Magnitude (slightly gentler)
   const magnitude = stClamp(
     (atrPct || 0.01) * (1
-      + 0.25 * Math.abs(volN)
-      + 0.35 * Math.abs(macdN)
-      + 0.20 * Math.abs(gapN)
+      + 0.20 * Math.abs(volN)
+      + 0.25 * Math.abs(macdN)
+      + 0.15 * Math.abs(gapN)
       + 0.25 * Math.abs(mom5N)
     ),
     0.002, 0.08
   );
 
-  const expectedReturn   = (2 * pUp - 1) * magnitude; // signed %
-  const expectedIncrease = pUp * magnitude;           // chance-adjusted %
+  const expectedReturn   = (2 * pUp - 1) * magnitude;
+  const expectedIncrease = pUp * magnitude;
 
   const out = {
-    pUp,                       // 0..1
-    magnitude,                 // abs move, as decimal
-    expectedReturn,            // signed decimal
-    expectedIncrease,          // decimal
-    diagnostics: { RSI, MACDh, pctB, atrPct, ret1d, mom5, rangePct, gapPct, volZ, obvZ }
+    pUp,
+    magnitude,
+    expectedReturn,
+    expectedIncrease,
+    diagnostics: { RSI, MACDh, pctB, atrPct, mom5, rangePct, gapPct, volZ, obvZ, TEMP, PMIN, PMAX }
   };
+
   ST_EXPECTED_CACHE.set(symbol, { val: out, ts: Date.now() });
   return out;
 }
+
 
 /*──────────────────────────────────────────
 |  13) FINDER (v2.2, light+heavy passes)   |

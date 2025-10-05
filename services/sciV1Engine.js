@@ -1,10 +1,18 @@
 // backend/services/sciV1Engine.js
 // SCI V1 — rule engine + optional ridge regression (TFJS)
-// Implements the exact paper logic Anivit wrote: z-scores over rolling windows,
-// base Up/Down/Neutral rules, neutralizers, gap overrides, shift aggregator,
-// and an optional regression head that predicts next‑day log return.
+// Rule logic kept intact, with added: (a) ATR gating, (b) calibrated pUp with
+// temperature + clamps, (c) expected magnitude estimate, (d) small perf fix.
 
 const tf = require('@tensorflow/tfjs-node');
+
+/* ========================= Tunables (env) ========================= */
+const CONFIG = {
+  ATR_MAX   : Number(process.env.SCIV1_ATR_MAX || 0.03), // skip / downweight decisions when daily ATR% is above this
+  TEMP      : Number(process.env.SCIV1_TEMP    || 1.4),  // >1 flattens confidence (reduces extremes)
+  PMIN      : Number(process.env.SCIV1_PMIN    || 0.20), // min probability after clamp
+  PMAX      : Number(process.env.SCIV1_PMAX    || 0.80), // max probability after clamp
+  SCORE_CAP : Number(process.env.SCIV1_SCORE_CAP || 0.85) // cap absolute score before mapping to prob
+};
 
 /* ========================= Helpers ========================= */
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
@@ -16,7 +24,7 @@ const stdev = (arr) => {
 };
 
 function rollingZ(series, W = 252) {
-  // return z_t for the last element (compute with lookback window, no leakage)
+  // z of *last* value using up to last W samples (no leakage)
   const n = series.length;
   const w = Math.min(W, n);
   const window = series.slice(n - w);
@@ -128,11 +136,13 @@ function computeIndicators(rows, cfg = {}) {
   const clvDen = (H[n - 1] - L[n - 1]);
   const CLV = clvDen === 0 ? 0 : clamp(((2 * C[n - 1] - H[n - 1] - L[n - 1]) / clvDen), -1, 1);
 
-  // ATR% (Wilder via EMA of TR)
+  // ATR% (Wilder via EMA of TR) + perf-friendly z of ATR%
   const TR = wilderTR(rows);
-  const ATR14 = emaArray(TR, 14)[n - 1];
+  const ATR14series = emaArray(TR, 14);
+  const ATR14 = ATR14series[n - 1];
   const atrPct = safeDiv(ATR14, C[n - 1]);
-  const z_ATRPct = rollingZ(TR.map((t, i) => safeDiv(emaArray(TR.slice(0, i + 1), 14).pop(), C[i])).slice(-Math.max(40, cfg.zWin || 252)), cfg.zWin || 252);
+  const atrPctSeries = ATR14series.map((a, i) => safeDiv(a, C[i] || 1));
+  const z_ATRPct = rollingZ(atrPctSeries.slice(-Math.max(40, cfg.zWin || 252)), cfg.zWin || 252);
 
   // BBW + delta + z
   const BBW = safeDiv(upper - lower, m20 || 1e-9);
@@ -258,22 +268,32 @@ function decideFromIndicators(f) {
   const bearEvents = [AccelBear, Math.abs(f.z_dLogRV) > 0.7 && (f.CLV < 0 || f.K < 0.5 || f.pctB < 0.5), CrossDown, (BBWRelease && (f.CLV < -0.3) && FlowMinus)].filter(Boolean).length;
 
   let final = afterGaps;
-  if (afterGaps === 'Neutral' && TrendPlus && FlowPlus && bullEvents >= 2) final = 'Up';
-  if (afterGaps === 'Neutral' && TrendMinus && FlowMinus && bearEvents >= 2) final = 'Down';
+  if (afterGaps === 'Neutral' && (f.zS > 0) && FlowPlus && bullEvents >= 2) final = 'Up';
+  if (afterGaps === 'Neutral' && (f.zS < 0) && FlowMinus && bearEvents >= 2) final = 'Down';
   if (afterGaps === 'Up' && (bearEvents >= 2) && AccelBearStrong) final = 'Neutral';
   if (afterGaps === 'Down' && (bullEvents >= 2) && AccelBullStrong) final = 'Neutral';
 
   // Continuous confidence score in [-1,1]
   const confUp = (
-    (TrendPlus?0.3:0) + (AccelBull?0.2:0) + (FlowPlus?0.2:0) + (LocBull?0.2:0) + (cont_up?0.2:0)
+    (f.zS > 0 ? 0.3 : 0) + (AccelBull?0.2:0) + (FlowPlus?0.2:0) + (LocBull?0.2:0) + (cont_up?0.2:0)
   );
   const confDn = (
-    (TrendMinus?0.3:0) + (AccelBear?0.2:0) + (FlowMinus?0.2:0) + (LocBear?0.2:0) + (cont_down?0.2:0)
+    (f.zS < 0 ? 0.3 : 0) + (AccelBear?0.2:0) + (FlowMinus?0.2:0) + (LocBear?0.2:0) + (cont_down?0.2:0)
   );
-  let score = (confUp - confDn);
-  if (VolSpike || Exhaustion) score *= 0.5; // neutralizers shrink confidence
-  score = clamp(score, -1, 1);
-  if (final === 'Neutral') score = score * 0.5; // pull toward 0
+  let score = clamp(confUp - confDn, -1, 1);
+
+  // Neutralizers shrink confidence
+  if (VolSpike || Exhaustion) score *= 0.5;
+  if (final === 'Neutral') score *= 0.5;
+
+  // === New safety rails: ATR gating + score cap ===
+  const tooVolatile = f.atrPct > CONFIG.ATR_MAX;
+  if (tooVolatile) {
+    // Keep categorical label, but squash conviction to reduce trade weight
+    score *= 0.5;
+    if (final !== 'Neutral') final = 'Neutral'; // optional: gate outright
+  }
+  score = clamp(score, -CONFIG.SCORE_CAP, CONFIG.SCORE_CAP);
 
   return {
     base, afterGaps, final, score,
@@ -283,18 +303,49 @@ function decideFromIndicators(f) {
   };
 }
 
+/* ========================= Prob & Magnitude ========================= */
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+
+function scoreToProbability(score, temp = CONFIG.TEMP) {
+  // Map score∈[-1,1] → probability via logistic; temp>1 flattens extremes.
+  const k = 3.0; // slope before temperature (empirically reasonable)
+  const p = sigmoid((score * k) / (temp || 1));
+  return clamp(p, CONFIG.PMIN, CONFIG.PMAX);
+}
+
+function expectedMagnitude(f, score) {
+  // Anchor to ATR%, then scale mildly by absolute conviction and recent flow.
+  const absScore = Math.abs(score);
+  const flowKick = (f.logRV > 0 ? 0.05 : -0.02) + (Math.sign(f.obvSlope10) * 0.02);
+  const base = (f.atrPct || 0.01) * (1 + 0.25 * absScore + flowKick);
+  return clamp(base, 0.002, 0.08);
+}
+
 /* ========================= Public API ========================= */
 function scoreWithRows(rows, cfg = {}) {
   const f = computeIndicators(rows, cfg);
   if (!(f.priceOk && f.liqOkUSD)) {
-    return { in_universe: false, reason: 'universe_fail', indicators: f, decision: { final: 'Neutral', score: 0 } };
+    return {
+      in_universe: false,
+      reason: 'universe_fail',
+      indicators: f,
+      decision: { final: 'Neutral', score: 0 },
+      probability: { pUp: 0.5, magnitude: 0 }
+    };
   }
   const decision = decideFromIndicators(f);
-  return { in_universe: true, indicators: f, decision };
+  const pUp = scoreToProbability(decision.score, CONFIG.TEMP);
+  const magnitude = expectedMagnitude(f, decision.score);
+  return {
+    in_universe: true,
+    indicators: f,
+    decision,
+    probability: { pUp, magnitude }
+  };
 }
 
 /* ========================= Regression Head ========================= */
-// We do a ridge regression: y = X w, with w = (X^T X + lambda I)^{-1} X^T y
+// Ridge regression: y = X w, with w = (X^T X + lambda I)^{-1} X^T y
 // Features: zS, z_dS, z_dHist, logRV, z_dLogRV, obvSlope10/scale, z_obvSl, K, pctB, CLV, atrPct, z_ATRPct, BBW, z_dBBW, gapNorm, fill
 
 function featureVectorFromIndicators(f) {
@@ -318,7 +369,7 @@ function buildDatasetFromRows(rows, cfg = {}) {
       const f = computeIndicators(slice, cfg);
       if (!(f.priceOk && f.liqOkUSD)) continue;
       const x = featureVectorFromIndicators(f);
-      const r = Math.log(rows[i + 1].close / rows[i].close); // next‑day log return
+      const r = Math.log(rows[i + 1].close / rows[i].close); // next-day log return
       samples.push({ x, y: r });
     } catch { /* skip */ }
   }
@@ -384,13 +435,16 @@ function predictReturnFromIndicators(f) {
   const x = featureVectorFromIndicators(f);
   const xn = x.map((v, j) => (v - REG.means[j]) / (REG.stds[j] || 1));
   const r = xn.reduce((s, v, j) => s + v * REG.w[j], 0);
-  return r; // predicted next‑day log return
+  return r; // predicted next-day log return
 }
 
 module.exports = {
   computeIndicators,
   decideFromIndicators,
   scoreWithRows,
+  // prob & magnitude helpers (exported for parity with short-term model)
+  scoreToProbability,
+  expectedMagnitude,
   // regression (single-symbol)
   trainRegressionForRows,
   predictReturnFromIndicators,

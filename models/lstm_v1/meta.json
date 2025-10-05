@@ -1,0 +1,20 @@
+{
+  "features": [
+    "Score",
+    "Ts",
+    "avgTs",
+    "compVolPct",
+    "compSentPct",
+    "TVolComp",
+    "MVolComp",
+    "close",
+    "volume",
+    "ret1"
+  ],
+  "label": "y_up",
+  "seq_len": 30,
+  "hidden": 64,
+  "layers": 1,
+  "dropout": 0.2,
+  "test_accuracy": 0.5131375579598145
+}
