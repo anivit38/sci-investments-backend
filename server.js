@@ -1558,10 +1558,9 @@ app.post("/api/check-stock", async (req, res) => {
     if (category === "technical" || category === "overall") {
       try {
         const userId = req.user?.userId || null;
-        const t = await getTechnicalForUser(upper, userId); // keep your existing indicators/trend as baseline
+        const t = await getTechnicalForUser(upper, userId); // keep your baseline indicators/trend
 
-        // ---------- minute-based helpers (scoped to this block) ----------
-        const MS = 60 * 1000;
+        // ---------- helpers (scoped) ----------
         const ema = (prev, x, k) => (prev == null ? x : prev + k * (x - prev));
         const macdSeries = (cl, f = 12, s = 26, g = 9) => {
           const kf = 2 / (f + 1), ks = 2 / (s + 1), kg = 2 / (g + 1);
@@ -1606,32 +1605,33 @@ app.post("/api/check-stock", async (req, res) => {
           return out;
         };
 
-        // ---------- fetch 1m (fallback to 5m if thin) ----------
-        const now = new Date();
-        const period2 = new Date(now.getTime() + 1 * MS);
-        const period1 = new Date(now.getTime() - 2 * 60 * MS);
-        const intraday = await yahooFinance.chart(upper, {
-          period1, period2, interval: "1m", includePrePost: false
-        }, { fetchOptions: requestOptions }).catch(() => null);
-
-        let minute = (intraday?.quotes || []).map(q => ({
-          time: new Date(q.date || q.timestamp || Date.now()),
-          open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
-        })).filter(c => Number.isFinite(c.close));
-
-        if (minute.length < 30) {
-          const intraday5 = await yahooFinance.chart(upper, {
-            period1, period2, interval: "5m", includePrePost: false
-          }, { fetchOptions: requestOptions }).catch(() => null);
-          minute = (intraday5?.quotes || []).map(q => ({
+        // ---------- fetch last trading day intraday (works off-hours) ----------
+        // Prefer 1m, fallback to 5m — both for range:"1d" so we always get the last session
+        let minute = [];
+        try {
+          const session1m = await yahooFinance.chart(upper, {
+            range: "1d", interval: "1m", includePrePost: false
+          }, { fetchOptions: requestOptions });
+          minute = (session1m?.quotes || []).map(q => ({
             time: new Date(q.date || q.timestamp || Date.now()),
             open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
           })).filter(c => Number.isFinite(c.close));
+        } catch {}
+        if (minute.length < 30) {
+          try {
+            const session5m = await yahooFinance.chart(upper, {
+              range: "1d", interval: "5m", includePrePost: false
+            }, { fetchOptions: requestOptions });
+            minute = (session5m?.quotes || []).map(q => ({
+              time: new Date(q.date || q.timestamp || Date.now()),
+              open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
+            })).filter(c => Number.isFinite(c.close));
+          } catch {}
         }
 
-        // ---------- compute advice inputs (only if enough bars) ----------
-        let adviceSuggestion = t?.suggestion ?? null;
-        let adviceInstructions = t?.instructions ?? null;
+        // ---------- build advice when we have enough bars ----------
+        let adviceSuggestion = null;
+        let adviceInstructions = null;
         let srLevels = { support: t?.levels?.support, resistance: t?.levels?.resistance };
 
         if (minute.length >= 30) {
@@ -1641,21 +1641,21 @@ app.post("/api/check-stock", async (req, res) => {
           const lows   = recent.map(c => c.low);
           const last   = closes.at(-1);
 
-          // S/R from last hour peaks/dips, filtered by proximity to recent mean
+          // S/R from last hour peaks/dips filtered by proximity to mean
           const win = Math.min(20, closes.length);
-          const mean = closes.slice(-win).reduce((a, b) => a + b, 0) / win;
-          const sd20 = Math.sqrt(closes.slice(-win).reduce((a, b) => a + (b - mean) ** 2, 0) / win) || (last * 0.01);
+          const mean = closes.slice(-win).reduce((a,b)=>a+b,0) / win;
+          const sd20 = Math.sqrt(closes.slice(-win).reduce((a,b)=>a+(b-mean)*(b-mean),0) / win) || (last * 0.01);
 
           const peaks = localExtremaIdx(highs, 3, "peak").map(i => highs[i])
             .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
           const dips  = localExtremaIdx(lows, 3, "dip").map(i => lows[i])
             .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
 
-          const resistance = peaks.length ? peaks.reduce((a, b) => a + b, 0) / peaks.length : Math.max(...highs.slice(-30));
-          const support    = dips.length  ? dips.reduce((a, b) => a + b, 0) / dips.length  : Math.min(...lows.slice(-30));
+          const resistance = peaks.length ? peaks.reduce((a,b)=>a+b,0)/peaks.length : Math.max(...highs.slice(-30));
+          const support    = dips.length  ? dips.reduce((a,b)=>a+b,0)/dips.length  : Math.min(...lows.slice(-30));
           srLevels = { support, resistance };
 
-          // VWAP / Momentum / RSI refs
+          // VWAP / momentum / RSI refs
           const vwap = vwapFromMinute(recent);
           const vwapBias = last >= vwap ? "Bullish" : "Bearish";
 
@@ -1681,11 +1681,11 @@ app.post("/api/check-stock", async (req, res) => {
             if (r > 0.003 && Number.isFinite(rsis[i])) upRSIs.push(rsis[i]);
             if (r < -0.003 && Number.isFinite(rsis[i])) dnRSIs.push(rsis[i]);
           }
-          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a, b) => a + b, 0) / upRSIs.length : 60;
-          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a, b) => a + b, 0) / dnRSIs.length : 40;
+          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a,b)=>a+b,0)/upRSIs.length : 60;
+          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a,b)=>a+b,0)/dnRSIs.length : 40;
           const rsiNow   = rsis.at(-1) ?? 50;
 
-          // State + buffers/levels
+          // Position & buffers
           const whereNow =
             last >= resistance ? "Above resistance" :
             last <= support    ? "At/Below support" :
@@ -1693,18 +1693,26 @@ app.post("/api/check-stock", async (req, res) => {
 
           const momentum =
             (stochUp && macTiltUp) ? "Momentum opening UP" :
-            (!stochUp && !macTiltUp) ? "Momentum opening DOWN" : "Momentum mixed";
+            (!stochUp && !macTiltUp) ? "Momentum opening DOWN" :
+            "Momentum mixed";
 
-          const buf = Math.max(0.25, sd20); // ≥$0.25 buffer for large caps
+          const buf = Math.max(0.25, sd20);  // ≥ $0.25 buffer
           const breakoutBuy = resistance + buf;
-          const dipBuy      = Math.max(vwap, support + 0.5 * buf);
-          const stopLong    = Math.max(0, Math.min(support - buf, last - 3 * buf));
-          const fadeShort   = resistance - 0.5 * buf;
+          const dipBuy      = Math.max(vwap, support + 0.5*buf);
+          const stopLong    = Math.max(0, Math.min(support - buf, last - 3*buf));
+          const fadeShort   = resistance - 0.5*buf;
           const stopShort   = resistance + buf;
-          const tgt1        = resistance + 1.0 * sd20;
-          const tgt2        = resistance + 2.0 * sd20;
+          const tgt1        = resistance + 1.0*sd20;
+          const tgt2        = resistance + 2.0*sd20;
 
-          // Advice formatting (headline + bullets-as-text)
+          // Headline + bullets (string with bullet prefixes your UI already shows)
+          adviceSuggestion = (
+            whereNow === "Above resistance" ? "BREAKOUT LONG (IF HOLDS ABOVE R + VWAP)" :
+            whereNow === "At/Below support" ? "WAIT FOR RECLAIM — NO LONGS UNTIL ABOVE VWAP" :
+            vwapBias === "Bullish"          ? "BUY THE DIP ABOVE VWAP" :
+                                              "FADE INTO VWAP/RESISTANCE"
+          );
+
           const PRIMARY = vwapBias === "Bullish" ? "BULLISH BIAS ABOVE VWAP" : "BEARISH BIAS BELOW VWAP";
           const TRIGGER =
             whereNow === "Above resistance" ? "Breakout continuation IF price holds above R + buffer and VWAP is maintained."
@@ -1740,18 +1748,10 @@ app.post("/api/check-stock", async (req, res) => {
             `RSI → now ${rsiNow.toFixed(1)} | surge ref ${rsiUpRef.toFixed(1)} | plunge ref ${rsiDnRef.toFixed(1)} — ${RSI_NOTE}`
           ];
 
-          adviceSuggestion = (
-            whereNow === "Above resistance" ? "BREAKOUT LONG (IF HOLDS ABOVE R + VWAP)" :
-            whereNow === "At/Below support" ? "WAIT FOR RECLAIM — NO LONGS UNTIL ABOVE VWAP" :
-            vwapBias === "Bullish"          ? "BUY THE DIP ABOVE VWAP" :
-                                              "FADE INTO VWAP/RESISTANCE"
-          );
-
-          // your UI renders lines as bullets; keep as a single string with bullet prefix
           adviceInstructions = lines.join("\n• ");
         }
 
-        // ---------- build technicalDetail (same shape as before) ----------
+        // ---------- build technicalDetail (same keys as before) ----------
         const ind = t?.indicators || {};
         const lev = t?.levels || {};
         const computedSupport    = Number.isFinite(srLevels.support) ? srLevels.support : undefined;
@@ -1780,6 +1780,7 @@ app.post("/api/check-stock", async (req, res) => {
                         (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh :
                           metrics.fiftyTwoWeekHigh ?? null)),
           },
+          // IMPORTANT: override when we could compute minute-advice; otherwise keep your old values
           suggestion:   adviceSuggestion ?? t?.suggestion ?? null,
           instructions: adviceInstructions ?? t?.instructions ?? null,
           chartUrl:     (typeof t?.chartUrl === "string") ? t.chartUrl : null
@@ -1788,6 +1789,7 @@ app.post("/api/check-stock", async (req, res) => {
         console.warn(`TechnicalService (minute-advice) failed for ${upper}:`, e.message);
       }
     }
+
 
 
 
