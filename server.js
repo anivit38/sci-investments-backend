@@ -1560,59 +1560,58 @@ app.post("/api/check-stock", async (req, res) => {
         const userId = req.user?.userId || null;
         const t = await getTechnicalForUser(upper, userId); // keep your existing indicators/trend as baseline
 
-        // ======== Minute-based “advice builder” (local, no new routes) ========
-        // small helpers (scoped here to avoid polluting global file)
+        // ---------- minute-based helpers (scoped to this block) ----------
         const MS = 60 * 1000;
         const ema = (prev, x, k) => (prev == null ? x : prev + k * (x - prev));
-        const macdSeries = (cl, f=12, s=26, g=9) => {
-          const kf = 2/(f+1), ks = 2/(s+1), kg = 2/(g+1);
-          let ef=null, es=null, sig=null;
-          const macd=[], hist=[];
+        const macdSeries = (cl, f = 12, s = 26, g = 9) => {
+          const kf = 2 / (f + 1), ks = 2 / (s + 1), kg = 2 / (g + 1);
+          let ef = null, es = null, sig = null;
+          const macd = [], hist = [];
           for (const p of cl) {
             ef = ema(ef, p, kf); es = ema(es, p, ks);
-            const ln = (ef??0)-(es??0);
+            const ln = (ef ?? 0) - (es ?? 0);
             macd.push(ln);
             sig = ema(sig, ln, kg);
-            hist.push(ln-(sig??0));
+            hist.push(ln - (sig ?? 0));
           }
           return { macd, signal: sig, hist };
         };
-        const rsiSeries = (cl, n=14) => {
+        const rsiSeries = (cl, n = 14) => {
           const rsis = new Array(cl.length).fill(50);
-          let ag=0, al=0, seeded=false;
-          for (let i=1;i<cl.length;i++){
-            const ch = cl[i]-cl[i-1], g=Math.max(ch,0), l=Math.max(-ch,0);
-            if (i<=n){ ag+=g; al+=l; if(i===n){ ag/=n; al/=n; seeded=true; } }
-            else { ag=(ag*(n-1)+g)/n; al=(al*(n-1)+l)/n; }
-            if (seeded){ const rs=ag/(al||1e-9); rsis[i]=100-100/(1+rs); }
+          let ag = 0, al = 0, seeded = false;
+          for (let i = 1; i < cl.length; i++) {
+            const ch = cl[i] - cl[i - 1], g = Math.max(ch, 0), l = Math.max(-ch, 0);
+            if (i <= n) { ag += g; al += l; if (i === n) { ag /= n; al /= n; seeded = true; } }
+            else { ag = (ag * (n - 1) + g) / n; al = (al * (n - 1) + l) / n; }
+            if (seeded) { const rs = ag / (al || 1e-9); rsis[i] = 100 - 100 / (1 + rs); }
           }
           return rsis;
         };
         const vwapFromMinute = (bars) => {
-          let pv=0, tv=0;
+          let pv = 0, tv = 0;
           for (const b of bars) {
             const price = (b.high + b.low + b.close) / 3;
             const vol = b.volume || 0;
             pv += price * vol; tv += vol;
           }
-          return tv ? pv/tv : bars.at(-1)?.close ?? null;
+          return tv ? pv / tv : bars.at(-1)?.close ?? null;
         };
         const localExtremaIdx = (arr, w, type) => {
           const out = [];
-          for (let i=w;i<arr.length-w;i++){
-            const seg = arr.slice(i-w,i+w+1);
-            if (type==='peak' && arr[i]===Math.max(...seg)) out.push(i);
-            if (type==='dip'  && arr[i]===Math.min(...seg)) out.push(i);
+          for (let i = w; i < arr.length - w; i++) {
+            const seg = arr.slice(i - w, i + w + 1);
+            if (type === "peak" && arr[i] === Math.max(...seg)) out.push(i);
+            if (type === "dip"  && arr[i] === Math.min(...seg)) out.push(i);
           }
           return out;
         };
 
-        // Pull 1m chart ~last 2h; use last ~75 mins for SR/VWAP logic
+        // ---------- fetch 1m (fallback to 5m if thin) ----------
         const now = new Date();
-        const period2 = new Date(now.getTime() + 1*MS);
-        const period1 = new Date(now.getTime() - 2*60*MS);
+        const period2 = new Date(now.getTime() + 1 * MS);
+        const period1 = new Date(now.getTime() - 2 * 60 * MS);
         const intraday = await yahooFinance.chart(upper, {
-          period1, period2, interval: '1m', includePrePost: false
+          period1, period2, interval: "1m", includePrePost: false
         }, { fetchOptions: requestOptions }).catch(() => null);
 
         let minute = (intraday?.quotes || []).map(q => ({
@@ -1620,10 +1619,9 @@ app.post("/api/check-stock", async (req, res) => {
           open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
         })).filter(c => Number.isFinite(c.close));
 
-        // If market closed or thin 1m data, gracefully fallback to a small 5m window
         if (minute.length < 30) {
           const intraday5 = await yahooFinance.chart(upper, {
-            period1, period2, interval: '5m', includePrePost: false
+            period1, period2, interval: "5m", includePrePost: false
           }, { fetchOptions: requestOptions }).catch(() => null);
           minute = (intraday5?.quotes || []).map(q => ({
             time: new Date(q.date || q.timestamp || Date.now()),
@@ -1631,8 +1629,11 @@ app.post("/api/check-stock", async (req, res) => {
           })).filter(c => Number.isFinite(c.close));
         }
 
-        // compute advice inputs only if we have enough bars
-        let adviceSuggestion = null, adviceInstructions = null, srLevels = {};
+        // ---------- compute advice inputs (only if enough bars) ----------
+        let adviceSuggestion = t?.suggestion ?? null;
+        let adviceInstructions = t?.instructions ?? null;
+        let srLevels = { support: t?.levels?.support, resistance: t?.levels?.resistance };
+
         if (minute.length >= 30) {
           const recent = minute.slice(-75);
           const closes = recent.map(c => c.close);
@@ -1640,88 +1641,121 @@ app.post("/api/check-stock", async (req, res) => {
           const lows   = recent.map(c => c.low);
           const last   = closes.at(-1);
 
-          // Support/Resistance from last hour (local peaks/dips) with simple proximity filter
-          const m = closes.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, closes.length);
-          const sd = Math.sqrt(
-            closes.slice(-20).reduce((a,b)=>a+(b-m)*(b-m),0) / Math.min(20, closes.length)
-          ) || (last*0.01);
-          const peaks = localExtremaIdx(highs, 3, 'peak')
-            .map(i => highs[i]).filter(v => Math.abs(v - m) <= sd).slice(-10);
-          const dips  = localExtremaIdx(lows, 3, 'dip')
-            .map(i => lows[i]).filter(v => Math.abs(v - m) <= sd).slice(-10);
-          const resistance = peaks.length ? peaks.reduce((a,b)=>a+b,0)/peaks.length : Math.max(...highs.slice(-30));
-          const support    = dips.length  ? dips.reduce((a,b)=>a+b,0)/dips.length   : Math.min(...lows.slice(-30));
+          // S/R from last hour peaks/dips, filtered by proximity to recent mean
+          const win = Math.min(20, closes.length);
+          const mean = closes.slice(-win).reduce((a, b) => a + b, 0) / win;
+          const sd20 = Math.sqrt(closes.slice(-win).reduce((a, b) => a + (b - mean) ** 2, 0) / win) || (last * 0.01);
+
+          const peaks = localExtremaIdx(highs, 3, "peak").map(i => highs[i])
+            .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
+          const dips  = localExtremaIdx(lows, 3, "dip").map(i => lows[i])
+            .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
+
+          const resistance = peaks.length ? peaks.reduce((a, b) => a + b, 0) / peaks.length : Math.max(...highs.slice(-30));
+          const support    = dips.length  ? dips.reduce((a, b) => a + b, 0) / dips.length  : Math.min(...lows.slice(-30));
           srLevels = { support, resistance };
 
-          // VWAP (session approx over recent window)
+          // VWAP / Momentum / RSI refs
           const vwap = vwapFromMinute(recent);
-          const vwapBias = last >= vwap ? 'Bullish' : 'Bearish';
+          const vwapBias = last >= vwap ? "Bullish" : "Bearish";
 
-          // MACD, Stoch, RSI
           const { macd: mac, signal: macSig } = macdSeries(closes);
           const macTiltUp = (mac.at(-1) ?? 0) > (macSig ?? 0);
-          // fast stochastic on closes/highs/lows
+
           const stochK = (() => {
             const k = [];
-            for (let i=0;i<closes.length;i++){
-              const start = Math.max(0, i-14+1);
-              const h = Math.max(...highs.slice(start, i+1));
-              const l = Math.min(...lows.slice(start, i+1));
-              k.push(h===l ? 50 : ((closes[i]-l)/(h-l))*100);
+            for (let i = 0; i < closes.length; i++) {
+              const start = Math.max(0, i - 14 + 1);
+              const h = Math.max(...highs.slice(start, i + 1));
+              const l = Math.min(...lows.slice(start, i + 1));
+              k.push(h === l ? 50 : ((closes[i] - l) / (h - l)) * 100);
             }
             return k;
           })();
           const stochUp = (stochK.at(-1) ?? 50) > 55;
 
           const rsis = rsiSeries(closes, 14);
-          // build “rapid” RSI refs
           const upRSIs = [], dnRSIs = [];
-          for (let i=1;i<closes.length;i++){
-            const r = (closes[i]-closes[i-1])/(closes[i-1]||1);
-            if (r>0.003 && Number.isFinite(rsis[i])) upRSIs.push(rsis[i]);
-            if (r<-0.003 && Number.isFinite(rsis[i])) dnRSIs.push(rsis[i]);
+          for (let i = 1; i < closes.length; i++) {
+            const r = (closes[i] - closes[i - 1]) / (closes[i - 1] || 1);
+            if (r > 0.003 && Number.isFinite(rsis[i])) upRSIs.push(rsis[i]);
+            if (r < -0.003 && Number.isFinite(rsis[i])) dnRSIs.push(rsis[i]);
           }
-          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a,b)=>a+b,0)/upRSIs.length : 60;
-          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a,b)=>a+b,0)/dnRSIs.length : 40;
-          const rsiNow = rsis.at(-1) ?? 50;
+          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a, b) => a + b, 0) / upRSIs.length : 60;
+          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a, b) => a + b, 0) / dnRSIs.length : 40;
+          const rsiNow   = rsis.at(-1) ?? 50;
 
-          // Advice (short, no fluff; your style)
+          // State + buffers/levels
           const whereNow =
-            last >= resistance ? 'Above resistance' :
-            last <= support    ? 'At/Below support' :
-                                'Between S/R';
+            last >= resistance ? "Above resistance" :
+            last <= support    ? "At/Below support" :
+                                "Between S/R";
+
           const momentum =
-            (stochUp && macTiltUp) ? 'Momentum opening UP' :
-            (!stochUp && !macTiltUp) ? 'Momentum opening DOWN' :
-            'Momentum mixed';
+            (stochUp && macTiltUp) ? "Momentum opening UP" :
+            (!stochUp && !macTiltUp) ? "Momentum opening DOWN" : "Momentum mixed";
 
-          const suggestLine = (() => {
-            if (whereNow === 'Above resistance') return 'Treat as breakout; manage risk with ATR-based stop.';
-            if (whereNow === 'At/Below support') return 'Caution on longs; wait for VWAP reclaim before risk-on.';
-            if (vwapBias === 'Bullish') return 'Bias long above VWAP; buy dips toward VWAP/support, scale out near resistance.';
-            if (vwapBias === 'Bearish') return 'Bias short below VWAP; fade pops into resistance, cover near support.';
-            return 'Wait for structure around VWAP or S/R.';
-          })();
+          const buf = Math.max(0.25, sd20); // ≥$0.25 buffer for large caps
+          const breakoutBuy = resistance + buf;
+          const dipBuy      = Math.max(vwap, support + 0.5 * buf);
+          const stopLong    = Math.max(0, Math.min(support - buf, last - 3 * buf));
+          const fadeShort   = resistance - 0.5 * buf;
+          const stopShort   = resistance + buf;
+          const tgt1        = resistance + 1.0 * sd20;
+          const tgt2        = resistance + 2.0 * sd20;
 
-          const extra = [];
-          if (momentum.includes('UP'))   extra.push('Stoch + MACD aligned up.');
-          if (momentum.includes('DOWN')) extra.push('Stoch + MACD aligned down.');
-          if (rsiNow < rsiDnRef)         extra.push('RSI near “plunge” ref → risk of further downside.');
-          if (rsiNow > rsiUpRef)         extra.push('RSI above “surge” ref → stretched; expect mean reversion.');
+          // Advice formatting (headline + bullets-as-text)
+          const PRIMARY = vwapBias === "Bullish" ? "BULLISH BIAS ABOVE VWAP" : "BEARISH BIAS BELOW VWAP";
+          const TRIGGER =
+            whereNow === "Above resistance" ? "Breakout continuation IF price holds above R + buffer and VWAP is maintained."
+          : whereNow === "At/Below support" ? "Wait for reclaim of VWAP and a higher low above Support before risking long."
+          : vwapBias === "Bullish"          ? "Buy-the-dip toward VWAP/Support with higher-low confirmation."
+                                            : "Fade pops into VWAP/Resistance with rejection wick and momentum down.";
 
-          adviceSuggestion   = suggestLine;
-          adviceInstructions = [
-            `Levels: S ${support.toFixed(2)} / R ${resistance.toFixed(2)} / VWAP ${(vwap??last).toFixed(2)}`,
-            `Where: ${whereNow} | Bias: ${vwapBias} | Momentum: ${momentum}`,
-            ...extra
-          ].join('  •  ');
+          const MOMO =
+            momentum.includes("UP")   ? "Momentum: Stoch + MACD aligned UP."
+          : momentum.includes("DOWN") ? "Momentum: Stoch + MACD aligned DOWN."
+                                      : "Momentum: mixed—wait for alignment.";
+
+          const RSI_NOTE =
+            rsiNow > rsiUpRef ? "RSI above “surge” ref → stretched; expect mean reversion risk."
+          : rsiNow < rsiDnRef ? "RSI near/under “plunge” ref → bounce risk but trend can continue."
+                              : "RSI neutral window.";
+
+          const lines = [
+            `Levels → Support ${support.toFixed(2)} | Resistance ${resistance.toFixed(2)} | VWAP ${(vwap ?? last).toFixed(2)}`,
+            `Primary Bias → ${PRIMARY}`,
+            `Where → ${whereNow}`,
+            `Trigger → ${TRIGGER}`,
+            vwapBias === "Bullish"
+              ? `Entries → Breakout: ${breakoutBuy.toFixed(2)}  •  Dip buy: ${dipBuy.toFixed(2)}`
+              : `Entries → Fade short near: ${fadeShort.toFixed(2)} (rejection)`,
+            vwapBias === "Bullish"
+              ? `Stops → ${stopLong.toFixed(2)} (below Support−buffer)`
+              : `Stops → ${stopShort.toFixed(2)} (above Resistance+buffer)`,
+            vwapBias === "Bullish"
+              ? `Targets → ${tgt1.toFixed(2)} / ${tgt2.toFixed(2)} (scale out into strength)`
+              : `Targets → Support retest ${support.toFixed(2)}; deeper = Support−${buf.toFixed(2)}`,
+            MOMO,
+            `RSI → now ${rsiNow.toFixed(1)} | surge ref ${rsiUpRef.toFixed(1)} | plunge ref ${rsiDnRef.toFixed(1)} — ${RSI_NOTE}`
+          ];
+
+          adviceSuggestion = (
+            whereNow === "Above resistance" ? "BREAKOUT LONG (IF HOLDS ABOVE R + VWAP)" :
+            whereNow === "At/Below support" ? "WAIT FOR RECLAIM — NO LONGS UNTIL ABOVE VWAP" :
+            vwapBias === "Bullish"          ? "BUY THE DIP ABOVE VWAP" :
+                                              "FADE INTO VWAP/RESISTANCE"
+          );
+
+          // your UI renders lines as bullets; keep as a single string with bullet prefix
+          adviceInstructions = lines.join("\n• ");
         }
 
-        // ======== Build technicalDetail with SAME shape you already use ========
+        // ---------- build technicalDetail (same shape as before) ----------
         const ind = t?.indicators || {};
         const lev = t?.levels || {};
-        const computedSupport    = srLevels.support;
-        const computedResistance = srLevels.resistance;
+        const computedSupport    = Number.isFinite(srLevels.support) ? srLevels.support : undefined;
+        const computedResistance = Number.isFinite(srLevels.resistance) ? srLevels.resistance : undefined;
 
         technicalDetail = {
           rsi14:  Number.isFinite(ind.RSI14)  ? ind.RSI14  : null,
@@ -1737,25 +1771,24 @@ app.post("/api/check-stock", async (req, res) => {
             return "sideways";
           })(),
           levels: {
-            // Prefer minute-based S/R if we computed them; otherwise keep your old behavior
-            support: Number.isFinite(computedSupport) ? computedSupport :
-                    (Number.isFinite(lev.support)    ? lev.support    :
+            support: (computedSupport !== undefined) ? computedSupport :
+                      (Number.isFinite(lev.support) ? lev.support :
                       (Number.isFinite(metrics.dayLow) ? metrics.dayLow :
-                      metrics.fiftyTwoWeekLow ?? null)),
-            resistance: Number.isFinite(computedResistance) ? computedResistance :
+                        metrics.fiftyTwoWeekLow ?? null)),
+            resistance: (computedResistance !== undefined) ? computedResistance :
                         (Number.isFinite(lev.resistance) ? lev.resistance :
                         (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh :
                           metrics.fiftyTwoWeekHigh ?? null)),
           },
-          // <<< here is what you actually wanted to change: advice text + how it’s derived >>>
-          suggestion:   adviceSuggestion   ?? t?.suggestion ?? null,
+          suggestion:   adviceSuggestion ?? t?.suggestion ?? null,
           instructions: adviceInstructions ?? t?.instructions ?? null,
-          chartUrl:     (typeof t?.chartUrl === 'string') ? t.chartUrl : null
+          chartUrl:     (typeof t?.chartUrl === "string") ? t.chartUrl : null
         };
       } catch (e) {
         console.warn(`TechnicalService (minute-advice) failed for ${upper}:`, e.message);
       }
     }
+
 
 
     // 6) Build the base payload
