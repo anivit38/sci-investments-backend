@@ -2,7 +2,7 @@
 // Keeps your existing behavior + adds safety guards so prices never equal,
 // and exposes indicators/trend/levels/suggestion for /api/check-stock.
 
-const yahoo = require('yahoo-finance2').default;
+const { yf: yahooFinance, historicalCompat } = require('../lib/yfCompat');
 const { sizePositionFromProfile } = require('./PositionSizingService');
 const UserProfile = require('../models/UserProfile');
 
@@ -43,7 +43,8 @@ function enforceDistancesLong(entry, stop, target) {
 async function getTechnical(symbol, opts = {}) {
   // 0) Live quote
   let quote = null;
-  try { quote = await yahoo.quote(symbol); } catch (_) {}
+  try { quote = await yahooFinance.quote(symbol); } catch (_) {}
+
 
   // 1) Session state
   const rawTime = quote?.regularMarketTime;
@@ -64,10 +65,11 @@ async function getTechnical(symbol, opts = {}) {
   // 3) History
   let history = [];
   try {
-    history = await yahoo.historical(symbol, { period1, period2, interval: '1d' });
+    history = await historicalCompat(symbol, { period1, period2, interval: '1d' });
   } catch {
-    try { history = await yahoo.historical(symbol, { period1, period2 }); } catch { history = []; }
+    history = [];
   }
+
 
   // 4) Fallback if nothing
   let isFallback = false;
@@ -89,13 +91,30 @@ async function getTechnical(symbol, opts = {}) {
   const volumes = history.map(r => r.volume || 0);
 
   if (isFallback) {
+    const c = closes[0];
+    const lvlPad = Math.max(c * 0.005, 0.05); // ~0.5% or $0.05
     return {
       symbol,
       technical: history,
-      instructions: [`Last available price on ${dates[0]} was $${closes[0].toFixed(2)}—no signals generated.`],
-      chartUrl: ''
+      indicators: {
+        RSI14: null,
+        MACD: null,
+        SMA50: null,
+        SMA200: null,
+        ATR14: null,
+        BB_upper: null,
+        BB_lower: null,
+      },
+      trend: 'sideways',
+      levels: { support: +(c - lvlPad).toFixed(2), resistance: +(c + lvlPad).toFixed(2) },
+      suggestion: { action: 'hold', rationale: ['Insufficient history to compute indicators.'] },
+      instructions: [
+        `Last available price on ${dates[0]} was $${c.toFixed(2)} — not enough data to compute signals.`,
+      ],
+      chartUrl: '',
     };
   }
+
 
   // 6) Indicators (full series)
   const sma20    = SMA.calculate({ period: 20,  values: closes });
@@ -128,13 +147,28 @@ async function getTechnical(symbol, opts = {}) {
   })).filter(r => r.sma20 !== null && r.ema50 !== null && r.rsi14 !== null);
 
   if (!raw.length) {
+    const lastClose = closes[closes.length - 1];
+    const lvlPad = Math.max(lastClose * 0.005, 0.05);
     return {
       symbol,
       technical: [],
-      instructions: ['No valid price bars remain after indicator calculation—cannot generate signals.'],
-      chartUrl: ''
+      indicators: {
+        RSI14: null,
+        MACD: null,
+        SMA50: null,
+        SMA200: null,
+        ATR14: null,
+        BB_upper: null,
+        BB_lower: null,
+      },
+      trend: 'sideways',
+      levels: { support: +(lastClose - lvlPad).toFixed(2), resistance: +(lastClose + lvlPad).toFixed(2) },
+      suggestion: { action: 'hold', rationale: ['No valid bars after indicator calc.'] },
+      instructions: ['No valid price bars remain after indicator calculation — cannot generate signals.'],
+      chartUrl: '',
     };
   }
+
 
   // 8) Focus on last two bars
   const prev = raw[raw.length - 2];

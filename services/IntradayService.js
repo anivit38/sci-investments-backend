@@ -1,5 +1,13 @@
 // backend/services/IntradayService.js
-const yahooFinance = require("yahoo-finance2").default;
+
+let yahooFinance;
+try {
+  // Prefer your compat wrapper (usually includes better defaults/headers)
+  ({ yf: yahooFinance } = require("../lib/yfCompat"));
+} catch {
+  // Fallback to raw library
+  yahooFinance = require("yahoo-finance2").default;
+}
 
 const ALLOWED_INTERVALS = ["1m", "2m", "5m", "15m", "30m", "60m"];
 const ALLOWED_RANGES = ["1d", "5d", "1mo", "3mo"];
@@ -32,28 +40,27 @@ exports.getIntradayIndicators = async (symbol, opts = {}) => {
     period2 = now;
     period1 = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
   }
+
   period1 = clampToIntradayLimit(period1, period2, interval);
 
+  // If Yahoo blocks / fails, let caller decide how to degrade (server now returns [])
   const result = await yahooFinance.chart(symbol, {
     period1,
     period2,
     interval,
     includePrePost: false,
-    // NOTE: don't set "events" to [] — some versions expect a string; omit it entirely
   });
 
   const quotes = result?.quotes ?? [];
   return quotes
-    .filter(
-      (q) =>
-        q &&
-        q.open != null &&
-        q.high != null &&
-        q.low != null &&
-        q.close != null &&
-        (q.volume == null || q.volume > 0)
+    .filter(q =>
+      q &&
+      q.open != null &&
+      q.high != null &&
+      q.low != null &&
+      q.close != null
     )
-    .map((q) => ({
+    .map(q => ({
       timestamp: +new Date(q.date),
       open: q.open,
       high: q.high,

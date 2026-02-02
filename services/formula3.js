@@ -1,338 +1,283 @@
-// backend/services/formula3.js
-const { median, mad, zScoreMAD, sma, ema } = require('./math');
-const {
-  macd, rsi, atr, bollingerWidth, rvol,
-  stochasticK, stochasticD, williamsR, cci,
-  diPlusMinus, sar, linReg
-} = require('./metrics');
-const {
-  compPercent, bucketTickerVol, bucketMarketVol,
-  computeTickerVol, computeMarketVol
-} = require('./volatility');
-const { buildDominationSeries } = require('./domination');
+// services/formula3.js
+// ------------------------------------------------------------------
+// SCI Next-Day Prediction (runtime).
+// - Uses your daily candles + optional VIX/sentiment/IV inputs.
+// - Builds the z-scored feature pack expected by YOUR combiner.
+// - Delegates the final "score" to ./sciCombiner.js (your formula).
+// - Maps that score to Up/Down/Neutral + probUp + magnitude.
+// ------------------------------------------------------------------
 
-/* ---------------- Z on prior data (t-L; t-1) ---------------- */ // :contentReference[oaicite:3]{index=3}
-function zSeriesPrior(series) {
-  return series.map((Xt, i) => {
-    const past = series.slice(0, i).filter(Number.isFinite);
-    if (!past.length) return NaN;
-    return zScoreMAD(Xt, past);
-  });
-}
-function nextDayMove(closes) { return closes.map((c,i)=> i<closes.length-1 ? (closes[i+1]>c?1:-1) : undefined); }
-function nextDayPct(closes)  { return closes.map((c,i)=> i<closes.length-1 ? ((closes[i+1]-c)/c*100) : undefined); }
+'use strict';
 
-/* ---------------- Build all indicators ---------------- */
-function buildAllFeatures(inputs) {
-  const N = inputs.candles.length;
-  const c = inputs.candles.map(x=>x.close);
-  const h = inputs.candles.map(x=>x.high);
-  const l = inputs.candles.map(x=>x.low);
-  const v = inputs.candles.map(x=>x.volume);
+const { RSI, SMA, ATR, BollingerBands } = require('technicalindicators');
+const combiner = require('./sciCombiner'); // ← YOUR formula lives here
 
-  const bbw = bollingerWidth(c,20);
-  const atrAbs = atr(h,l,c,14);
-  const atrPct = atrAbs.map((x,i)=> x/(c[i]||1));
-  const rvol20 = rvol(v,20);
-  const iv = (inputs.impliedVol || Array(N).fill(NaN));
+/* ================= Tunables ================= */
+const CFG = {
+  // Probability mapping (kept mild; you can tweak)
+  TEMP      : Number(process.env.SCI_TEMP      || 1.35),
+  PMIN      : Number(process.env.SCI_PMIN      || 0.20),
+  PMAX      : Number(process.env.SCI_PMAX      || 0.82),
+  SCORE_CAP : Number(process.env.SCI_SCORE_CAP || 0.90),
 
-  const mac = macd(c);
-  const rsi14 = rsi(c,14);
-  const stochK = stochasticK(h,l,c,14);
-  const stochD = stochasticD(stochK,3);
-  const wpr = williamsR(h,l,c,14);
-  const cci20 = cci(h,l,c,20);
+  // Decision band around 0 for Neutral
+  NEUTRAL_BAND: Number(process.env.SCI_NEUTRAL_BAND || 0.15),
 
-  const roc1 = c.map((x,i)=> i? (x-c[i-1])/(c[i-1]||1) : NaN);
-  const momentum10 = c.map((x,i)=> i>=10? (x - c[i-10]) : NaN);
-  const { slope: ema20Slope } = linReg(ema(c,20), 20);
-  const { plusDI, minusDI, adx } = diPlusMinus(h,l,c,14);
-  const psar = sar(h,l,0.02,0.2);
-  const { slope: priceSlope20, r2: priceR2_20 } = linReg(c,20);
+  // Z lookback (robust median/MAD)
+  Z_LOOKBACK: Number(process.env.SCI_Z_LOOKBACK || 252),
 
-  const sma20 = sma(c,20), ema20 = ema(c,20);
-  const maSpread = ema(c,10).map((x,i)=> Number.isFinite(x)&&Number.isFinite(ema20[i]) ? x-ema20[i] : NaN);
-  const priceMinusSMA20 = c.map((x,i)=> Number.isFinite(sma20[i]) ? (x - sma20[i])/(sma20[i]||1) : NaN);
+  // Expected magnitude scale
+  MAGNITUDE_MIN: 0.002, // 0.2%
+  MAGNITUDE_MAX: 0.08,  // 8%
+};
 
-  const z = {
-    // TVol pieces
-    bbw: zSeriesPrior(bbw),
-    atrPct: zSeriesPrior(atrPct),
-    rvol: zSeriesPrior(rvol20),
-    iv: zSeriesPrior(iv),
+const clamp   = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const safeNum = (n, fb = 0) => (Number.isFinite(+n) ? +n : fb);
+const nz      = (n) => (Number.isFinite(n) ? n : 0);
 
-    // Families
-    macdLine: zSeriesPrior(mac.line),
-    macdSig : zSeriesPrior(mac.signal),
-    rsi14: zSeriesPrior(rsi14),
-    stochK: zSeriesPrior(stochK),
-    wpr: zSeriesPrior(wpr),
-    cci20: zSeriesPrior(cci20),
+const eps = 1e-12;
+const log = (x) => Math.log(Math.max(x, eps));
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 
-    roc1: zSeriesPrior(roc1),
-    mom10: zSeriesPrior(momentum10),
-    ema20Slope: zSeriesPrior(ema20Slope),
-
-    adx14: zSeriesPrior(adx),
-    plusDI14: zSeriesPrior(plusDI),
-    psarDist: zSeriesPrior(c.map((x,i)=> Number.isFinite(psar[i])? (x-psar[i])/(x||1) : NaN)),
-
-    priceSlope20: zSeriesPrior(priceSlope20),
-    priceR2_20: zSeriesPrior(priceR2_20),
-
-    maSpread: zSeriesPrior(maSpread),
-    priceMinusSMA20: zSeriesPrior(priceMinusSMA20),
-  };
-
-  return { N, c, h, l, v, z };
+/* ================ Small utils ================ */
+function seriesFromCandles(candles) {
+  const C = candles.map(c => +c.close  || 0);
+  const O = candles.map(c => +c.open   || 0);
+  const H = candles.map(c => +c.high   || 0);
+  const L = candles.map(c => +c.low    || 0);
+  const V = candles.map(c => +c.volume || 0);
+  return { O, H, L, C, V };
 }
 
-/* ---------------- 432 combos ---------------- */           // :contentReference[oaicite:4]{index=4}
-const F1 = ['sma20','ema20','macdLine','macdSig','maSpread','priceMinusSMA20']; // 6
-const F2 = ['rsi14','stochK','wpr','cci20'];                                     // 4
-const F3 = ['roc1','mom10','ema20Slope'];                                        // 3
-const F4 = ['adx14','plusDI14','psarDist'];                                      // 3
-const F5 = ['priceSlope20','priceR2_20'];                                        // 2
-function zKeyForF1(k){ if(k==='sma20')return 'priceMinusSMA20'; if(k==='ema20')return 'ema20Slope'; return k; }
-function sumZ(z, keys, i){ return keys.reduce((s,k)=> s + (Number.isFinite(z[(F1.includes(k)?zKeyForF1(k):k)]?.[i]) ? z[(F1.includes(k)?zKeyForF1(k):k)][i] : 0), 0); }
-
-/* ----- %SM by decile bins, tie-breaker: lowest avg (max% − min%) of majority %C ----- */ // :contentReference[oaicite:5]{index=5}
-function evaluateCombo(z, closes) {
-  const N = closes.length, y = nextDayMove(closes), pct = nextDayPct(closes);
-  return function(keysForThisCombo){
-    const S = Array(N).fill(NaN);
-    for (let i=0;i<N;i++) S[i] = sumZ(z, keysForThisCombo, i);
-
-    const idx = Array.from({length:N-1}, (_,i)=>i).filter(i=>Number.isFinite(S[i]) && Number.isFinite(y[i]));
-    if (!idx.length) return null;
-
-    const sorted = idx.sort((a,b)=> S[a]-S[b]);
-    const n = sorted.length, gSize = Math.floor(n/10);
-    const bins = [];
-    let cursor = 0;
-    for (let g=0; g<10; g++){
-      const take = (g===9) ? (n-cursor) : gSize;
-      if (take<=0) break;
-      bins.push(sorted.slice(cursor, cursor+take));
-      cursor += take;
-    }
-
-    const perBin = bins.map(arr=>{
-      const ups = arr.filter(i=>y[i]===1), downs = arr.filter(i=>y[i]===-1);
-      const maj = ups.length >= downs.length ? 1 : -1;
-      const sm = (maj===1? ups.length : downs.length) / (arr.length||1);         // %SM   :contentReference[oaicite:6]{index=6}
-      const majPct = arr.filter(i=>y[i]===maj).map(i=>pct[i]).filter(Number.isFinite);
-      const rng = majPct.length ? (Math.max(...majPct) - Math.min(...majPct)) : 0; // tie-breaker range  :contentReference[oaicite:7]{index=7}
-      return { sm, rng };
-    });
-
-    const avgSM = perBin.reduce((a,b)=>a+b.sm,0)/(perBin.length||1);
-    const avgRangePct = perBin.reduce((a,b)=>a+b.rng,0)/(perBin.length||1);
-    return { keys: keysForThisCombo, avgSM, avgRangePct };
+function obvSeries(C, V) {
+  const n = Math.min(C.length, V.length);
+  const obv = Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const dir = Math.sign(C[i] - C[i - 1]);
+    obv[i] = obv[i - 1] + dir * (V[i] || 0);
   }
-}
-function selectBestCombo(z, closes){
-  const evalFn = evaluateCombo(z, closes);
-  const combos = [];
-  for (const a of F1) for (const b of F2) for (const c of F3) for (const d of F4) for (const e of F5) {
-    const res = evalFn([a,b,c,d,e]); if (res) combos.push(res);
-  }
-  combos.sort((x,y)=> y.avgSM - x.avgSM);
-  const top = combos[0];
-  const within3 = combos.filter(c=> (top.avgSM - c.avgSM) <= 0.03);              // within 3%  :contentReference[oaicite:8]{index=8}
-  within3.sort((x,y)=> x.avgRangePct - y.avgRangePct);
-  return within3[0];
+  return obv;
 }
 
-/* ---------------- Volume/Sentiment/Volatility/ Domination ---------------- */
-function compSeries(vals, n=20){
-  const avg = vals.map((_,i)=> {
-    const s = Math.max(0, i-(n-1)); const slice = vals.slice(s,i+1);
-    return slice.reduce((a,b)=>a+b,0)/slice.length;
-  });
-  return vals.map((v,i)=> compPercent(v, avg[i]));
-}
-function buildVolSentDom(inputs){
-  const N = inputs.candles.length;
-  const c = inputs.candles.map(x=>x.close), h=inputs.candles.map(x=>x.high), l=inputs.candles.map(x=>x.low), v=inputs.candles.map(x=>x.volume);
-
-  const compVolPct = compSeries(v,20);                                            // Volume column  :contentReference[oaicite:9]{index=9}
-  const sent = (inputs.sentiment || Array(N).fill({score:NaN})).map(s=> s?.score ?? NaN);
-  const compSentPct = compSeries(sent,20);                                        // Sentiment column  :contentReference[oaicite:10]{index=10}
-
-  // Volume domination
-  let domination = inputs.volumeDomination;                                       // "Buyer"|"Seller"|"Neutral"
-  if (!domination && inputs.ticksByDayMap) {
-    domination = buildDominationSeries(inputs.candles, inputs.ticksByDayMap);
-  }
-
-  // TVol & MVol with buckets → scores  :contentReference[oaicite:11]{index=11}
-  const zBBW = zSeriesPrior(bollingerWidth(c,20));
-  const zATR = zSeriesPrior(atr(h,l,c,14).map((x,i)=>x/(c[i]||1)));
-  const zRVOL = zSeriesPrior(rvol(v,20));
-  const zIV   = zSeriesPrior(inputs.impliedVol || Array(N).fill(NaN));
-  const TVol  = zBBW.map((_,i)=> computeTickerVol(zBBW[i], zATR[i], zRVOL[i], zIV[i]));
-  const avgTVol = sma(TVol.map(x=>Number.isFinite(x)?x:0),20);
-  const TVolComp = TVol.map((v,i)=> Number.isFinite(avgTVol[i]) ? compPercent(v, avgTVol[i]) : NaN);
-  const TVolBucket = TVolComp.map(x => Number.isFinite(x)? bucketTickerVol(x) : {label:'N/A',score:0});
-
-  const zVIX = zSeriesPrior(inputs.vix || Array(N).fill(NaN));
-  const zEPU = zSeriesPrior(inputs.epu || Array(N).fill(NaN));
-  const zMDD = zSeriesPrior(inputs.mdd || Array(N).fill(NaN));
-  const MVol = zVIX.map((_,i)=> computeMarketVol(zVIX[i], zEPU[i], zMDD[i]));
-  const avgMVol = sma(MVol.map(x=>Number.isFinite(x)?x:0),20);
-  const MVolComp = MVol.map((v,i)=> Number.isFinite(avgMVol[i]) ? compPercent(v, avgMVol[i]) : NaN);
-  const MVolBucket = MVolComp.map(x => Number.isFinite(x)? bucketMarketVol(x) : {label:'N/A',score:0});
-
-  return { compVolPct, compSentPct, TVolComp, TVolBucket, MVolComp, MVolBucket, domination };
-}
-
-/* ---------------- Ts & avgTs (AH/MO/MC/C) ---------------- */
-// Your spec defines the averaging based on when we compute the score.  :contentReference[oaicite:12]{index=12}
-// We support two modes: 'during' and 'after'. If phases for t and t-1 are supplied,
-// we follow exactly; if not, we fall back to daily Ts.
-function averageTsBySpec(currentDayRows, prevDayRows, mode /* 'during' | 'after' */) {
-  if (!Array.isArray(currentDayRows) || !Array.isArray(prevDayRows)) return NaN;
-  const map = (rows)=> Object.fromEntries(rows.map(r=> [r.phase, r.Ts]).filter(([_,v])=>Number.isFinite(v)));
-  const cur = map(currentDayRows), prev = map(prevDayRows);
-  if (mode === 'during') {
-    const parts = [cur.MO, prev.MC, prev.AH, prev.MO, cur.C];                    // 5-term average  :contentReference[oaicite:13]{index=13}
-    const arr = parts.filter(Number.isFinite);
-    return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : NaN;
-  } else {
-    const parts = [prev.MC, prev.AH, prev.MO, cur.C];                             // 4-term average  :contentReference[oaicite:14]{index=14}
-    const arr = parts.filter(Number.isFinite);
-    return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : NaN;
-  }
-}
-
-/* ---------------- Full pipeline ---------------- */
-function runFullFormula(inputs){
-  const { N, c, z } = buildAllFeatures(inputs);
-  const best = selectBestCombo(z, c);                                             // 432 + tie-breaker  :contentReference[oaicite:15]{index=15}
-  const { compVolPct, compSentPct, TVolComp, TVolBucket, MVolComp, MVolBucket, domination } = buildVolSentDom(inputs);
-
-  // Score = sum of z's for best combo  :contentReference[oaicite:16]{index=16}
-  const Score = Array(N).fill(NaN);
-  for (let i=0;i<N;i++) Score[i] = sumZ(z, best.keys, i);
-
-  // Ts per index (row) = Score + CompVol% + CompSent% + TVolBucketScore + MVolBucketScore  :contentReference[oaicite:17]{index=17}
-  const Ts = Array(N).fill(NaN);
-  for (let i=0;i<N;i++){
-    const compV = Number.isFinite(compVolPct[i]) ? compVolPct[i] : 0;
-    const compS = Number.isFinite(compSentPct[i]) ? compSentPct[i] : 0;
-    const tB = TVolBucket[i]?.score ?? 0;
-    const mB = MVolBucket[i]?.score ?? 0;
-    Ts[i] = (Score[i]||0) + compV + compS + tB + mB;
-  }
-
-  // avgTs per calendar day per your AH/MO/MC/C rule
-  // If you pass inputs.dayRows = [{date:'YYYY-MM-DD', rows:[{phase:'AH'|'MO'|'MC'|'C', idx}]}, ...]
-  // we compute exact averages; else fallback to Ts.
-  const avgTs = Ts.slice();
-  if (Array.isArray(inputs.dayRows) && inputs.dayRows.length >= 2) {
-    for (let d = 1; d < inputs.dayRows.length; d++) {
-      const cur = inputs.dayRows[d];
-      const prev = inputs.dayRows[d-1];
-      const mode = inputs.mode === 'during' ? 'during' : 'after';
-      // attach Ts to each row
-      const rowsWithTs = cur.rows.map(r => ({...r, Ts: Ts[r.idx]}));
-      const prevRowsTs = prev.rows.map(r => ({...r, Ts: Ts[r.idx]}));
-      const val = averageTsBySpec(rowsWithTs, prevRowsTs, mode);
-      // set avgTs for all indices of the current day to same avg
-      for (const r of rowsWithTs) avgTs[r.idx] = val;
+function pctBSeries(C, period = 20, std = 2) {
+  // technicalindicators returns only when enough lookback exists; align to C
+  const bb = BollingerBands.calculate({ period, stdDev: std, values: C });
+  const out = Array(C.length).fill(null);
+  for (let i = 0; i < C.length; i++) {
+    const j = i - (period - 1);
+    if (j >= 0 && bb[j]) {
+      const lower = bb[j].lower;
+      const upper = bb[j].upper;
+      const den = (upper - lower);
+      out[i] = den === 0 ? 0.5 : clamp((C[i] - lower) / den, 0, 1);
     }
   }
-
-  return {
-    bestCombo: best,
-    snapshot: {
-      date: inputs.candles[N-1].t,
-      domination: domination?.[N-1] ?? null,                                     // "Buyer"/"Seller"/"Neutral"
-      Score: Score[N-1],
-      compVolPct: compVolPct[N-1],
-      compSentPct: compSentPct[N-1],
-      TVolComp: TVolComp[N-1], TVolBucket: TVolBucket[N-1],
-      MVolComp: MVolComp[N-1], MVolBucket: MVolBucket[N-1],
-      Ts: Ts[N-1], avgTs: avgTs[N-1]
-    },
-    series: { Score, Ts, avgTs, domination }
-  };
+  return out;
 }
 
-/* ---------------- Similarity & Prediction (strict) ---------------- */
-// Gate 1: avgTs within ±3 (widen to 10 if needed)  :contentReference[oaicite:18]{index=18}
-// Gate 2: vector distance on [Score, %CompVol, %CompSent, TVolComp, MVolComp] must be among k-nearest.
+function ema(values, n) {
+  const k = 2 / (n + 1);
+  const out = Array(values.length).fill(NaN);
+  for (let i = 0; i < values.length; i++) {
+    const x = values[i];
+    out[i] = i === 0 ? x : out[i - 1] + k * (x - out[i - 1]);
+  }
+  return out;
+}
+
+function obvSlope(obv, n = 10) {
+  const out = Array(obv.length).fill(0);
+  for (let i = 0; i < obv.length; i++) {
+    out[i] = i >= n ? (obv[i] - obv[i - n]) : 0;
+  }
+  return out;
+}
+
+/* -------- Robust rolling z (median/MAD) — missing helper added -------- */
+function median(arr) {
+  const a = [...arr].filter(Number.isFinite).sort((x, y) => x - y);
+  if (!a.length) return NaN;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : 0.5 * (a[m - 1] + a[m]);
+}
+function mad(arr) {
+  const a = arr.filter(Number.isFinite);
+  if (!a.length) return NaN;
+  const med = median(a);
+  const dev = a.map(x => Math.abs(x - med));
+  return 1.4826 * median(dev); // consistency factor to ~std
+}
+function winsorize(arr, limit = 3.5) {
+  return arr.map(z => Math.max(-limit, Math.min(limit, z)));
+}
+function rollingRobustZ(values, L, { winsorFinal = true } = {}) {
+  const n = values.length;
+  const z = new Array(n).fill(NaN);
+  for (let t = 0; t < n; t++) {
+    const start = Math.max(0, t - L);
+    const end = t; // exclude current
+    if (end - start <= 1) continue;
+    const window = values.slice(start, end).filter(Number.isFinite);
+
+    let med1 = median(window);
+    let mad1 = mad(window);
+    const filtered =
+      mad1 > eps ? window.filter(x => Math.abs((x - med1) / mad1) <= 3.5) : window;
+
+    const med2 = median(filtered);
+    const mad2 = mad(filtered);
+    if (!(mad2 > eps)) continue;
+
+    z[t] = (values[t] - med2) / mad2;
+  }
+  return winsorFinal ? winsorize(z, 3.5) : z;
+}
+/* --------------------------------------------------------------------- */
+
+function scoreToProb(s, temp = CFG.TEMP) {
+  const k = 3.0;
+  const p = sigmoid((clamp(s, -CFG.SCORE_CAP, CFG.SCORE_CAP) * k) / (temp || 1));
+  return clamp(p, CFG.PMIN, CFG.PMAX);
+}
+
+// Magnitude helper (renamed to avoid shadowing when used below)
+function expectedMagnitudeFromATR(atrPctSeries, score) {
+  const atr = atrPctSeries.at(-1) || 0.01;
+  const absS = Math.abs(score);
+  // Mildly scale with conviction, anchor to ATR%
+  const base = atr * (1 + 0.25 * absS);
+  return clamp(base, CFG.MAGNITUDE_MIN, CFG.MAGNITUDE_MAX);
+}
+
+/* ================ Feature pack (Z.*) ================ */
+/**
+ * Build z-scored metrics required by your combiner.
+ * Z keys provided:
+ *   zRET1, zMOM5, zRSI14, zATRpct, zGAP, zVOL, zOBV, zPctB
+ */
+function buildZPack(candles) {
+  const { O, H, L, C, V } = seriesFromCandles(candles);
+  const n = C.length;
+  if (n < 40) return null;
+
+  // 1-day log return & 5-day momentum
+  const ret1 = C.map((c, i) => (i ? log(c / (C[i - 1] || c)) : 0));
+  const mom5 = C.map((c, i) => (i >= 5 ? (c - C[i - 5]) / (C[i - 5] || 1) : 0));
+
+  // RSI14 (raw → z of raw)
+  const rsi = RSI.calculate({ period: 14, values: C });
+  const rsiFull = Array(n).fill(null);
+  for (let i = 0; i < n; i++) rsiFull[i] = i >= 13 ? rsi[i - 13] : null;
+
+  // ATR% (Wilder)
+  const atr14 = ATR.calculate({ period: 14, high: H, low: L, close: C });
+  const atrFull = Array(n).fill(null);
+  for (let i = 0; i < n; i++) atrFull[i] = i >= 13 ? atr14[i - 13] : null;
+  const atrPct = atrFull.map((a, i) => (a && C[i] ? a / C[i] : 0));
+
+  // Gap normalized by ATR%
+  const gap = C.map((c, i) => (i ? log((O[i] || c) / (C[i - 1] || O[i])) : 0));
+  const gapNorm = gap.map((g, i) => (atrPct[i] ? Math.sign(g) * Math.min(Math.abs(g) / atrPct[i], 5) : 0));
+
+  // VOL regime (log RVOL delta)
+  const vSma20 = SMA.calculate({ period: 20, values: V });
+  const rvol = V.map((v, i) => (i >= 19 ? (v / (vSma20[i - 19] || 1)) : 1));
+  const logRV = rvol.map(x => log(Math.max(x, 1e-9)));
+  const dLogRV = logRV.map((x, i) => (i ? x - logRV[i - 1] : 0));
+
+  // OBV + 10-bar slope, then z
+  const obv = obvSeries(C, V);
+  const obvSl10 = obvSlope(obv, 10);
+
+  // Bollinger %B (20, 2sd)
+  const pctB = pctBSeries(C, 20, 2);
+
+  // --- Robust rolling z's (median/MAD) ---
+  const zRET1   = rollingRobustZ(ret1,   CFG.Z_LOOKBACK);
+  const zMOM5   = rollingRobustZ(mom5,   CFG.Z_LOOKBACK);
+  const zRSI14  = rollingRobustZ(rsiFull.map(v => (v == null ? NaN : v)), CFG.Z_LOOKBACK);
+  const zATRpct = rollingRobustZ(atrPct, CFG.Z_LOOKBACK);
+  const zGAP    = rollingRobustZ(gapNorm, CFG.Z_LOOKBACK);
+  const zVOL    = rollingRobustZ(dLogRV,  CFG.Z_LOOKBACK);
+  const zOBV    = rollingRobustZ(obvSl10, CFG.Z_LOOKBACK);
+  const zPctB   = rollingRobustZ(pctB.map(v => (v == null ? NaN : v)), CFG.Z_LOOKBACK);
+
+  return { zRET1, zMOM5, zRSI14, zATRpct, zGAP, zVOL, zOBV, zPctB };
+}
+
+/* ================ Public API ================ */
+/**
+ * predictNextDay(inputs)
+ * inputs:
+ *   {
+ *     candles: [{t, open, high, low, close, volume}, ...],
+ *     vix: number[] (aligned to candles)   // optional
+ *     sentiment, impliedVol, epu, mdd: arrays (optional – ignored here),
+ *     mode: 'during' | 'after',
+ *     dayRows: attached intraday rows (optional)
+ *   }
+ */
 function predictNextDay(inputs) {
-  const ff = runFullFormula(inputs);
-  const { Score, avgTs } = ff.series;
-  const N = inputs.candles.length;
-  const today = {
-    avgTs: avgTs[N-1],
-    Score: Score[N-1],
+  const candles = Array.isArray(inputs?.candles) ? inputs.candles.slice() : [];
+  if (candles.length < 40) {
+    return {
+      prediction: { label: 'Neutral', probUp: 0.5, expectedMagnitude: 0 },
+      snapshot: { reason: 'insufficient_candles', n: candles.length }
+    };
+  }
+
+  // 1) Build Z-pack for your combiner
+  const Z = buildZPack(candles);
+  if (!Z) {
+    return {
+      prediction: { label: 'Neutral', probUp: 0.5, expectedMagnitude: 0 },
+      snapshot: { reason: 'feature_build_failed' }
+    };
+  }
+
+  // 2) Run YOUR formula (via sciCombiner.js) to get the scalar score S_t
+  const t = candles.length - 1;
+  const s = combiner(Z, t); // ← your formula decides sign/magnitude
+  const score = clamp(safeNum(s), -CFG.SCORE_CAP, CFG.SCORE_CAP);
+
+  // 3) Turn score into categorical label
+  const band = CFG.NEUTRAL_BAND;
+  let label = 'Neutral';
+  if (score > +band) label = 'Up';
+  if (score < -band) label = 'Down';
+
+  // 4) Probability & magnitude
+  const probUp = +scoreToProb(score, CFG.TEMP).toFixed(4);
+
+  // ATR% series for magnitude anchor
+  const { O, H, L, C } = seriesFromCandles(candles);
+  const atr14 = ATR.calculate({ period: 14, high: H, low: L, close: C });
+  const atrFull = Array(C.length).fill(null);
+  for (let i = 0; i < C.length; i++) atrFull[i] = i >= 13 ? atr14[i - 13] : null;
+  const atrPctSeries = atrFull.map((a, i) => (a && C[i] ? a / C[i] : 0));
+
+  const magnitude = +expectedMagnitudeFromATR(atrPctSeries, score).toFixed(4);
+
+  // 5) Snapshot for UI / debugging
+  const snapshot = {
+    ts: new Date().toISOString(),
+    last: candles.at(-1)?.t || null,
+    score,
+    probUp,
+    label,
+    cfg: {
+      TEMP: CFG.TEMP,
+      PMIN: CFG.PMIN,
+      PMAX: CFG.PMAX,
+      SCORE_CAP: CFG.SCORE_CAP,
+      NEUTRAL_BAND: CFG.NEUTRAL_BAND
+    },
+    zMeta: Object.keys(Z).reduce((m, k) => (m[k] = Z[k].at(-1), m), {}),
+    vix: Array.isArray(inputs.vix) ? inputs.vix.at(-1) : null,
+    mode: inputs.mode || 'during'
   };
-  const comp = buildVolSentDom(inputs); // rebuild for access to comps
-  const curVec = [
-    today.Score,
-    comp.compVolPct[N-1],
-    comp.compSentPct[N-1],
-    comp.TVolComp[N-1],
-    comp.MVolComp[N-1],
-  ];
 
-  const closes = inputs.candles.map(x=>x.close);
-  const label = nextDayMove(closes);
-  const pct = nextDayPct(closes);
-
-  // Gate 1: Ts band
-  let band = 3;
-  let candIdx = [];
-  while (candIdx.length < 50 && band <= 10) {
-    candIdx = avgTs
-      .map((v,i)=>({i,v}))
-      .filter(o=> o.i < N-1 && Number.isFinite(o.v) && Math.abs(o.v - today.avgTs) <= band)
-      .map(o=>o.i);
-    band++;
-  }
-  if (!candIdx.length) {
-    return { ...ff, prediction: { prediction:'Unknown', confidence:0, estPctChange:0, matches:0, bandUsed: band-1 } };
-  }
-
-  // Gate 2: kNN on vector differences
-  function vec(i){
-    return [
-      Score[i],
-      comp.compVolPct[i],
-      comp.compSentPct[i],
-      comp.TVolComp[i],
-      comp.MVolComp[i],
-    ];
-  }
-  function dist(a,b){ let s=0; for (let k=0;k<a.length;k++){ const da=a[k], db=b[k]; if (Number.isFinite(da)&&Number.isFinite(db)) s += (da-db)*(da-db); } return Math.sqrt(s); }
-
-  const ranked = candIdx
-    .map(i => ({ i, d: dist(curVec, vec(i)) }))
-    .sort((x,y)=> x.d - y.d);
-
-  const K = Math.min(100, ranked.length); // use up to 100 nearest
-  const nn = ranked.slice(0,K).map(r=>r.i);
-
-  const ups = nn.filter(i=>label[i]===1).length;
-  const downs = nn.filter(i=>label[i]===-1).length;
-  const total = ups + downs;
-  const predUp = ups >= downs;
-  const estPct = nn.map(i=>pct[i]).filter(Number.isFinite).reduce((a,b)=>a+b,0) / (nn.length||1);
-
-  return {
-    ...ff,
-    prediction: {
-      prediction: predUp ? 'Up' : 'Down',
-      confidence: total ? Math.max(ups,downs)/total : 0,
-      estPctChange: estPct,
-      matches: nn.length,
-      bandUsed: band-1
-    }
-  };
+  return { prediction: { label, probUp, expectedMagnitude: magnitude }, snapshot };
 }
 
-module.exports = { runFullFormula, predictNextDay };
+module.exports = { predictNextDay };

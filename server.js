@@ -14,11 +14,13 @@ const admin      = require('firebase-admin');
 const mongoose   = require('mongoose');
 const fs         = require('fs');
 const tf         = require('@tensorflow/tfjs-node');
-const yahooFinance = require('yahoo-finance2').default;
+const { yf: yahooFinance, historicalCompat } = require('./lib/yfCompat');
 const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
 const https      = require('https'); // keep-alive agent
+const ensembleRoutes = require('./routes/ensemble');
+const UserProfile = require('./models/UserProfile');
 
 // --- 1m technical advice helpers (no new npm deps) ---
 const MS = 60 * 1000;
@@ -95,7 +97,6 @@ const { getIntradayIndicators } = require('./services/IntradayService');
 const analyzeRouter      = require('./routes/analyze');
 const userProfileRoutes  = require('./routes/userProfileRoutes');
 const advisorRouter = require('./routes/advisorRoutes');
-const UserProfile        = require('./models/UserProfile');
 const RSSParser = require('rss-parser');
 const Sentiment = require('sentiment');
 const rssParser = new RSSParser();
@@ -139,6 +140,8 @@ if (!admin.apps.length) {
   });
 }
 
+
+
 // ---- Express app ----
 const app = express();
 // set JSON body limit explicitly
@@ -158,6 +161,9 @@ const ALLOWLIST = new Set([
 // add Vary: Origin so caches don't poison responses
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 
+app.use('/api/formula3', require('./routes/formula3-symbol'));
+
+
 const corsOptionsDelegate = (req, cb) => {
   const origin = req.headers.origin;
   const allowed = !origin || ALLOWLIST.has(origin);
@@ -166,7 +172,7 @@ const corsOptionsDelegate = (req, cb) => {
     credentials: true,
     methods: ['GET','POST','OPTIONS'],
     // 🔒 removed 'x-user-id'
-    allowedHeaders: ['Content-Type','Authorization','Accept'],
+    allowedHeaders: ['Content-Type','Authorization','Accept','x-user-id'],
     optionsSuccessStatus: 204,
   });
 };
@@ -874,6 +880,18 @@ app.use('/api', analyzeRouter);
 app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
 app.use('/api', advisorRouter);
 
+// ✅ Alias endpoint used by the frontend (returns null if not logged in)
+app.get('/api/me/profile', async (req, res) => {
+  try {
+    const profile = await getUserProfile(req); // already defined in server.js
+    return res.status(200).json(profile);      // can be null
+  } catch (e) {
+    console.error('GET /api/me/profile error:', e);
+    return res.status(200).json(null);
+  }
+});
+
+
 /* extras */
 const crypto      = require("crypto");
 const fetchNative = require("node-fetch");
@@ -1295,6 +1313,23 @@ app.post("/login", async (req, res) => {
   }
 });
 
+
+// ✅ Alias endpoint used by frontend; returns null if not logged in
+app.get('/api/me/profile', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    if (!userId) return res.status(200).json(null);
+
+    const profile = await UserProfile.findOne({ userId }).lean();
+    return res.status(200).json(profile || null);
+  } catch (err) {
+    console.error('GET /api/me/profile failed:', err);
+    return res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+
+
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "Token required." });
@@ -1304,6 +1339,20 @@ app.get("/protected", (req, res) => {
     return res.status(401).json({ message: "Invalid or expired token." });
   }
 });
+
+app.get('/api/me/profile', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    if (!userId) return res.status(200).json(null);
+
+    const profile = await UserProfile.findOne({ userId }).lean();
+    return res.json(profile || null);
+  } catch (err) {
+    console.error('GET /api/me/profile failed:', err);
+    return res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
 
 app.get("/api/fundamentals/:symbol", async (req, res) => {
   const symbol = (req.params.symbol || "").toUpperCase();
@@ -2400,22 +2449,24 @@ app.get('/api/sci/chart/:symbol', async (req, res) => {
 
 
 // ────────────────────────────────────────────────────────────
-// Intraday Indicators Endpoint
+// Intraday Indicators Endpoint (never hard-500 to the frontend)
 // ────────────────────────────────────────────────────────────
 app.get("/api/intraday/:symbol", async (req, res) => {
+  const symbol = (req.params.symbol || "").toUpperCase();
+  const opts = {
+    interval: req.query.interval,
+    range: req.query.range,
+    from: req.query.from,
+    to: req.query.to,
+  };
+
   try {
-    const symbol = (req.params.symbol || "").toUpperCase();
-    const opts = {
-      interval: req.query.interval, // e.g. '1m'
-      range: req.query.range,       // e.g. '1d'
-      from: req.query.from,         // ISO timestamp (optional)
-      to: req.query.to,             // ISO timestamp (optional)
-    };
     const data = await getIntradayIndicators(symbol, opts);
-    res.json(data);
+    return res.status(200).json(Array.isArray(data) ? data : []);
   } catch (err) {
-    console.error(`intraday/${req.params.symbol}:`, err);
-    res.status(500).json({ error: err.message });
+    console.error(`intraday/${symbol}:`, err?.message || err);
+    // ✅ degrade gracefully
+    return res.status(200).json([]);
   }
 });
 
@@ -2930,6 +2981,8 @@ finderRouter.post("/find-stocks", async (req, res) => {
 });
 
 app.use(["/api", "/finder/api"], finderRouter);
+
+app.use('/api/ensemble', ensembleRoutes);
 
 /*──────────────────────────────────────────
 |  14) Dashboard helper endpoints          |
