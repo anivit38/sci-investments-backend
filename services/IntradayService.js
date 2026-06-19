@@ -3,7 +3,7 @@
 let yahooFinance;
 try {
   // Prefer your compat wrapper (usually includes better defaults/headers)
-  ({ yf: yahooFinance } = require("../lib/yfCompat"));
+  ({ yf: yahooFinance, fetchOptions } = require("../lib/yfCompat"));
 } catch {
   // Fallback to raw library
   yahooFinance = require("yahoo-finance2").default;
@@ -11,6 +11,9 @@ try {
 
 const ALLOWED_INTERVALS = ["1m", "2m", "5m", "15m", "30m", "60m"];
 const ALLOWED_RANGES = ["1d", "5d", "1mo", "3mo"];
+
+
+
 
 function clampToIntradayLimit(period1, period2, interval) {
   const maxDays = interval === "1m" ? 30 : 60;
@@ -44,12 +47,17 @@ exports.getIntradayIndicators = async (symbol, opts = {}) => {
   period1 = clampToIntradayLimit(period1, period2, interval);
 
   // If Yahoo blocks / fails, let caller decide how to degrade (server now returns [])
-  const result = await yahooFinance.chart(symbol, {
-    period1,
-    period2,
-    interval,
-    includePrePost: false,
-  });
+  const result = await yahooFinance.chart(
+    symbol,
+    {
+      period1,
+      period2,
+      interval,
+      includePrePost: false,
+    },
+    { fetchOptions }
+  );
+
 
   const quotes = result?.quotes ?? [];
   return quotes

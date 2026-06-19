@@ -187,7 +187,7 @@ app.options('*', (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     // 🔒 removed 'x-user-id'
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,x-user-id');
   }
   res.setHeader('Access-Control-Max-Age', '600');
   return res.sendStatus(204);
@@ -880,17 +880,6 @@ app.use('/api', analyzeRouter);
 app.use('/api', userProfileRoutes);     // uses the same authenticate() inside
 app.use('/api', advisorRouter);
 
-// ✅ Alias endpoint used by the frontend (returns null if not logged in)
-app.get('/api/me/profile', async (req, res) => {
-  try {
-    const profile = await getUserProfile(req); // already defined in server.js
-    return res.status(200).json(profile);      // can be null
-  } catch (e) {
-    console.error('GET /api/me/profile error:', e);
-    return res.status(200).json(null);
-  }
-});
-
 
 /* extras */
 const crypto      = require("crypto");
@@ -1314,22 +1303,6 @@ app.post("/login", async (req, res) => {
 });
 
 
-// ✅ Alias endpoint used by frontend; returns null if not logged in
-app.get('/api/me/profile', async (req, res) => {
-  try {
-    const userId = req.headers['x-user-id'];
-    if (!userId) return res.status(200).json(null);
-
-    const profile = await UserProfile.findOne({ userId }).lean();
-    return res.status(200).json(profile || null);
-  } catch (err) {
-    console.error('GET /api/me/profile failed:', err);
-    return res.status(500).json({ error: 'Failed to load profile' });
-  }
-});
-
-
-
 app.get("/protected", (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "Token required." });
@@ -1443,94 +1416,124 @@ app.get('/api/technical/:symbol', async (req, res) => {
 └──────────────────────────────────────────*/
 app.post("/api/check-stock", async (req, res) => {
   try {
-    let { symbol, intent, category = "overall" } = req.body || {};
-    if (!symbol || !intent) {
-      return res.status(400).json({ message: "symbol & intent required." });
-    }
-    const upper = String(symbol).toUpperCase();
-    category = String(category).toLowerCase();
+    let { symbol } = req.body || {};
+    if (!symbol) return res.status(400).json({ message: "symbol required." });
 
-    // 1) Live quote / metrics
+    const upper = String(symbol).toUpperCase().trim();
+
     const stock = await fetchStockData(upper);
     if (!stock || !stock.price) {
       return res.status(404).json({ message: "Stock not found or data unavailable." });
     }
-    const priceData = stock.price;
-    const summary   = stock.summaryDetail || {};
-    const finData   = stock.financialData || {};
 
-    const metrics = {
-      volume:           priceData.regularMarketVolume ?? null,
-      currentPrice:     priceData.regularMarketPrice  ?? null,
-      peRatio:          summary.trailingPE            ?? null,
-      pbRatio:          summary.priceToBook           ?? null,
-      dividendYield:    summary.dividendYield         ?? null,
-      earningsGrowth:   finData.earningsGrowth        ?? null,
-      debtRatio:        finData.debtToEquity          ?? null,
-      dayHigh:          priceData.regularMarketDayHigh?? null,
-      dayLow:           priceData.regularMarketDayLow ?? null,
-      fiftyTwoWeekHigh: summary.fiftyTwoWeekHigh      ?? null,
-      fiftyTwoWeekLow:  summary.fiftyTwoWeekLow       ?? null,
-    };
+    const priceData = stock.price || {};
+    // Kick off technical analysis in parallel with the rest of the route
+    const techPromise = getTechnical(upper).catch(() => null);
+    const summary = stock.summaryDetail || {};
+    const finData = stock.financialData || {};
+    const profile = stock.assetProfile || {};
 
-    // quick score (same idea you had)
-    const avgVol = summary.averageDailyVolume3Month ?? metrics.volume ?? 0;
-    let quickRating = 0;
-    if (metrics.volume > avgVol * 1.2) quickRating += 3;
-    else if (metrics.volume < avgVol * 0.8) quickRating -= 2;
+    const currentPrice = priceData.regularMarketPrice ?? null;
+    const volume = priceData.regularMarketVolume ?? null;
+    const avgVolume =
+      summary.averageDailyVolume3Month ??
+      summary.averageVolume ??
+      null;
 
-    if (metrics.peRatio != null) {
-      if (metrics.peRatio >= 5 && metrics.peRatio <= 25) quickRating += 2;
-      else if (metrics.peRatio > 30) quickRating -= 1;
-    }
-    if (metrics.earningsGrowth != null) {
-      if (metrics.earningsGrowth > 0.15) quickRating += 4;
-      else if (metrics.earningsGrowth > 0.03) quickRating += 2;
-      else if (metrics.earningsGrowth < 0) quickRating -= 2;
-    }
-    if (metrics.debtRatio != null) {
-      if (metrics.debtRatio < 0.3) quickRating += 3;
-      else if (metrics.debtRatio > 1) quickRating -= 1;
+    const marketCap = priceData.marketCap ?? summary.marketCap ?? null;
+    const bid = summary.bid ?? priceData.bid ?? null;
+    const ask = summary.ask ?? priceData.ask ?? null;
+
+    function num(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
     }
 
-    const dayRange  = (metrics.dayHigh  || 0) - (metrics.dayLow  || 0);
-    const weekRange = (metrics.fiftyTwoWeekHigh || 0) - (metrics.fiftyTwoWeekLow || 0);
-    if (dayRange > 0) {
-      const pos = (metrics.currentPrice - metrics.dayLow) / dayRange;
-      if (pos < 0.2) quickRating += 1;
-      if (pos > 0.8) quickRating -= 1;
-    }
-    if (weekRange > 0) {
-      const pos = (metrics.currentPrice - metrics.fiftyTwoWeekLow) / weekRange;
-      if (pos < 0.3) quickRating += 2;
-      if (pos > 0.8) quickRating -= 2;
+    function pct(v) {
+      const n = num(v);
+      return n == null ? null : n * 100;
     }
 
-    // 2) Forecast (short horizon — expected move model)
-    let forecastPrice = metrics.currentPrice;
-    let growthPct = 0;
-    try {
-      const st = await withTimeout(computeShortTermExpectedMove(upper), 4000);
-      if (st && metrics.currentPrice) {
-        const expR = st.expectedReturn;                 // signed decimal
-        forecastPrice = +(metrics.currentPrice * (1 + expR));
-        growthPct = expR * 100;
-      } else if (metrics.currentPrice) {
-        try {
-          const fc = await withTimeout(buildForecastPrice(upper, metrics.currentPrice), 2000);
-          forecastPrice = fc;
-          growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
-        } catch { /* keep defaults */ }
+    function addFinding(arr, section, stat, value, meaning, result, impact) {
+      arr.push({ section, stat, value, meaning, result, impact });
+    }
+
+    function finalSuggestion(goods, bads) {
+      if (goods > bads) return "Buy";
+      if (bads > goods) return "Stay away / Don’t buy";
+      return "Neutral / needs more analysis";
+    }
+
+    const findings = [];
+    let goods = 0;
+    let bads = 0;
+    let neutrals = 0;
+
+    function record(section, stat, value, meaning, result) {
+      let impact = "neutral";
+      if (result === "good") {
+        goods++;
+        impact = "good";
+      } else if (result === "bad") {
+        bads++;
+        impact = "bad";
+      } else {
+        neutrals++;
       }
-    } catch {
-      try {
-        const fc = await withTimeout(buildForecastPrice(upper, metrics.currentPrice), 2000);
-        forecastPrice = fc;
-        growthPct = ((fc - metrics.currentPrice) / metrics.currentPrice) * 100;
-      } catch { /* keep defaults */ }
+      addFinding(findings, section, stat, value, meaning, result, impact);
     }
 
-    // 3) News sentiment — LITE (RSS only)
+    // 1. Liquidity / Tradability Check from PDF
+    const spread = bid != null && ask != null ? ask - bid : null;
+    const spreadPct = spread != null && currentPrice ? (spread / currentPrice) * 100 : null;
+
+    record(
+      "Liquidity / Tradability",
+      "Bid-ask spread",
+      spreadPct == null ? "Unavailable" : `${spreadPct.toFixed(2)}%`,
+      "Your method says spread under 0.5% of stock price means the stock is liquid.",
+      spreadPct == null ? "neutral" : spreadPct < 0.5 ? "good" : "bad"
+    );
+
+    record(
+      "Liquidity / Tradability",
+      "Trading volume",
+      volume == null ? "Unavailable" : volume,
+      "Your method says only analyze if trading volume is above 500,000 per day.",
+      volume == null ? "neutral" : volume > 500000 ? "good" : "bad"
+    );
+
+    record(
+      "Liquidity / Tradability",
+      "Market cap",
+      marketCap == null ? "Unavailable" : marketCap,
+      "Your method says only analyze if market cap is above $300M.",
+      marketCap == null ? "neutral" : marketCap > 300000000 ? "good" : "bad"
+    );
+
+    record(
+      "Liquidity / Tradability",
+      "Float-adjusted volume",
+      "Unavailable",
+      "Your method requires float-adjusted volume above 15 million. Current data source does not provide float-adjusted volume here.",
+      "neutral"
+    );
+
+    // 2. Volume comparative %
+    let compVol = null;
+    if (volume != null && avgVolume != null && avgVolume !== 0) {
+      compVol = ((volume / avgVolume) - 1) * 100;
+    }
+
+    record(
+      "Volume",
+      "Comparative volume %",
+      compVol == null ? "Unavailable" : `${compVol.toFixed(2)}%`,
+      "Formula: [(today volume / average volume) - 1] × 100%. Higher volume can confirm participation, but spikes late in a move can mean exhaustion.",
+      compVol == null ? "neutral" : compVol >= 0 ? "good" : "bad"
+    );
+
+    // 3. Sentiment comparative %
     let news = { averageSentiment: 0, topStories: [] };
     try {
       const feed = await withTimeout(
@@ -1538,379 +1541,526 @@ app.post("/api/check-stock", async (req, res) => {
         3000
       );
       const items = (feed.items || []).slice(0, 5).map(i => {
-        const snippet = (i.contentSnippet || i.title || '').slice(0, 200);
+        const snippet = (i.contentSnippet || i.title || "").slice(0, 200);
         return { title: i.title, link: i.link, snippet };
       });
       const scores = items.map(x => sentiment.analyze(x.snippet).score);
-      const avg = scores.length ? scores.reduce((a,b)=>a+b,0)/scores.length : 0;
+      const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
       news = { averageSentiment: avg, topStories: items };
-    } catch (_) {
-      // swallow; keep default empty news
-    }
+    } catch {}
 
-    // 4) Fundamental detail (only when requested or overall)
-    let fundamentalDetail = null;
-    if (category === "fundamental" || category === "overall") {
-      try {
-        const fund = await getFundamentals(upper);
-        if (fund) {
-          const { peRatio, priceToSales } = fund.ratios || {};
-          const { peRatio: bmPE, priceToSales: bmPS } = fund.benchmarks || {};
-          const cp = metrics.currentPrice;
-          let valuation = fund.valuation ?? null;
-          let advice = fund.advice ?? "";
+    record(
+      "Sentiment",
+      "Average sentiment score",
+      news.averageSentiment,
+      "Your method says higher sentiment score is bullish.",
+      news.averageSentiment > 0 ? "good" : news.averageSentiment < 0 ? "bad" : "neutral"
+    );
 
-          if (!valuation && cp != null) {
-            if (peRatio != null && bmPE != null && peRatio > 0) {
-              const fairPrice = +((bmPE / peRatio) * cp).toFixed(2);
-              const status    = fairPrice > cp ? "undervalued" : "overvalued";
-              valuation = { fairPrice, status };
-              advice = status === "undervalued"
-                ? "Price below peer PE average—consider a closer look."
-                : "Price above peer PE average—be cautious of overpaying.";
-            } else if (priceToSales != null && bmPS != null && priceToSales > 0) {
-              const fairPrice = +((bmPS / priceToSales) * cp).toFixed(2);
-              const status    = fairPrice > cp ? "undervalued" : "overvalued";
-              valuation = { fairPrice, status };
-              advice = status === "undervalued"
-                ? "Price below peer P/S average—consider a closer look."
-                : "Price above peer P/S average—be cautious of overpaying.";
-            } else if (
-              fund.weaknesses?.some(w =>
-                ["Negative net margin","Negative ROA"].includes(w.flag)
-              )
-            ) {
-              advice = "Company is unprofitable—avoid investing.";
-            }
-          }
-
-          fundamentalDetail = {
-            companyInfo: fund.companyInfo,
-            ratios: fund.ratios,
-            benchmarks: fund.benchmarks,
-            rating: fund.rating,
-            weaknesses: fund.weaknesses,
-            valuation,
-            advice,
-            currentPrice: metrics.currentPrice,
-            fetchedAt: fund.fetchedAt,
-            news: fund.news
-          };
-        }
-      } catch (e) {
-        console.warn(`FundamentalsService failed for ${upper}:`, e.message);
-      }
-    }
-
-    // 5) Technical detail (only when requested or overall) — SAME SHAPE, new advice logic (1-minute SR/VWAP/MACD/Stoch/RSI)
-    let technicalDetail = null;
-    if (category === "technical" || category === "overall") {
-      try {
-        const userId = req.user?.userId || null;
-        const t = await getTechnicalForUser(upper, userId); // keep your baseline indicators/trend
-
-        // ---------- helpers (scoped) ----------
-        const ema = (prev, x, k) => (prev == null ? x : prev + k * (x - prev));
-        const macdSeries = (cl, f = 12, s = 26, g = 9) => {
-          const kf = 2 / (f + 1), ks = 2 / (s + 1), kg = 2 / (g + 1);
-          let ef = null, es = null, sig = null;
-          const macd = [], hist = [];
-          for (const p of cl) {
-            ef = ema(ef, p, kf); es = ema(es, p, ks);
-            const ln = (ef ?? 0) - (es ?? 0);
-            macd.push(ln);
-            sig = ema(sig, ln, kg);
-            hist.push(ln - (sig ?? 0));
-          }
-          return { macd, signal: sig, hist };
-        };
-        const rsiSeries = (cl, n = 14) => {
-          const rsis = new Array(cl.length).fill(50);
-          let ag = 0, al = 0, seeded = false;
-          for (let i = 1; i < cl.length; i++) {
-            const ch = cl[i] - cl[i - 1], g = Math.max(ch, 0), l = Math.max(-ch, 0);
-            if (i <= n) { ag += g; al += l; if (i === n) { ag /= n; al /= n; seeded = true; } }
-            else { ag = (ag * (n - 1) + g) / n; al = (al * (n - 1) + l) / n; }
-            if (seeded) { const rs = ag / (al || 1e-9); rsis[i] = 100 - 100 / (1 + rs); }
-          }
-          return rsis;
-        };
-        const vwapFromMinute = (bars) => {
-          let pv = 0, tv = 0;
-          for (const b of bars) {
-            const price = (b.high + b.low + b.close) / 3;
-            const vol = b.volume || 0;
-            pv += price * vol; tv += vol;
-          }
-          return tv ? pv / tv : bars.at(-1)?.close ?? null;
-        };
-        const localExtremaIdx = (arr, w, type) => {
-          const out = [];
-          for (let i = w; i < arr.length - w; i++) {
-            const seg = arr.slice(i - w, i + w + 1);
-            if (type === "peak" && arr[i] === Math.max(...seg)) out.push(i);
-            if (type === "dip"  && arr[i] === Math.min(...seg)) out.push(i);
-          }
-          return out;
-        };
-
-        // ---------- fetch last trading day intraday (works off-hours) ----------
-        // Prefer 1m, fallback to 5m — both for range:"1d" so we always get the last session
-        let minute = [];
-        try {
-          const session1m = await yahooFinance.chart(upper, {
-            range: "1d", interval: "1m", includePrePost: false
-          }, { fetchOptions: requestOptions });
-          minute = (session1m?.quotes || []).map(q => ({
-            time: new Date(q.date || q.timestamp || Date.now()),
-            open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
-          })).filter(c => Number.isFinite(c.close));
-        } catch {}
-        if (minute.length < 30) {
-          try {
-            const session5m = await yahooFinance.chart(upper, {
-              range: "1d", interval: "5m", includePrePost: false
-            }, { fetchOptions: requestOptions });
-            minute = (session5m?.quotes || []).map(q => ({
-              time: new Date(q.date || q.timestamp || Date.now()),
-              open: +q.open, high: +q.high, low: +q.low, close: +q.close, volume: +q.volume
-            })).filter(c => Number.isFinite(c.close));
-          } catch {}
-        }
-
-        // ---------- build advice when we have enough bars ----------
-        let adviceSuggestion = null;
-        let adviceInstructions = null;
-        let srLevels = { support: t?.levels?.support, resistance: t?.levels?.resistance };
-
-        if (minute.length >= 30) {
-          const recent = minute.slice(-75);
-          const closes = recent.map(c => c.close);
-          const highs  = recent.map(c => c.high);
-          const lows   = recent.map(c => c.low);
-          const last   = closes.at(-1);
-
-          // S/R from last hour peaks/dips filtered by proximity to mean
-          const win = Math.min(20, closes.length);
-          const mean = closes.slice(-win).reduce((a,b)=>a+b,0) / win;
-          const sd20 = Math.sqrt(closes.slice(-win).reduce((a,b)=>a+(b-mean)*(b-mean),0) / win) || (last * 0.01);
-
-          const peaks = localExtremaIdx(highs, 3, "peak").map(i => highs[i])
-            .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
-          const dips  = localExtremaIdx(lows, 3, "dip").map(i => lows[i])
-            .filter(v => Math.abs(v - mean) <= sd20).slice(-10);
-
-          const resistance = peaks.length ? peaks.reduce((a,b)=>a+b,0)/peaks.length : Math.max(...highs.slice(-30));
-          const support    = dips.length  ? dips.reduce((a,b)=>a+b,0)/dips.length  : Math.min(...lows.slice(-30));
-          srLevels = { support, resistance };
-
-          // VWAP / momentum / RSI refs
-          const vwap = vwapFromMinute(recent);
-          const vwapBias = last >= vwap ? "Bullish" : "Bearish";
-
-          const { macd: mac, signal: macSig } = macdSeries(closes);
-          const macTiltUp = (mac.at(-1) ?? 0) > (macSig ?? 0);
-
-          const stochK = (() => {
-            const k = [];
-            for (let i = 0; i < closes.length; i++) {
-              const start = Math.max(0, i - 14 + 1);
-              const h = Math.max(...highs.slice(start, i + 1));
-              const l = Math.min(...lows.slice(start, i + 1));
-              k.push(h === l ? 50 : ((closes[i] - l) / (h - l)) * 100);
-            }
-            return k;
-          })();
-          const stochUp = (stochK.at(-1) ?? 50) > 55;
-
-          const rsis = rsiSeries(closes, 14);
-          const upRSIs = [], dnRSIs = [];
-          for (let i = 1; i < closes.length; i++) {
-            const r = (closes[i] - closes[i - 1]) / (closes[i - 1] || 1);
-            if (r > 0.003 && Number.isFinite(rsis[i])) upRSIs.push(rsis[i]);
-            if (r < -0.003 && Number.isFinite(rsis[i])) dnRSIs.push(rsis[i]);
-          }
-          const rsiUpRef = upRSIs.length ? upRSIs.reduce((a,b)=>a+b,0)/upRSIs.length : 60;
-          const rsiDnRef = dnRSIs.length ? dnRSIs.reduce((a,b)=>a+b,0)/dnRSIs.length : 40;
-          const rsiNow   = rsis.at(-1) ?? 50;
-
-          // Position & buffers
-          const whereNow =
-            last >= resistance ? "Above resistance" :
-            last <= support    ? "At/Below support" :
-                                "Between S/R";
-
-          const momentum =
-            (stochUp && macTiltUp) ? "Momentum opening UP" :
-            (!stochUp && !macTiltUp) ? "Momentum opening DOWN" :
-            "Momentum mixed";
-
-          const buf = Math.max(0.25, sd20);  // ≥ $0.25 buffer
-          const breakoutBuy = resistance + buf;
-          const dipBuy      = Math.max(vwap, support + 0.5*buf);
-          const stopLong    = Math.max(0, Math.min(support - buf, last - 3*buf));
-          const fadeShort   = resistance - 0.5*buf;
-          const stopShort   = resistance + buf;
-          const tgt1        = resistance + 1.0*sd20;
-          const tgt2        = resistance + 2.0*sd20;
-
-          // Headline + bullets (string with bullet prefixes your UI already shows)
-          adviceSuggestion = (
-            whereNow === "Above resistance" ? "BREAKOUT LONG (IF HOLDS ABOVE R + VWAP)" :
-            whereNow === "At/Below support" ? "WAIT FOR RECLAIM — NO LONGS UNTIL ABOVE VWAP" :
-            vwapBias === "Bullish"          ? "BUY THE DIP ABOVE VWAP" :
-                                              "FADE INTO VWAP/RESISTANCE"
-          );
-
-          const PRIMARY = vwapBias === "Bullish" ? "BULLISH BIAS ABOVE VWAP" : "BEARISH BIAS BELOW VWAP";
-          const TRIGGER =
-            whereNow === "Above resistance" ? "Breakout continuation IF price holds above R + buffer and VWAP is maintained."
-          : whereNow === "At/Below support" ? "Wait for reclaim of VWAP and a higher low above Support before risking long."
-          : vwapBias === "Bullish"          ? "Buy-the-dip toward VWAP/Support with higher-low confirmation."
-                                            : "Fade pops into VWAP/Resistance with rejection wick and momentum down.";
-
-          const MOMO =
-            momentum.includes("UP")   ? "Momentum: Stoch + MACD aligned UP."
-          : momentum.includes("DOWN") ? "Momentum: Stoch + MACD aligned DOWN."
-                                      : "Momentum: mixed—wait for alignment.";
-
-          const RSI_NOTE =
-            rsiNow > rsiUpRef ? "RSI above “surge” ref → stretched; expect mean reversion risk."
-          : rsiNow < rsiDnRef ? "RSI near/under “plunge” ref → bounce risk but trend can continue."
-                              : "RSI neutral window.";
-
-          const lines = [
-            `Levels → Support ${support.toFixed(2)} | Resistance ${resistance.toFixed(2)} | VWAP ${(vwap ?? last).toFixed(2)}`,
-            `Primary Bias → ${PRIMARY}`,
-            `Where → ${whereNow}`,
-            `Trigger → ${TRIGGER}`,
-            vwapBias === "Bullish"
-              ? `Entries → Breakout: ${breakoutBuy.toFixed(2)}  •  Dip buy: ${dipBuy.toFixed(2)}`
-              : `Entries → Fade short near: ${fadeShort.toFixed(2)} (rejection)`,
-            vwapBias === "Bullish"
-              ? `Stops → ${stopLong.toFixed(2)} (below Support−buffer)`
-              : `Stops → ${stopShort.toFixed(2)} (above Resistance+buffer)`,
-            vwapBias === "Bullish"
-              ? `Targets → ${tgt1.toFixed(2)} / ${tgt2.toFixed(2)} (scale out into strength)`
-              : `Targets → Support retest ${support.toFixed(2)}; deeper = Support−${buf.toFixed(2)}`,
-            MOMO,
-            `RSI → now ${rsiNow.toFixed(1)} | surge ref ${rsiUpRef.toFixed(1)} | plunge ref ${rsiDnRef.toFixed(1)} — ${RSI_NOTE}`
-          ];
-
-          adviceInstructions = lines.join("\n• ");
-        }
-
-        // ---------- build technicalDetail (same keys as before) ----------
-        const ind = t?.indicators || {};
-        const lev = t?.levels || {};
-        const computedSupport    = Number.isFinite(srLevels.support) ? srLevels.support : undefined;
-        const computedResistance = Number.isFinite(srLevels.resistance) ? srLevels.resistance : undefined;
-
-        technicalDetail = {
-          rsi14:  Number.isFinite(ind.RSI14)  ? ind.RSI14  : null,
-          macd:   Number.isFinite(ind.MACD)   ? ind.MACD   : null,
-          sma50:  Number.isFinite(ind.SMA50)  ? ind.SMA50  : null,
-          sma200: Number.isFinite(ind.SMA200) ? ind.SMA200 : null,
-          atr14:  Number.isFinite(ind.ATR14)  ? ind.ATR14  : null,
-          trend:  t?.trend ?? (() => {
-            const s50 = ind.SMA50, s200 = ind.SMA200;
-            if (Number.isFinite(s50) && Number.isFinite(s200)) {
-              return s50 > s200 ? "uptrend" : (s50 < s200 ? "downtrend" : "sideways");
-            }
-            return "sideways";
-          })(),
-          levels: {
-            support: (computedSupport !== undefined) ? computedSupport :
-                      (Number.isFinite(lev.support) ? lev.support :
-                      (Number.isFinite(metrics.dayLow) ? metrics.dayLow :
-                        metrics.fiftyTwoWeekLow ?? null)),
-            resistance: (computedResistance !== undefined) ? computedResistance :
-                        (Number.isFinite(lev.resistance) ? lev.resistance :
-                        (Number.isFinite(metrics.dayHigh) ? metrics.dayHigh :
-                          metrics.fiftyTwoWeekHigh ?? null)),
-          },
-          // IMPORTANT: override when we could compute minute-advice; otherwise keep your old values
-          suggestion:   adviceSuggestion ?? t?.suggestion ?? null,
-          instructions: adviceInstructions ?? t?.instructions ?? null,
-          chartUrl:     (typeof t?.chartUrl === "string") ? t.chartUrl : null
-        };
-      } catch (e) {
-        console.warn(`TechnicalService (minute-advice) failed for ${upper}:`, e.message);
-      }
-    }
-
-
-
-
-    // 6) Build the base payload
-    const base = {
-      symbol: upper,
-      name:   priceData.longName || upper,
-      industry: stock.assetProfile?.industry || "Unknown",
-      metrics
-    };
-
-    if (category === "fundamental") {
-      return res.json({ ...base, fundamentals: fundamentalDetail });
-    }
-    if (category === "technical") {
-      return res.json({ ...base, technical: technicalDetail });
-    }
-
-    // overall summary
-    const classification =
-      growthPct >= 2 ? "growth" :
-      growthPct >= 0 ? "stable" :
-      "decline";
-
-    const combinedScore = +(0.2 * quickRating + 0.8 * growthPct).toFixed(2);
-    const advice =
-      classification === "growth"
-        ? "Projected to grow. Consider buying."
-        : classification === "stable"
-        ? "Minimal growth expected. Hold or monitor."
-        : "Projected to decline. Consider selling or avoiding.";
-
-    // Personalized Advisor Suggestion (only if token is present → profile available)
-    let advisorSuggestion = null;
+    // 4. SCI V1 z-score / score engine using your existing service
+    let sciScore = null;
     try {
-      const profile = await getUserProfile(req);
-      advisorSuggestion = await buildAdvisorSuggestion({
-        symbol: upper,
-        profile,
-        baseAdvice: advice,
-        fundamentals: fundamentalDetail,
-        technical: technicalDetail,
-        metrics
+      const period2 = new Date();
+      const period1 = new Date();
+      period1.setFullYear(period1.getFullYear() - 2);
+
+      const rows = await historicalCompat(upper, {
+        period1: period1.toISOString().slice(0, 10),
+        period2: period2.toISOString().slice(0, 10),
+        interval: "1d"
       });
-    } catch (_) { /* swallow */ }
 
-    const payload = {
-      ...base,
-      fundamentalRating: quickRating.toFixed(2),
-      combinedScore,
-      classification,
-      advice,
-      advisorSuggestion,
-      forecast: {
-        forecastPrice: +forecastPrice.toFixed(2),
-        projectedGrowthPercent: `${growthPct.toFixed(2)}%`,
-        forecastPeriod: "Close",
-        forecastEndDate: getForecastEndTime(),
-      },
-      fundamentals: fundamentalDetail || {},
-      technical: technicalDetail || {},
-      news
-    };
+      const cleanRows = (rows || [])
+        .map(r => ({
+          date: r.date,
+          open: num(r.open),
+          high: num(r.high),
+          low: num(r.low),
+          close: num(r.close),
+          volume: num(r.volume) || 0
+        }))
+        .filter(r =>
+          r.open != null &&
+          r.high != null &&
+          r.low != null &&
+          r.close != null
+        )
+        .sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    try {
-      return res.json(payload);
+      if (cleanRows.length >= 40) {
+        sciScore = sciV1.scoreWithRows(cleanRows);
+
+        const final = sciScore?.decision?.final || "Neutral";
+        const score = sciScore?.decision?.score ?? 0;
+        const pUp = sciScore?.probability?.pUp ?? 0.5;
+        const magnitude = sciScore?.probability?.magnitude ?? 0;
+
+        record(
+          "SCI Score",
+          "Composite z-score result",
+          `${final}, score ${score.toFixed(3)}`,
+          "Your method uses z-scored metric combinations to judge whether the current setup historically leans up or down.",
+          final === "Up" ? "good" : final === "Down" ? "bad" : "neutral"
+        );
+
+        record(
+          "SCI Score",
+          "Probability up",
+          `${(pUp * 100).toFixed(1)}%`,
+          "This estimates the historical chance of an upward next move from the current SCI score setup.",
+          pUp > 0.5 ? "good" : pUp < 0.5 ? "bad" : "neutral"
+        );
+
+        record(
+          "SCI Score",
+          "Expected magnitude",
+          `${(magnitude * 100).toFixed(2)}%`,
+          "This estimates the expected move size using volatility and conviction.",
+          "neutral"
+        );
+      } else {
+        record(
+          "SCI Score",
+          "Historical rows",
+          cleanRows.length,
+          "Your z-score method needs enough historical rows to compare today against previous days.",
+          "neutral"
+        );
+      }
     } catch (e) {
-      console.error("check-stock serialize error:", e);
-      return res.status(500).json({ message: `serialize-failed: ${e.message}` });
+      record(
+        "SCI Score",
+        "SCI score engine",
+        "Unavailable",
+        `SCI engine could not run: ${e.message}`,
+        "neutral"
+      );
     }
+
+    // 5. Ticker volatility category
+    const atrPct =
+      sciScore?.indicators?.atrPct != null
+        ? sciScore.indicators.atrPct * 100
+        : null;
+
+    let tickerVolCategory = "Unavailable";
+    let tickerVolResult = "neutral";
+    if (atrPct != null) {
+      if (atrPct <= 1) {
+        tickerVolCategory = "Low / normal";
+        tickerVolResult = "good";
+      } else if (atrPct <= 3) {
+        tickerVolCategory = "High";
+        tickerVolResult = "neutral";
+      } else {
+        tickerVolCategory = "Very high";
+        tickerVolResult = "bad";
+      }
+    }
+
+    record(
+      "Volatility",
+      "Ticker volatility",
+      atrPct == null ? "Unavailable" : `${atrPct.toFixed(2)}% ATR`,
+      "Your method says high ticker volatility increases risk and can make scores less reliable.",
+      tickerVolResult
+    );
+
+    // 6. Valuation / financial model checks from available fields
+    const evToEbitda = summary.enterpriseToEbitda ?? null;
+    if (evToEbitda != null) {
+      let result = "neutral";
+      let meaning = "Your EV/EBITDA method: below 10 may suggest undervaluation, negative means stay out, above 15 can suggest overvaluation or high growth expectations.";
+      if (evToEbitda < 0) result = "bad";
+      else if (evToEbitda < 10) result = "good";
+      else if (evToEbitda > 15) result = "bad";
+
+      record(
+        "Financial Models",
+        "EV/EBITDA",
+        evToEbitda,
+        meaning,
+        result
+      );
+    } else {
+      record(
+        "Financial Models",
+        "EV/EBITDA",
+        "Unavailable",
+        "Your method uses EV/EBITDA as a major comparable multiple. Current quote data did not provide it.",
+        "neutral"
+      );
+    }
+
+    const revenueGrowth = pct(finData.revenueGrowth);
+    if (revenueGrowth != null) {
+      let result = "neutral";
+      if (revenueGrowth > 20) result = "bad";
+      else if (revenueGrowth >= 5 && revenueGrowth <= 15) result = "good";
+      else if (revenueGrowth < 2) result = "bad";
+
+      record(
+        "Financial Models",
+        "Revenue growth",
+        `${revenueGrowth.toFixed(2)}%`,
+        "Your CAGR rules: 5–15% is steady healthy expansion, below 2% is stagnation/decline, and above 20% may indicate startup-style risk under your guidelines.",
+        result
+      );
+    } else {
+      record(
+        "Financial Models",
+        "Revenue growth / CAGR",
+        "Unavailable",
+        "Your method requires multi-year CAGR. Current route only has limited live data, so this should be upgraded later with 10-year statements.",
+        "neutral"
+      );
+    }
+
+    const earningsGrowth = pct(finData.earningsGrowth);
+    if (earningsGrowth != null) {
+      let result = "neutral";
+      if (earningsGrowth < 0) result = "bad";
+      else if (earningsGrowth >= 5 && earningsGrowth < 10) result = "good";
+      else if (earningsGrowth >= 10) result = "good";
+      else if (earningsGrowth > 0 && earningsGrowth < 5) result = "neutral";
+
+      record(
+        "Financial Models",
+        "EPS / earnings growth",
+        `${earningsGrowth.toFixed(2)}%`,
+        "Your EPS CAGR scale: below 0% is poor, 0–5% weak, 5–10% acceptable, 10–15% good, 15–20% strong, above 20% amazing.",
+        result
+      );
+    } else {
+      record(
+        "Financial Models",
+        "EPS / earnings growth",
+        "Unavailable",
+        "Your method uses EPS CAGR to detect shareholder dilution and real per-share growth.",
+        "neutral"
+      );
+    }
+
+    record(
+      "Financial Models",
+      "DCF / WACC / Comps",
+      "Unavailable",
+      "Your PDF requires DCF, WACC stress testing, and comparable-company analysis. These require full financial statements, peer groups, FCF forecasts, terminal value, and WACC assumptions. This route should not invent them.",
+      "neutral"
+    );
+
+    // ── Profit & Margins ─────────────────────────────────────────────
+    const grossMargin    = pct(finData.grossMargins);
+    const operatingMargin = pct(finData.operatingMargins);
+    const netMargin      = pct(finData.profitMargins);
+    const roa            = pct(finData.returnOnAssets);
+    const roe            = pct(finData.returnOnEquity);
+
+    if (grossMargin != null) {
+      record(
+        "Profit & Margins", "Gross margin", `${grossMargin.toFixed(1)}%`,
+        grossMargin > 40
+          ? `At ${grossMargin.toFixed(1)}%, the company keeps a large portion of each sales dollar after production costs. Strong gross margins signal pricing power and operational efficiency.`
+          : grossMargin > 20
+          ? `At ${grossMargin.toFixed(1)}%, gross margins are moderate — acceptable but not exceptional. Compare to competitors in the same industry to judge.`
+          : `At ${grossMargin.toFixed(1)}%, gross margins are thin. There is very little buffer between revenue and the cost of making the product.`,
+        grossMargin > 40 ? "good" : grossMargin > 20 ? "neutral" : "bad"
+      );
+    } else {
+      record("Profit & Margins", "Gross margin", "Unavailable", "Gross margin data not available from this data source.", "neutral");
+    }
+
+    if (netMargin != null) {
+      record(
+        "Profit & Margins", "Net margin", `${netMargin.toFixed(1)}%`,
+        netMargin > 15
+          ? `At ${netMargin.toFixed(1)}%, the company is highly profitable — it keeps over 15 cents of profit for every dollar earned.`
+          : netMargin > 5
+          ? `At ${netMargin.toFixed(1)}%, the company is moderately profitable. Positive margins mean the business earns real money, not just revenue.`
+          : netMargin > 0
+          ? `At ${netMargin.toFixed(1)}%, net margins are very thin. A small revenue dip could push this business into losses.`
+          : `Net margin is negative (${netMargin.toFixed(1)}%) — the company is losing money. Per your framework, negative net margin is a red flag.`,
+        netMargin > 5 ? "good" : netMargin > 0 ? "neutral" : "bad"
+      );
+    } else {
+      record("Profit & Margins", "Net margin", "Unavailable", "Net margin data not available.", "neutral");
+    }
+
+    if (roa != null) {
+      record(
+        "Profit & Margins", "Return on Assets (ROA)", `${roa.toFixed(1)}%`,
+        roa > 5
+          ? `ROA of ${roa.toFixed(1)}% means the company generates strong returns from what it owns — a sign of efficient management.`
+          : roa > 0
+          ? `ROA of ${roa.toFixed(1)}% is positive but modest. The company earns on its assets but could be more efficient.`
+          : `ROA is negative — per your framework, this is a red flag indicating the company destroys value on its assets.`,
+        roa > 5 ? "good" : roa > 0 ? "neutral" : "bad"
+      );
+    }
+
+    if (roe != null) {
+      record(
+        "Profit & Margins", "Return on Equity (ROE)", `${roe.toFixed(1)}%`,
+        roe > 15
+          ? `ROE of ${roe.toFixed(1)}% means shareholders are getting excellent returns on their invested equity — a hallmark of quality companies.`
+          : roe > 0
+          ? `ROE of ${roe.toFixed(1)}% is positive — the company generates some return for shareholders, but has room to improve.`
+          : `ROE is negative — the company is destroying shareholder value.`,
+        roe > 15 ? "good" : roe > 0 ? "neutral" : "bad"
+      );
+    }
+
+    // ── Debt & Safety ────────────────────────────────────────────────
+    const debtToEquity = num(finData.debtToEquity);
+    const currentRatioVal = num(finData.currentRatio);
+
+    if (debtToEquity != null) {
+      record(
+        "Debt & Safety", "Debt-to-equity ratio", debtToEquity.toFixed(2),
+        debtToEquity < 0.5
+          ? `D/E of ${debtToEquity.toFixed(2)} — very little debt relative to equity. This company is financially conservative and resilient to downturns.`
+          : debtToEquity < 1.5
+          ? `D/E of ${debtToEquity.toFixed(2)} is a manageable debt load — moderate leverage, within normal range for most industries.`
+          : debtToEquity < 3
+          ? `D/E of ${debtToEquity.toFixed(2)} indicates high leverage. Per your framework, high debt increases risk especially in rising interest rate environments.`
+          : `D/E of ${debtToEquity.toFixed(2)} is very high — your framework flags this as a high-leverage warning. Companies burning through loans to stay afloat may look attractive but carry serious risk.`,
+        debtToEquity < 1.5 ? "good" : debtToEquity < 3 ? "neutral" : "bad"
+      );
+    } else {
+      record("Debt & Safety", "Debt-to-equity ratio", "Unavailable", "Debt ratio data not available from this source.", "neutral");
+    }
+
+    if (currentRatioVal != null) {
+      record(
+        "Debt & Safety", "Current ratio", currentRatioVal.toFixed(2),
+        currentRatioVal > 2
+          ? `Current ratio of ${currentRatioVal.toFixed(2)} means the company has ${currentRatioVal.toFixed(1)}x more short-term assets than short-term liabilities — very liquid and able to cover near-term obligations easily.`
+          : currentRatioVal > 1
+          ? `Current ratio of ${currentRatioVal.toFixed(2)} means the company can cover short-term debts, but with limited buffer. Acceptable, not comfortable.`
+          : `Current ratio below 1 (${currentRatioVal.toFixed(2)}) is a warning sign — the company has more near-term debt than short-term assets. Liquidity risk.`,
+        currentRatioVal > 1.5 ? "good" : currentRatioVal > 1 ? "neutral" : "bad"
+      );
+    } else {
+      record("Debt & Safety", "Current ratio", "Unavailable", "Current ratio data not available.", "neutral");
+    }
+
+    // ── Additional Valuation ─────────────────────────────────────────
+    const trailingPE  = num(stock.summaryDetail?.trailingPE ?? stock.defaultKeyStatistics?.trailingPE);
+    const priceToBook = num(stock.summaryDetail?.priceToBook ?? stock.defaultKeyStatistics?.priceToBook);
+
+    if (trailingPE != null) {
+      let peResult = "neutral", peMeaning;
+      if (trailingPE < 0) {
+        peResult = "bad";
+        peMeaning = `P/E is negative — the company is not currently profitable. Stay away per your framework.`;
+      } else if (trailingPE < 15) {
+        peResult = "good";
+        peMeaning = `P/E of ${trailingPE.toFixed(1)}x is low — the stock may be undervalued relative to earnings. Verify it is not a value trap (check the trend in earnings).`;
+      } else if (trailingPE <= 25) {
+        peResult = "neutral";
+        peMeaning = `P/E of ${trailingPE.toFixed(1)}x is in a fair range for most established companies.`;
+      } else {
+        peResult = "bad";
+        peMeaning = `P/E of ${trailingPE.toFixed(1)}x is elevated — the market is pricing in high growth. Any earnings disappointment could cause a sharp correction.`;
+      }
+      record("Valuation", "P/E ratio (trailing 12 months)", `${trailingPE.toFixed(1)}x`, peMeaning, peResult);
+    }
+
+    if (priceToBook != null) {
+      record(
+        "Valuation", "Price-to-book ratio", `${priceToBook.toFixed(2)}x`,
+        priceToBook < 1
+          ? `P/B below 1 (${priceToBook.toFixed(2)}x) means you are buying assets for less than their book value — potentially undervalued. Verify why the market discounts it.`
+          : priceToBook < 3
+          ? `P/B of ${priceToBook.toFixed(2)}x is reasonable — a small premium to book value, normal for profitable companies.`
+          : `P/B of ${priceToBook.toFixed(2)}x is elevated — the market prices in significant intangibles (brand, IP, growth). Justified for quality companies, risky if growth slows.`,
+        priceToBook < 3 ? "good" : priceToBook < 5 ? "neutral" : "bad"
+      );
+    }
+
+    // ── Technical Signals (await getTechnical result) ─────────────────
+    const tech       = await techPromise;
+    const ind        = tech?.indicators || {};
+    const techLevels = tech?.levels     || {};
+    const techTrend  = tech?.trend      || "sideways";
+
+    if (ind.RSI14 != null) {
+      let rsiResult = "neutral", rsiMsg;
+      const r = ind.RSI14;
+      if (r < 30) {
+        rsiResult = "good";
+        rsiMsg = `RSI is at ${r.toFixed(1)} — the stock is oversold. Sellers have exhausted themselves and a bounce is statistically likely. Your framework treats this as a potential entry zone.`;
+      } else if (r < 45) {
+        rsiResult = "neutral";
+        rsiMsg = `RSI at ${r.toFixed(1)} is in the lower neutral zone — momentum is weak but not extreme. Not yet a buying signal by itself.`;
+      } else if (r <= 60) {
+        rsiResult = "good";
+        rsiMsg = `RSI at ${r.toFixed(1)} is healthy — momentum is positive without being overbought. This is the sweet spot for a continuation move in your framework.`;
+      } else if (r <= 70) {
+        rsiResult = "neutral";
+        rsiMsg = `RSI at ${r.toFixed(1)} is elevated — momentum is strong but approaching overbought. Be cautious about chasing the move.`;
+      } else {
+        rsiResult = "bad";
+        rsiMsg = `RSI above 70 (${r.toFixed(1)}) — the stock is overbought. A pullback or consolidation is statistically likely. Your framework reduces signal reliability here.`;
+      }
+      record("Technical Signals", "RSI 14 (momentum)", r.toFixed(1), rsiMsg, rsiResult);
+    }
+
+    if (ind.MACD) {
+      const bullishMacd = ind.MACD.macd > ind.MACD.signal;
+      record(
+        "Technical Signals", "MACD signal",
+        bullishMacd ? "Bullish" : "Bearish",
+        bullishMacd
+          ? `MACD line (${ind.MACD.macd.toFixed(3)}) is above the signal line (${ind.MACD.signal.toFixed(3)}) — short-term momentum is stronger than the longer-term baseline. A bullish signal per your framework.`
+          : `MACD line (${ind.MACD.macd.toFixed(3)}) is below the signal line (${ind.MACD.signal.toFixed(3)}) — short-term momentum is weaker than the longer-term baseline. A bearish signal.`,
+        bullishMacd ? "good" : "bad"
+      );
+    }
+
+    if (techTrend) {
+      let trendResult, trendMsg;
+      if (techTrend === "uptrend") {
+        trendResult = "good";
+        trendMsg = `SMA 50 is above SMA 200 — a "Golden Cross". This confirms a long-term uptrend. Your framework says momentum strategies work best in trending markets with ADX > 25.`;
+      } else if (techTrend === "downtrend") {
+        trendResult = "bad";
+        trendMsg = `SMA 50 is below SMA 200 — a "Death Cross". This confirms a long-term downtrend. Your framework says to be cautious and avoid momentum longs in this environment.`;
+      } else {
+        trendResult = "neutral";
+        trendMsg = `Moving averages are close together — no clear trend. The market is sideways or transitioning. Your framework says to wait for a cleaner directional signal before committing.`;
+      }
+      record(
+        "Technical Signals", "Long-term trend (SMA 50 vs SMA 200)",
+        techTrend === "uptrend" ? "Uptrend — Golden Cross" : techTrend === "downtrend" ? "Downtrend — Death Cross" : "Sideways",
+        trendMsg, trendResult
+      );
+    }
+
+    if (ind.SMA50 != null && currentPrice != null) {
+      const pctFromSMA50 = ((currentPrice - ind.SMA50) / ind.SMA50) * 100;
+      const above = currentPrice > ind.SMA50;
+      record(
+        "Technical Signals", "Price vs SMA 50",
+        `${above ? "+" : ""}${pctFromSMA50.toFixed(1)}% from $${ind.SMA50.toFixed(2)}`,
+        above
+          ? `Price is ${pctFromSMA50.toFixed(1)}% above its 50-day moving average ($${ind.SMA50.toFixed(2)}). Stocks trading above key moving averages tend to remain in an uptrend.`
+          : `Price is ${Math.abs(pctFromSMA50).toFixed(1)}% below its 50-day moving average ($${ind.SMA50.toFixed(2)}). This indicates short-to-medium term weakness.`,
+        above ? "good" : "bad"
+      );
+    }
+
+    if (ind.BB_upper != null && ind.BB_lower != null && currentPrice != null) {
+      const range  = ind.BB_upper - ind.BB_lower;
+      const bbPos  = range > 0 ? (currentPrice - ind.BB_lower) / range : 0.5;
+      let bbResult = "neutral", bbMsg;
+      if (bbPos > 0.85) {
+        bbResult = "bad";
+        bbMsg = `Price is near the upper Bollinger Band ($${ind.BB_upper.toFixed(2)}) — statistically expensive relative to recent volatility. Your framework flags this as a potential sell zone.`;
+      } else if (bbPos < 0.15) {
+        bbResult = "good";
+        bbMsg = `Price is near the lower Bollinger Band ($${ind.BB_lower.toFixed(2)}) — statistically cheap relative to recent volatility. A potential bounce zone per your framework.`;
+      } else {
+        bbResult = "neutral";
+        bbMsg = `Price sits within the Bollinger Bands (upper: $${ind.BB_upper.toFixed(2)}, lower: $${ind.BB_lower.toFixed(2)}) — no extreme band signal. Momentum is not stretched.`;
+      }
+      record("Technical Signals", "Bollinger Band position", `${(bbPos * 100).toFixed(0)}% within bands`, bbMsg, bbResult);
+    }
+
+    // ── Support & Resistance ─────────────────────────────────────────
+    if (techLevels.support != null && techLevels.resistance != null && currentPrice != null) {
+      const distToSupport    = ((currentPrice - techLevels.support)    / currentPrice) * 100;
+      const distToResistance = ((techLevels.resistance - currentPrice) / currentPrice) * 100;
+
+      record(
+        "Support & Resistance", "20-day support level", `$${techLevels.support.toFixed(2)}`,
+        `Support at $${techLevels.support.toFixed(2)} is ${distToSupport.toFixed(1)}% below the current price. This is where buyers have historically stepped in. A good place to consider a stop loss — if price breaks below this level convincingly, the thesis has failed.`,
+        distToSupport > 3 ? "good" : distToSupport > 1 ? "neutral" : "bad"
+      );
+
+      record(
+        "Support & Resistance", "20-day resistance level", `$${techLevels.resistance.toFixed(2)}`,
+        `Resistance at $${techLevels.resistance.toFixed(2)} is ${distToResistance.toFixed(1)}% above the current price. Price has struggled to break above this level. A confirmed breakout above it would be a strong bullish signal with target upside.`,
+        distToResistance > 5 ? "good" : distToResistance > 2 ? "neutral" : "bad"
+      );
+
+      if (distToSupport > 0 && distToResistance > 0) {
+        const riskReward = distToResistance / distToSupport;
+        record(
+          "Support & Resistance", "Implied risk/reward (S/R based)", `${riskReward.toFixed(2)}:1`,
+          riskReward > 2
+            ? `${distToResistance.toFixed(1)}% upside to resistance vs ${distToSupport.toFixed(1)}% risk to support = ${riskReward.toFixed(2)}:1 risk/reward. Your framework requires more upside than downside — this qualifies.`
+            : riskReward > 1
+            ? `${distToResistance.toFixed(1)}% upside vs ${distToSupport.toFixed(1)}% risk = ${riskReward.toFixed(2)}:1. Marginally positive but thin margin. Consider waiting for a better setup closer to support.`
+            : `${distToResistance.toFixed(1)}% upside vs ${distToSupport.toFixed(1)}% risk = ${riskReward.toFixed(2)}:1. Unfavorable — the downside to support exceeds the upside to resistance. Your framework says skip this trade.`,
+          riskReward > 2 ? "good" : riskReward > 1 ? "neutral" : "bad"
+        );
+      }
+    }
+
+    // 7. Regime detection
+    const marketVol = null;
+    record(
+      "Regime Detection",
+      "GMM / HMM / Hurst regime",
+      "Unavailable",
+      "Your method calls for GMM and HMM to detect regime and Hurst exponent to detect regime shift. This route does not currently compute those models.",
+      "neutral"
+    );
+
+    // 8. Risk management
+    record(
+      "Risk Management",
+      "Risk per trade",
+      "1–2% max portfolio risk",
+      "Your method says never risk more than 1–2% of portfolio on one trade.",
+      "neutral"
+    );
+
+    record(
+      "Risk Management",
+      "Risk/reward",
+      "Needs user entry, stop, and target",
+      "Your method says a trade should offer more upside than downside. This needs user-provided or model-generated entry, stop, and target.",
+      "neutral"
+    );
+
+    const suggestion = finalSuggestion(goods, bads);
+
+    return res.json({
+      symbol: upper,
+      name: priceData.longName || upper,
+      industry: profile.industry || "Unknown",
+      method: "SCI analysis method",
+      source: "SCI PDF methodology",
+      summary: {
+        goods,
+        bads,
+        neutrals,
+        overallSuggestion: suggestion,
+        explanation:
+          "The suggestion is based on your rule: if good findings are greater than bad findings, it is Buy; if bad findings are greater than good findings, it is Stay away / Don’t buy; if close or incomplete, it is Neutral."
+      },
+      metrics: {
+        currentPrice,
+        volume,
+        avgVolume,
+        marketCap,
+        bid,
+        ask,
+        spreadPct,
+        comparativeVolumePercent: compVol,
+        sentimentScore: news.averageSentiment
+      },
+      sciScore,
+      findings,
+      news,
+      levels: Object.keys(techLevels).length ? techLevels : null,
+      technicalIndicators: Object.keys(ind).length ? ind : null,
+      trend: techTrend || null
+    });
   } catch (err) {
-    console.error("check-stock route error:", err);
+    console.error("SCI check-stock route error:", err);
     return res.status(500).json({ message: "Server error." });
   }
 });
@@ -3289,14 +3439,12 @@ async function refreshAllHistoricalData() {
 }
 
  if (!DISABLE_BG) {
-   // initial run at boot
-   refreshAllHistoricalData();
-   // run once every 24 h
-   setInterval(() => {
-     console.log("⏰ Running daily refreshAllHistoricalData…");
-     refreshAllHistoricalData();
-   }, ONE_DAY);
- }
+  setInterval(() => {
+    console.log("⏰ Running daily refreshAllHistoricalData…");
+    refreshAllHistoricalData();
+  }, ONE_DAY);
+}
+
 
 // GET /api/sci/score/:symbol  -> rule decision, confidence, and optional regression
 app.get('/api/sci/score/:symbol', async (req, res) => {
