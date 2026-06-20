@@ -11,6 +11,7 @@
     "postinstall": "node -e \"console.log('postinstall ok')\""
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
     "@sendgrid/mail": "^8.1.5",
     "@tensorflow/tfjs-node": "^4.22.0",
     "admin": "^1.4.1",

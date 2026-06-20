@@ -18,6 +18,7 @@ const { yf: yahooFinance, historicalCompat } = require('./lib/yfCompat');
 const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
+const Anthropic  = require('@anthropic-ai/sdk');
 const https      = require('https'); // keep-alive agent
 const ensembleRoutes = require('./routes/ensemble');
 const UserProfile = require('./models/UserProfile');
@@ -344,37 +345,60 @@ function trimMessages(messages = [], maxTurns = 12, maxCharsPerMsg = 1500) {
   return out;
 }
 
+// Anthropic client (lazy-init so missing key doesn't crash startup)
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return null;
+    _anthropic = new Anthropic({ apiKey });
+  }
+  return _anthropic;
+}
+
 async function callChatServiceAdaptive({ system, messages }) {
-  if (!CHAT_SERVICE_URL) return ''; // let caller fall back
+  const safeMsgs   = trimMessages(messages || [], 12, 1500);
+  const safeSystem = String(system || '').slice(0, 8000);
 
-  const safeMsgs = trimMessages(messages || [], 12, 1500);
-  const safeSystem = String(system || '').slice(0, 8000); // protect token budget
+  // A) Anthropic Claude (preferred — structured, fast, follows formatting rules)
+  const anthropic = getAnthropic();
+  if (anthropic) {
+    try {
+      const userMsgs = safeMsgs.filter(m => m.role !== 'system');
+      const response = await anthropic.messages.create({
+        model:      process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
+        max_tokens: 600,
+        system:     safeSystem,
+        messages:   userMsgs.length ? userMsgs : [{ role: 'user', content: 'Hello' }],
+      });
+      const text = response?.content?.[0]?.text?.trim();
+      if (text) return text;
+    } catch (e) {
+      console.warn('[Chat] Anthropic error:', e.message);
+    }
+  }
+
+  // B) Legacy external service fallback
+  if (!CHAT_SERVICE_URL) return '';
   const packed = [{ role: 'system', content: safeSystem }, ...safeMsgs];
-
-  const opts = { timeout: 20000 }; // 20s hard cap
-
-  // A) messages-based call
+  const opts   = { timeout: 20000 };
   try {
     const rA = await axios.post(CHAT_SERVICE_URL, { messages: packed }, opts);
     const tA = normalizeChatResponse(rA.data);
     if (tA) return tA;
-    console.warn('Chat A empty. keys=', Object.keys(rA.data || {}));
   } catch (e) {
-    console.warn('Chat A error:', e.message);
+    console.warn('[Chat] Legacy A error:', e.message);
   }
-
-  // B) single-prompt fallback
   try {
     const prompt = renderPromptFromMessages(safeSystem, safeMsgs);
     const rB = await axios.post(CHAT_SERVICE_URL, { prompt }, opts);
     const tB = normalizeChatResponse(rB.data);
     if (tB) return tB;
-    console.warn('Chat B empty. keys=', Object.keys(rB.data || {}));
   } catch (e) {
-    console.warn('Chat B error:', e.message);
+    console.warn('[Chat] Legacy B error:', e.message);
   }
 
-  return ''; // important: don't throw → caller can build an offline reply
+  return '';
 }
 
 // create a keep-alive agent for Yahoo requests
@@ -2284,17 +2308,26 @@ Include up to 2 detected symbols. Output JSON only.
     let system;
     if (ctx.symbol || intent === 'ticker_question') {
       system = `
-You are SCI's AI equity advisor.
+You are SCI, a precise AI equity advisor. Your responses are rendered with markdown — use it.
 
-Use ONLY the provided Context (live snapshot, fundamentals/benchmarks, Finder score+reasons, short-term model), the user's Profile & Memory, and the researchText.
-Never invent prices. Personalize to risk/horizon.
+FORMATTING RULES (follow exactly):
+- Use ### for section titles: ### Snapshot, ### Core View, ### Action
+- Use **bold** for key numbers, tickers, signals
+- Use "- " bullet lines for lists of data points or reasons
+- Keep total response under 180 words
+- Never output raw JSON, code blocks, or unformatted walls of text
 
-Format (≤180 words):
-1) Snapshot — name, price, 52w position. Include quick rating and Finder score with one reason.
-2) Core View — short-term if horizonIntent ≠ 'long'; otherwise long-term thesis (bullets) using researchText.
-3) Action — buy/hold/avoid with risk notes (sizing aligned to profile); if short-term, you may suggest entry/stop/target ranges implied by support/resistance/ATR if available; otherwise keep high-level.
+RESPONSE STRUCTURE:
+### Snapshot
+One sentence: [Ticker] at $[price], [52w position: near high/mid/low]. Analyst consensus: [Buy/Neutral/Avoid].
 
-Data:
+### Core View
+- 2–3 bullet points from fundamentals/technicals/research
+
+### Action
+**[Buy / Hold / Avoid]** — one sentence rationale. Risk note aligned to profile.
+
+DATA (use only this, never invent):
 Intent: ${intent}
 Profile: ${JSON.stringify(profile || {})}
 Memory:  ${JSON.stringify(memory || {})}
@@ -2302,10 +2335,15 @@ Context: ${JSON.stringify(llmContext || {})}
 `.trim();
     } else if (intent === 'portfolio_sizing' || intent === 'risk_policy') {
       system = `
-You are a portfolio coach. The user asked about position sizing/risk.
-Use Profile & Memory (riskTolerance, maxPositionPct, stopLossPct, portfolioSize) if available.
-If numbers are missing, provide a clear framework (e.g., risk 0.5–1.5% of equity per trade; derive share count from stop distance).
-Give an example with round numbers. Keep it ≤160 words.
+You are SCI's portfolio coach. Responses rendered with markdown — use ### headers and **bold** for numbers.
+
+### Framework
+Explain position sizing in ≤3 bullet points using the user's profile numbers if available.
+
+### Example
+Show a round-number worked example.
+
+Keep total response under 160 words.
 
 Profile: ${JSON.stringify(profile || {})}
 Memory:  ${JSON.stringify(memory || {})}
@@ -2318,10 +2356,12 @@ Memory:  ${JSON.stringify(memory || {})}
         pUp: p.pUp, magnitudePct: p.magnitudePct, expectedReturnPct: p.expectedReturnPct
       }));
       system = `
-You are SCI's stock scout. The user wants ideas/picks without giving a ticker.
-Use the short-term model picks provided below. Personalize to Profile/Memory (risk, horizon, sectors).
-Output a short list (2–3 bullets) with each pick's price and brief rationale (probability/magnitude or quality).
-Close with a nudge that you can deep-dive any of them.
+You are SCI's stock scout. Responses are rendered with markdown.
+
+### Ideas
+List 2–3 picks as bullets: "- **TICK** $XX.XX — [one-line reason (probability/expected-return)]"
+End with one line: "Ask me to deep-dive any of these."
+Keep total under 120 words.
 
 Profile: ${JSON.stringify(profile || {})}
 Memory:  ${JSON.stringify(memory || {})}
@@ -2329,20 +2369,29 @@ Picks:   ${JSON.stringify(picksLite || [])}
 `.trim();
     } else if (intent === 'education') {
       system = `
-You are a concise explainer for investing concepts (≤160 words).
-Use simple language, one mini example, and one caution/pitfall. No symbols required.
-Profile (to adjust tone): ${JSON.stringify(profile || {})}
+You are SCI's investing educator. Responses rendered with markdown.
+
+### [Concept Name]
+Explain in ≤3 bullet points using simple language.
+
+### Example
+One sentence mini-example.
+
+### Watch Out
+One caution/pitfall.
+
+Keep total under 150 words.
+Profile (adjust tone): ${JSON.stringify(profile || {})}
 `.trim();
     } else if (intent === 'greet' || intent === 'other' || intent === 'macro' || intent === 'watchlist_update') {
       // friendly general assistant + quick capability summary; try to be helpful immediately
       const picks = await quickPicksForUser(profile).catch(() => []);
       const picksLite = picks.map(p => ({ symbol: p.symbol, expectedReturnPct: p.expectedReturnPct }));
       system = `
-You are SCI's AI financial assistant. The user didn't provide a ticker.
-Greet briefly and show what you can do (1 short line).
-Offer 2 quick actionable options tailored to Profile/Memory (e.g., "get ideas", "size a position", "analyze your watchlist").
-If Picks are supplied, mention 1–2 tickers with their expected-return snapshot as "quick ideas".
-Keep it ≤120 words.
+You are SCI, an AI financial assistant. Responses rendered with markdown.
+
+Respond warmly in ≤120 words. If picks are available, mention 1–2 as "- **TICK** (+X% expected)" quick ideas.
+Offer what you can do: analyze tickers, size positions, give ideas, explain concepts.
 
 Profile: ${JSON.stringify(profile || {})}
 Memory:  ${JSON.stringify(memory || {})}
@@ -3153,6 +3202,29 @@ app.get("/api/popular-stocks*", async (_req, res) => {
       popular.map((s) => fetchStockData(s).catch(() => null))
     );
 
+    function quickSuggestion(d) {
+      // Use Yahoo analyst consensus (recommendationMean: 1=StrongBuy, 5=StrongSell)
+      const rec = d?.financialData?.recommendationMean ?? d?.summaryDetail?.recommendationMean;
+      if (rec != null) {
+        if (rec <= 2.0) return "Buy";
+        if (rec >= 3.8) return "Stay Away";
+        return "Neutral";
+      }
+      // Fallback: use 52w range position + day change
+      const price  = d?.price?.regularMarketPrice;
+      const hi52   = d?.price?.fiftyTwoWeekHigh ?? d?.summaryDetail?.fiftyTwoWeekHigh;
+      const lo52   = d?.price?.fiftyTwoWeekLow  ?? d?.summaryDetail?.fiftyTwoWeekLow;
+      const chgPct = d?.price?.regularMarketChangePercent;
+      if (price && hi52 && lo52) {
+        const pos = (price - lo52) / (hi52 - lo52); // 0=at low, 1=at high
+        if (pos > 0.75 && chgPct < 0) return "Neutral"; // near high but falling
+        if (pos < 0.30) return chgPct >= 0 ? "Buy" : "Stay Away";
+        if (chgPct >= 0.01) return "Buy";
+        if (chgPct <= -0.01) return "Neutral";
+      }
+      return "Neutral";
+    }
+
     const rows = quotes
       .map((d, i) =>
         d && d.price
@@ -3161,6 +3233,7 @@ app.get("/api/popular-stocks*", async (_req, res) => {
               name: d.price.longName || popular[i],
               price: d.price.regularMarketPrice || 0,
               volume: d.price.regularMarketVolume || 0,
+              overallSuggestion: quickSuggestion(d),
             }
           : null
       )
