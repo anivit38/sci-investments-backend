@@ -1491,7 +1491,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Liquidity / Tradability",
       "Bid-ask spread",
       spreadPct == null ? "Unavailable" : `${spreadPct.toFixed(2)}%`,
-      "Your method says spread under 0.5% of stock price means the stock is liquid.",
+      "A spread below 0.5% of the stock price indicates sufficient liquidity for safe entry and exit.",
       spreadPct == null ? "neutral" : spreadPct < 0.5 ? "good" : "bad"
     );
 
@@ -1499,7 +1499,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Liquidity / Tradability",
       "Trading volume",
       volume == null ? "Unavailable" : volume,
-      "Your method says only analyze if trading volume is above 500,000 per day.",
+      "The SCI framework only analyses stocks with at least 500,000 shares traded per day to ensure tradability.",
       volume == null ? "neutral" : volume > 500000 ? "good" : "bad"
     );
 
@@ -1507,7 +1507,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Liquidity / Tradability",
       "Market cap",
       marketCap == null ? "Unavailable" : marketCap,
-      "Your method says only analyze if market cap is above $300M.",
+      "The SCI framework filters for companies above $300M market cap to avoid micro-cap liquidity risk.",
       marketCap == null ? "neutral" : marketCap > 300000000 ? "good" : "bad"
     );
 
@@ -1515,7 +1515,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Liquidity / Tradability",
       "Float-adjusted volume",
       "Unavailable",
-      "Your method requires float-adjusted volume above 15 million. Current data source does not provide float-adjusted volume here.",
+      "Float-adjusted volume above 15 million confirms institutional-grade liquidity. This data point is not available from the current source.",
       "neutral"
     );
 
@@ -1553,7 +1553,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Sentiment",
       "Average sentiment score",
       news.averageSentiment,
-      "Your method says higher sentiment score is bullish.",
+      "A positive news sentiment score is bullish. Negative sentiment can indicate near-term headwinds.",
       news.averageSentiment > 0 ? "good" : news.averageSentiment < 0 ? "bad" : "neutral"
     );
 
@@ -1599,7 +1599,7 @@ app.post("/api/check-stock", async (req, res) => {
           "SCI Score",
           "Composite z-score result",
           `${final}, score ${score.toFixed(3)}`,
-          "Your method uses z-scored metric combinations to judge whether the current setup historically leans up or down.",
+          "The SCI z-score engine compares current technical conditions against historical distributions to estimate directional bias.",
           final === "Up" ? "good" : final === "Down" ? "bad" : "neutral"
         );
 
@@ -1623,7 +1623,7 @@ app.post("/api/check-stock", async (req, res) => {
           "SCI Score",
           "Historical rows",
           cleanRows.length,
-          "Your z-score method needs enough historical rows to compare today against previous days.",
+          "Insufficient historical data to run the SCI z-score engine. At least 40 trading days of history are required.",
           "neutral"
         );
       }
@@ -1662,7 +1662,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Volatility",
       "Ticker volatility",
       atrPct == null ? "Unavailable" : `${atrPct.toFixed(2)}% ATR`,
-      "Your method says high ticker volatility increases risk and can make scores less reliable.",
+      "High ATR-based volatility increases risk and can reduce signal reliability. Low volatility is preferred for cleaner entries.",
       tickerVolResult
     );
 
@@ -1670,7 +1670,7 @@ app.post("/api/check-stock", async (req, res) => {
     const evToEbitda = summary.enterpriseToEbitda ?? null;
     if (evToEbitda != null) {
       let result = "neutral";
-      let meaning = "Your EV/EBITDA method: below 10 may suggest undervaluation, negative means stay out, above 15 can suggest overvaluation or high growth expectations.";
+      let meaning = "EV/EBITDA below 10 may indicate undervaluation; negative means the business is loss-making; above 15 suggests premium or high-growth pricing.";
       if (evToEbitda < 0) result = "bad";
       else if (evToEbitda < 10) result = "good";
       else if (evToEbitda > 15) result = "bad";
@@ -1687,7 +1687,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "EV/EBITDA",
         "Unavailable",
-        "Your method uses EV/EBITDA as a major comparable multiple. Current quote data did not provide it.",
+        "EV/EBITDA is a key comparable valuation multiple in the SCI framework. Data not available for this ticker.",
         "neutral"
       );
     }
@@ -1703,7 +1703,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "Revenue growth",
         `${revenueGrowth.toFixed(2)}%`,
-        "Your CAGR rules: 5–15% is steady healthy expansion, below 2% is stagnation/decline, and above 20% may indicate startup-style risk under your guidelines.",
+        "SCI target range is 5–15% annual revenue growth — steady and sustainable. Below 2% signals stagnation; above 20% may indicate early-stage risk.",
         result
       );
     } else {
@@ -1711,7 +1711,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "Revenue growth / CAGR",
         "Unavailable",
-        "Your method requires multi-year CAGR. Current route only has limited live data, so this should be upgraded later with 10-year statements.",
+        "Multi-year revenue CAGR data is not available from the current source. Full historical statements would be needed for a complete assessment.",
         "neutral"
       );
     }
@@ -1728,7 +1728,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "EPS / earnings growth",
         `${earningsGrowth.toFixed(2)}%`,
-        "Your EPS CAGR scale: below 0% is poor, 0–5% weak, 5–10% acceptable, 10–15% good, 15–20% strong, above 20% amazing.",
+        "EPS growth scale: below 0% is poor, 0–5% weak, 5–10% acceptable, 10–15% good, 15–20% strong, above 20% exceptional.",
         result
       );
     } else {
@@ -1736,7 +1736,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "EPS / earnings growth",
         "Unavailable",
-        "Your method uses EPS CAGR to detect shareholder dilution and real per-share growth.",
+        "EPS growth data is not available from the current source. Multi-year EPS CAGR is used to detect dilution and real per-share growth.",
         "neutral"
       );
     }
@@ -1745,7 +1745,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Financial Models",
       "DCF / WACC / Comps",
       "Unavailable",
-      "Your PDF requires DCF, WACC stress testing, and comparable-company analysis. These require full financial statements, peer groups, FCF forecasts, terminal value, and WACC assumptions. This route should not invent them.",
+      "DCF, WACC stress testing, and comparable-company analysis require full financial statements, peer groups, and FCF forecasts. These cannot be reliably computed from live quote data alone.",
       "neutral"
     );
 
@@ -2004,7 +2004,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Regime Detection",
       "GMM / HMM / Hurst regime",
       "Unavailable",
-      "Your method calls for GMM and HMM to detect regime and Hurst exponent to detect regime shift. This route does not currently compute those models.",
+      "Regime detection uses GMM, HMM, and the Hurst exponent to classify whether the market is trending or mean-reverting. These models are not yet computed on this route.",
       "neutral"
     );
 
@@ -2013,7 +2013,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Risk Management",
       "Risk per trade",
       "1–2% max portfolio risk",
-      "Your method says never risk more than 1–2% of portfolio on one trade.",
+      "The SCI framework mandates capping risk at 1–2% of total portfolio per trade to protect capital over the long run.",
       "neutral"
     );
 
@@ -2021,7 +2021,7 @@ app.post("/api/check-stock", async (req, res) => {
       "Risk Management",
       "Risk/reward",
       "Needs user entry, stop, and target",
-      "Your method says a trade should offer more upside than downside. This needs user-provided or model-generated entry, stop, and target.",
+      "Every trade must offer more upside than downside. A risk/reward ratio above 1:1.5 is preferred. Requires a defined entry, stop loss, and price target.",
       "neutral"
     );
 
