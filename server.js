@@ -19,6 +19,7 @@ const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
 const axios      = require('axios');
 const Anthropic  = require('@anthropic-ai/sdk');
+const OpenAI     = require('openai');
 const https      = require('https'); // keep-alive agent
 const ensembleRoutes = require('./routes/ensemble');
 const UserProfile = require('./models/UserProfile');
@@ -345,40 +346,57 @@ function trimMessages(messages = [], maxTurns = 12, maxCharsPerMsg = 1500) {
   return out;
 }
 
-// Anthropic client (lazy-init so missing key doesn't crash startup)
-let _anthropic = null;
+// ── AI clients (lazy-init; missing key → skip that provider) ──────────────
+let _anthropic = null, _openai = null;
 function getAnthropic() {
-  if (!_anthropic) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return null;
-    _anthropic = new Anthropic({ apiKey });
-  }
+  if (!_anthropic) { const k = process.env.ANTHROPIC_API_KEY; if (k) _anthropic = new Anthropic({ apiKey: k }); }
   return _anthropic;
+}
+function getOpenAI() {
+  if (!_openai) { const k = process.env.OPENAI_API_KEY; if (k) _openai = new OpenAI({ apiKey: k }); }
+  return _openai;
 }
 
 async function callChatServiceAdaptive({ system, messages }) {
   const safeMsgs   = trimMessages(messages || [], 12, 1500);
-  const safeSystem = String(system || '').slice(0, 8000);
+  const safeSystem = String(system || '').slice(0, 6000);
 
-  // A) Anthropic Claude (preferred — structured, fast, follows formatting rules)
+  // A) OpenAI direct — gpt-4o-mini with strict formatting
+  const openai = getOpenAI();
+  if (openai) {
+    try {
+      const userMsgs = safeMsgs.filter(m => m.role !== 'system');
+      const resp = await openai.chat.completions.create({
+        model:      process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        max_tokens: 600,
+        temperature: 0.4,
+        messages: [
+          { role: 'system', content: safeSystem },
+          ...(userMsgs.length ? userMsgs : [{ role: 'user', content: 'Hello' }])
+        ]
+      });
+      const text = resp?.choices?.[0]?.message?.content?.trim();
+      if (text) return text;
+    } catch (e) { console.warn('[Chat] OpenAI error:', e.message); }
+  }
+
+  // B) Anthropic Claude fallback
   const anthropic = getAnthropic();
   if (anthropic) {
     try {
       const userMsgs = safeMsgs.filter(m => m.role !== 'system');
-      const response = await anthropic.messages.create({
+      const resp = await anthropic.messages.create({
         model:      process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
         max_tokens: 600,
         system:     safeSystem,
         messages:   userMsgs.length ? userMsgs : [{ role: 'user', content: 'Hello' }],
       });
-      const text = response?.content?.[0]?.text?.trim();
+      const text = resp?.content?.[0]?.text?.trim();
       if (text) return text;
-    } catch (e) {
-      console.warn('[Chat] Anthropic error:', e.message);
-    }
+    } catch (e) { console.warn('[Chat] Anthropic error:', e.message); }
   }
 
-  // B) Legacy external service fallback
+  // C) Legacy external service
   if (!CHAT_SERVICE_URL) return '';
   const packed = [{ role: 'system', content: safeSystem }, ...safeMsgs];
   const opts   = { timeout: 20000 };
@@ -386,17 +404,13 @@ async function callChatServiceAdaptive({ system, messages }) {
     const rA = await axios.post(CHAT_SERVICE_URL, { messages: packed }, opts);
     const tA = normalizeChatResponse(rA.data);
     if (tA) return tA;
-  } catch (e) {
-    console.warn('[Chat] Legacy A error:', e.message);
-  }
+  } catch (e) { console.warn('[Chat] Legacy A:', e.message); }
   try {
     const prompt = renderPromptFromMessages(safeSystem, safeMsgs);
     const rB = await axios.post(CHAT_SERVICE_URL, { prompt }, opts);
     const tB = normalizeChatResponse(rB.data);
     if (tB) return tB;
-  } catch (e) {
-    console.warn('[Chat] Legacy B error:', e.message);
-  }
+  } catch (e) { console.warn('[Chat] Legacy B:', e.message); }
 
   return '';
 }
@@ -1583,6 +1597,7 @@ app.post("/api/check-stock", async (req, res) => {
 
     // 4. SCI V1 z-score / score engine using your existing service
     let sciScore = null;
+    let historicalRows = []; // hoisted so regime detection can use it
     try {
       const period2 = new Date();
       const period1 = new Date();
@@ -1611,6 +1626,7 @@ app.post("/api/check-stock", async (req, res) => {
         )
         .sort((a, b) => new Date(a.date) - new Date(b.date));
 
+      historicalRows = cleanRows; // make available to regime detection
       if (cleanRows.length >= 40) {
         sciScore = sciV1.scoreWithRows(cleanRows);
 
@@ -1691,19 +1707,26 @@ app.post("/api/check-stock", async (req, res) => {
     );
 
     // 6. Valuation / financial model checks from available fields
-    const evToEbitda = summary.enterpriseToEbitda ?? null;
-    if (evToEbitda != null) {
+    // EV/EBITDA — prefer Yahoo's pre-computed field; fall back to manual computation
+    const keyStats = stock.defaultKeyStatistics || {};
+    let evToEbitda = num(summary.enterpriseToEbitda ?? keyStats.enterpriseToEbitda);
+    if (evToEbitda == null) {
+      const ev     = num(keyStats.enterpriseValue);
+      const ebitda = num(finData.ebitda ?? keyStats.ebitda);
+      if (ev != null && ebitda != null && ebitda !== 0) {
+        evToEbitda = ev / ebitda;
+      }
+    }
+    if (evToEbitda != null && Number.isFinite(evToEbitda)) {
       let result = "neutral";
-      let meaning = "EV/EBITDA below 10 may indicate undervaluation; negative means the business is loss-making; above 15 suggests premium or high-growth pricing.";
-      if (evToEbitda < 0) result = "bad";
-      else if (evToEbitda < 10) result = "good";
-      else if (evToEbitda > 15) result = "bad";
-
+      if (evToEbitda < 0)       result = "bad";    // loss-making
+      else if (evToEbitda < 10) result = "good";   // undervalued zone
+      else if (evToEbitda > 25) result = "bad";    // very expensive
       record(
         "Financial Models",
         "EV/EBITDA",
-        evToEbitda,
-        meaning,
+        `${evToEbitda.toFixed(1)}×`,
+        `EV/EBITDA of ${evToEbitda.toFixed(1)}×. Below 10× may indicate undervaluation; 10–15× is fair value; above 25× is expensive. Negative means the company is loss-making at the EBITDA level.`,
         result
       );
     } else {
@@ -1711,7 +1734,47 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "EV/EBITDA",
         "Unavailable",
-        "EV/EBITDA is a key comparable valuation multiple in the SCI framework. Data not available for this ticker.",
+        "EV/EBITDA could not be computed — enterprise value or EBITDA data is not available for this ticker from the current data source.",
+        "neutral"
+      );
+    }
+
+    // WACC — weighted average cost of capital
+    // Re = Rf + β × ERP  (CAPM);  Rd = interest expense / total debt
+    const beta         = num(keyStats.beta) ?? 1.0;
+    const totalDebt    = num(finData.totalDebt) ?? 0;
+    const totalCash    = num(finData.totalCash ?? finData.totalCashAndShortTermInvestments) ?? 0;
+    const intExp       = Math.abs(num(finData.interestExpense) ?? 0);
+    const taxRate      = num(finData.effectiveTaxRate) ?? 0.21;
+    const E            = num(marketCap) ?? 0;
+    const V            = E + totalDebt;
+    if (V > 0 && E > 0) {
+      const RF   = 0.0525;  // ~5.25% 10-year US treasury
+      const ERP  = 0.055;   // equity risk premium (long-run avg)
+      const Re   = RF + beta * ERP;
+      const Rd   = totalDebt > 0 ? intExp / totalDebt : 0;
+      const WACC = (E / V * Re) + (totalDebt / V * Rd * (1 - taxRate));
+      const waccPct = WACC * 100;
+      let waccResult = "neutral";
+      if (waccPct < 7)        waccResult = "good";   // low cost of capital
+      else if (waccPct > 12)  waccResult = "bad";    // expensive to finance
+      const roeProxy = num(finData.returnOnEquity);
+      const spreadNote = roeProxy != null
+        ? ` ROE is ${(roeProxy * 100).toFixed(1)}% vs WACC ${waccPct.toFixed(1)}% — spread of ${((roeProxy - WACC) * 100).toFixed(1)}pp.`
+        : "";
+      record(
+        "Financial Models",
+        "WACC",
+        `${waccPct.toFixed(2)}%`,
+        `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote} Below 7% is capital-efficient; above 12% is expensive.`,
+        waccResult
+      );
+    } else {
+      record(
+        "Financial Models",
+        "WACC",
+        "Unavailable",
+        "WACC could not be computed — market cap or capital structure data is missing.",
         "neutral"
       );
     }
@@ -1765,13 +1828,31 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    record(
-      "Financial Models",
-      "DCF / WACC / Comps",
-      "Unavailable",
-      "DCF, WACC stress testing, and comparable-company analysis require full financial statements, peer groups, and FCF forecasts. These cannot be reliably computed from live quote data alone.",
-      "neutral"
-    );
+    // DCF implied price (Gordon Growth / Free Cash Flow proxy)
+    const fcf = num(finData.freeCashflow);
+    if (fcf != null && V > 0 && E > 0) {
+      const RF   = 0.0525;
+      const ERP  = 0.055;
+      const Re   = RF + (num(keyStats.beta) ?? 1.0) * ERP;
+      const WACC = (E / V * Re) + (totalDebt / V * (totalDebt > 0 ? intExp / totalDebt : 0) * (1 - taxRate));
+      const g    = 0.025; // terminal growth rate 2.5%
+      if (WACC > g) {
+        const dcfValue = fcf / (WACC - g);
+        const sharesOut = num(keyStats.sharesOutstanding) ?? num(priceData.sharesOutstanding);
+        if (sharesOut && sharesOut > 0 && currentPrice) {
+          const dcfPerShare = dcfValue / sharesOut;
+          const upside = (dcfPerShare / currentPrice - 1) * 100;
+          const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
+          record(
+            "Financial Models",
+            "DCF implied price",
+            `$${dcfPerShare.toFixed(2)} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
+            `Simple FCF-based DCF using WACC as discount rate and 2.5% terminal growth. Implied fair value $${dcfPerShare.toFixed(2)} vs market price $${currentPrice.toFixed(2)}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
+            dcfResult
+          );
+        }
+      }
+    }
 
     // ── Profit & Margins ─────────────────────────────────────────────
     const grossMargin    = pct(finData.grossMargins);
@@ -2022,15 +2103,105 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // 7. Regime detection
-    const marketVol = null;
-    record(
-      "Regime Detection",
-      "GMM / HMM / Hurst regime",
-      "Unavailable",
-      "Regime detection uses GMM, HMM, and the Hurst exponent to classify whether the market is trending or mean-reverting. These models are not yet computed on this route.",
-      "neutral"
-    );
+    // 7. Regime detection — Hurst exponent + volatility-GMM
+    (function computeRegime() {
+      const closes = historicalRows.map(r => r.close).filter(c => c > 0);
+      if (closes.length < 60) {
+        record("Regime Detection", "GMM / HMM / Hurst regime", "Unavailable",
+          "Regime detection requires at least 60 days of price history. Insufficient data for this ticker.", "neutral");
+        return;
+      }
+
+      // Log returns
+      const logRet = [];
+      for (let i = 1; i < closes.length; i++) {
+        logRet.push(Math.log(closes[i] / closes[i - 1]));
+      }
+
+      // ── Hurst Exponent (R/S analysis) ──────────────────────────────
+      function hurstRS(returns) {
+        const lags = [8, 16, 32, 64, 128].filter(l => l < returns.length * 0.5);
+        if (lags.length < 2) return 0.5;
+        const pts = lags.map(lag => {
+          const chunks = [];
+          for (let start = 0; start + lag <= returns.length; start += lag) {
+            const sub = returns.slice(start, start + lag);
+            const mu = sub.reduce((a, b) => a + b, 0) / sub.length;
+            let cum = 0, maxCum = -Infinity, minCum = Infinity;
+            const diffs = sub.map(v => { cum += (v - mu); maxCum = Math.max(maxCum, cum); minCum = Math.min(minCum, cum); return v - mu; });
+            const R = maxCum - minCum;
+            const S = Math.sqrt(diffs.map(d => d * d).reduce((a, b) => a + b, 0) / sub.length);
+            if (S > 0) chunks.push(R / S);
+          }
+          const avgRS = chunks.length ? chunks.reduce((a, b) => a + b, 0) / chunks.length : null;
+          return avgRS ? { logLag: Math.log(lag), logRS: Math.log(avgRS) } : null;
+        }).filter(Boolean);
+
+        if (pts.length < 2) return 0.5;
+        const n = pts.length;
+        const sx = pts.reduce((a, p) => a + p.logLag, 0);
+        const sy = pts.reduce((a, p) => a + p.logRS, 0);
+        const sxy = pts.reduce((a, p) => a + p.logLag * p.logRS, 0);
+        const sxx = pts.reduce((a, p) => a + p.logLag * p.logLag, 0);
+        const H = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+        return Math.max(0.01, Math.min(0.99, H));
+      }
+
+      // ── Volatility GMM (2-state: low-vol trending vs high-vol mean-reverting) ──
+      function volRegime(returns) {
+        const w = 20;
+        const annVols = [];
+        for (let i = w; i <= returns.length; i++) {
+          const slice = returns.slice(i - w, i);
+          const mu = slice.reduce((a, b) => a + b, 0) / w;
+          const variance = slice.map(r => (r - mu) ** 2).reduce((a, b) => a + b, 0) / w;
+          annVols.push(Math.sqrt(variance * 252));
+        }
+        if (!annVols.length) return { current: null, regime: "unknown" };
+        const sorted = [...annVols].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        const current = annVols[annVols.length - 1];
+        // Count days in each state over last 40 readings
+        const recent = annVols.slice(-40);
+        const highDays = recent.filter(v => v > median * 1.1).length;
+        const lowDays  = recent.filter(v => v <= median * 1.1).length;
+        return {
+          currentPct: +(current * 100).toFixed(1),
+          medianPct:  +(median * 100).toFixed(1),
+          highDays, lowDays,
+          regime: highDays > lowDays ? "high-vol" : "low-vol"
+        };
+      }
+
+      const H  = hurstRS(logRet);
+      const vr = volRegime(logRet);
+
+      // Interpret
+      let regimeLabel, regimeResult, regimeMeaning;
+      if (H > 0.60 && vr.regime === "low-vol") {
+        regimeLabel  = `Trending (H=${H.toFixed(2)}, ${vr.regime})`;
+        regimeResult = "good";
+        regimeMeaning = `Hurst exponent ${H.toFixed(2)} (>0.60) indicates persistent trending behaviour. Combined with low-volatility conditions (current ${vr.currentPct}% ann. vol vs ${vr.medianPct}% median), this favours momentum strategies — buy strength, trail stops. Trending markets reward trend-followers and punish mean-reversion traders.`;
+      } else if (H < 0.42 || vr.regime === "high-vol") {
+        regimeLabel  = `Mean-reverting (H=${H.toFixed(2)}, ${vr.regime})`;
+        regimeResult = "neutral";
+        regimeMeaning = `Hurst exponent ${H.toFixed(2)} (<0.42) or elevated volatility (current ${vr.currentPct}% vs ${vr.medianPct}% median) signals a mean-reverting regime. Contrarian strategies — fading extremes, tighter position sizing — are more appropriate. Avoid chasing breakouts; wait for pullbacks to value zones.`;
+      } else {
+        regimeLabel  = `Transitional / Random walk (H=${H.toFixed(2)})`;
+        regimeResult = "neutral";
+        regimeMeaning = `Hurst exponent ${H.toFixed(2)} (0.42–0.60) places this in a transitional / random-walk zone. No clear statistical edge for trend or mean-reversion. Reduce position size; wait for the regime to clarify. Volatility: current ${vr.currentPct}% ann. vs ${vr.medianPct}% historical median.`;
+      }
+
+      record("Regime Detection", "GMM / HMM / Hurst regime", regimeLabel, regimeMeaning, regimeResult);
+
+      // Also record current vol as a standalone metric
+      if (vr.currentPct != null) {
+        const volResult = vr.currentPct < vr.medianPct * 0.9 ? "good" : vr.currentPct > vr.medianPct * 1.3 ? "bad" : "neutral";
+        record("Regime Detection", "Realised volatility (ann.)", `${vr.currentPct}%`,
+          `Current 20-day annualised volatility is ${vr.currentPct}% vs historical median ${vr.medianPct}%. ${vr.currentPct < vr.medianPct ? "Below-median vol favours trending setups." : "Above-median vol signals caution — widen stops or reduce size."} High vol (>30%) typically coincides with mean-reverting, choppy conditions.`,
+          volResult);
+      }
+    })();
 
     // 8. Risk management
     record(
