@@ -1293,6 +1293,22 @@ app.use('/api/community-posts', communityLimiter);
 |  11) Auth Endpoints                      |
 └──────────────────────────────────────────*/
 app.get("/", (_req, res) => res.send("✅ Combined Server is running!"));
+
+app.get("/api/search-ticker", async (req, res) => {
+  const q = (req.query.q || "").trim();
+  if (!q) return res.status(400).json({ error: "Missing query" });
+  try {
+    const results = await yf.search(q, { quotesCount: 6, newsCount: 0 });
+    const quote = (results?.quotes || []).find(r =>
+      r.quoteType === "EQUITY" && r.symbol && /^[A-Z]{1,5}$/.test(r.symbol)
+    );
+    if (!quote) return res.json({ symbol: null });
+    res.json({ symbol: quote.symbol, name: quote.shortname || quote.longname || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Lightweight health check for the dashboard warm-up
 app.get("/api/health", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
