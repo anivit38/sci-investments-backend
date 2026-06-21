@@ -1294,16 +1294,44 @@ app.use('/api/community-posts', communityLimiter);
 └──────────────────────────────────────────*/
 app.get("/", (_req, res) => res.send("✅ Combined Server is running!"));
 
-app.get("/api/search-ticker", async (req, res) => {
-  const q = (req.query.q || "").trim();
-  if (!q) return res.status(400).json({ error: "Missing query" });
+let _secTickers = null;
+let _secFetchedAt = 0;
+async function getSecTickers() {
+  if (_secTickers && Date.now() - _secFetchedAt < 24 * 3600 * 1000) return _secTickers;
   try {
-    const results = await yf.search(q, { quotesCount: 6, newsCount: 0 });
-    const quote = (results?.quotes || []).find(r =>
-      r.quoteType === "EQUITY" && r.symbol && /^[A-Z]{1,5}$/.test(r.symbol)
-    );
-    if (!quote) return res.json({ symbol: null });
-    res.json({ symbol: quote.symbol, name: quote.shortname || quote.longname || null });
+    const { data } = await axios.get('https://www.sec.gov/files/company_tickers.json', {
+      headers: { 'User-Agent': 'SCI-Investments/1.0 contact@sci-investments.com' },
+      timeout: 10000
+    });
+    _secTickers = Object.values(data)
+      .map(d => ({ symbol: String(d.ticker).toUpperCase(), name: String(d.title) }))
+      .filter(d => /^[A-Z]{1,5}$/.test(d.symbol));
+    _secFetchedAt = Date.now();
+  } catch { /* keep previous cache if any */ }
+  return _secTickers || [];
+}
+
+app.get("/api/search-ticker", async (req, res) => {
+  const raw = (req.query.q || "").trim();
+  if (!raw) return res.status(400).json({ error: "Missing query" });
+
+  const q = raw.toLowerCase();
+  try {
+    const tickers = await getSecTickers();
+
+    // Exact ticker match
+    const exact = tickers.find(t => t.symbol.toLowerCase() === q);
+    if (exact) return res.json({ symbol: exact.symbol, name: exact.name });
+
+    // Company name starts with query
+    const starts = tickers.find(t => t.name.toLowerCase().startsWith(q));
+    if (starts) return res.json({ symbol: starts.symbol, name: starts.name });
+
+    // Company name contains query
+    const contains = tickers.find(t => t.name.toLowerCase().includes(q));
+    if (contains) return res.json({ symbol: contains.symbol, name: contains.name });
+
+    res.json({ symbol: null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
