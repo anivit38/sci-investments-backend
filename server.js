@@ -1593,12 +1593,23 @@ app.post("/api/check-stock", async (req, res) => {
       marketCap == null ? "neutral" : marketCap > 300000000 ? "good" : "bad"
     );
 
+    const floatShares = num((stock.defaultKeyStatistics || {}).floatShares ?? priceData.floatShares);
+    const floatAdjVol = volume != null && floatShares != null && floatShares > 0
+      ? volume
+      : null;
+    const floatTurnoverPct = floatAdjVol != null ? (floatAdjVol / floatShares) * 100 : null;
     record(
       "Liquidity / Tradability",
       "Float-adjusted volume",
-      "Unavailable",
-      "Float-adjusted volume above 15 million confirms institutional-grade liquidity. This data point is not available from the current source.",
-      "neutral"
+      floatAdjVol == null
+        ? "Unavailable"
+        : `${(floatAdjVol / 1e6).toFixed(2)}M (${floatTurnoverPct.toFixed(2)}% of float)`,
+      floatAdjVol == null
+        ? "Float shares data unavailable — cannot compute float-adjusted volume."
+        : floatAdjVol >= 15e6
+          ? `${(floatAdjVol / 1e6).toFixed(2)}M shares traded vs ${(floatShares / 1e6).toFixed(1)}M float (${floatTurnoverPct.toFixed(2)}% turnover). Above 15M threshold — confirms institutional-grade liquidity.`
+          : `${(floatAdjVol / 1e6).toFixed(2)}M shares traded vs ${(floatShares / 1e6).toFixed(1)}M float (${floatTurnoverPct.toFixed(2)}% turnover). Below 15M threshold — liquidity may be insufficient for large positions.`,
+      floatAdjVol == null ? "neutral" : floatAdjVol >= 15e6 ? "good" : "bad"
     );
 
     // 2. Volume comparative %
@@ -1615,18 +1626,30 @@ app.post("/api/check-stock", async (req, res) => {
       compVol == null ? "neutral" : compVol >= 0 ? "good" : "bad"
     );
 
-    // 3. Sentiment comparative %
+    // 3. Sentiment — try Yahoo Finance news first (finance-specific), then Google RSS
     let news = { averageSentiment: 0, topStories: [] };
     try {
-      const feed = await withTimeout(
-        rssParser.parseURL(`https://news.google.com/rss/search?q=${encodeURIComponent(upper)}`),
-        3000
+      const rssUrls = [
+        `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(upper)}&region=US&lang=en-US`,
+        `https://news.google.com/rss/search?q=${encodeURIComponent(upper)}+stock+market&hl=en-US&gl=US&ceid=US:en`,
+      ];
+
+      let items = [];
+      for (const url of rssUrls) {
+        try {
+          const feed = await withTimeout(rssParser.parseURL(url), 7000);
+          const parsed = (feed.items || []).slice(0, 10).map(i => {
+            const snippet = (i.contentSnippet || i.summary || i.title || '').slice(0, 400);
+            return { title: i.title || '', link: i.link || '', snippet };
+          });
+          if (parsed.length > 0) { items = parsed; break; }
+        } catch { /* try next source */ }
+      }
+
+      // Score title + snippet together for richer signal
+      const scores = items.map(x =>
+        sentiment.analyze(`${x.title} ${x.snippet}`).score
       );
-      const items = (feed.items || []).slice(0, 5).map(i => {
-        const snippet = (i.contentSnippet || i.title || "").slice(0, 200);
-        return { title: i.title, link: i.link, snippet };
-      });
-      const scores = items.map(x => sentiment.analyze(x.snippet).score);
       const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
       news = { averageSentiment: avg, topStories: items };
     } catch {}
@@ -1722,10 +1745,33 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // 5. Ticker volatility category
-    const atrPct =
+    let atrPct =
       sciScore?.indicators?.atrPct != null
         ? sciScore.indicators.atrPct * 100
         : null;
+
+    // Fallback: compute 14-period Wilder ATR directly from historicalRows
+    if (atrPct == null && historicalRows.length >= 15) {
+      const hRows = historicalRows;
+      const hn = hRows.length;
+      const trArr = [];
+      for (let i = 1; i < hn; i++) {
+        const prev = hRows[i - 1].close;
+        trArr.push(Math.max(
+          hRows[i].high - hRows[i].low,
+          Math.abs(hRows[i].high - prev),
+          Math.abs(hRows[i].low  - prev)
+        ));
+      }
+      if (trArr.length >= 14) {
+        let atr14 = trArr.slice(0, 14).reduce((a, b) => a + b, 0) / 14;
+        for (let i = 14; i < trArr.length; i++) {
+          atr14 = (atr14 * 13 + trArr[i]) / 14;
+        }
+        const lastClose = hRows[hn - 1].close;
+        if (lastClose > 0) atrPct = (atr14 / lastClose) * 100;
+      }
+    }
 
     let tickerVolCategory = "Unavailable";
     let tickerVolResult = "neutral";
@@ -2027,96 +2073,9 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // ── Technical Signals (await getTechnical result) ─────────────────
-    const tech       = await techPromise;
-    const ind        = tech?.indicators || {};
-    const techLevels = tech?.levels     || {};
-    const techTrend  = tech?.trend      || "sideways";
-
-    if (ind.RSI14 != null) {
-      let rsiResult = "neutral", rsiMsg;
-      const r = ind.RSI14;
-      if (r < 30) {
-        rsiResult = "good";
-        rsiMsg = `RSI is at ${r.toFixed(1)} — the stock is oversold. Sellers have exhausted themselves and a bounce is statistically likely. Your framework treats this as a potential entry zone.`;
-      } else if (r < 45) {
-        rsiResult = "neutral";
-        rsiMsg = `RSI at ${r.toFixed(1)} is in the lower neutral zone — momentum is weak but not extreme. Not yet a buying signal by itself.`;
-      } else if (r <= 60) {
-        rsiResult = "good";
-        rsiMsg = `RSI at ${r.toFixed(1)} is healthy — momentum is positive without being overbought. This is the sweet spot for a continuation move in your framework.`;
-      } else if (r <= 70) {
-        rsiResult = "neutral";
-        rsiMsg = `RSI at ${r.toFixed(1)} is elevated — momentum is strong but approaching overbought. Be cautious about chasing the move.`;
-      } else {
-        rsiResult = "bad";
-        rsiMsg = `RSI above 70 (${r.toFixed(1)}) — the stock is overbought. A pullback or consolidation is statistically likely. Your framework reduces signal reliability here.`;
-      }
-      record("Technical Signals", "RSI 14 (momentum)", r.toFixed(1), rsiMsg, rsiResult);
-    }
-
-    if (ind.MACD) {
-      const bullishMacd = ind.MACD.macd > ind.MACD.signal;
-      record(
-        "Technical Signals", "MACD signal",
-        bullishMacd ? "Bullish" : "Bearish",
-        bullishMacd
-          ? `MACD line (${ind.MACD.macd.toFixed(3)}) is above the signal line (${ind.MACD.signal.toFixed(3)}) — short-term momentum is stronger than the longer-term baseline. A bullish signal per your framework.`
-          : `MACD line (${ind.MACD.macd.toFixed(3)}) is below the signal line (${ind.MACD.signal.toFixed(3)}) — short-term momentum is weaker than the longer-term baseline. A bearish signal.`,
-        bullishMacd ? "good" : "bad"
-      );
-    }
-
-    if (techTrend) {
-      let trendResult, trendMsg;
-      if (techTrend === "uptrend") {
-        trendResult = "good";
-        trendMsg = `SMA 50 is above SMA 200 — a "Golden Cross". This confirms a long-term uptrend. Your framework says momentum strategies work best in trending markets with ADX > 25.`;
-      } else if (techTrend === "downtrend") {
-        trendResult = "bad";
-        trendMsg = `SMA 50 is below SMA 200 — a "Death Cross". This confirms a long-term downtrend. Your framework says to be cautious and avoid momentum longs in this environment.`;
-      } else {
-        trendResult = "neutral";
-        trendMsg = `Moving averages are close together — no clear trend. The market is sideways or transitioning. Your framework says to wait for a cleaner directional signal before committing.`;
-      }
-      record(
-        "Technical Signals", "Long-term trend (SMA 50 vs SMA 200)",
-        techTrend === "uptrend" ? "Uptrend — Golden Cross" : techTrend === "downtrend" ? "Downtrend — Death Cross" : "Sideways",
-        trendMsg, trendResult
-      );
-    }
-
-    if (ind.SMA50 != null && currentPrice != null) {
-      const pctFromSMA50 = ((currentPrice - ind.SMA50) / ind.SMA50) * 100;
-      const above = currentPrice > ind.SMA50;
-      record(
-        "Technical Signals", "Price vs SMA 50",
-        `${above ? "+" : ""}${pctFromSMA50.toFixed(1)}% from $${ind.SMA50.toFixed(2)}`,
-        above
-          ? `Price is ${pctFromSMA50.toFixed(1)}% above its 50-day moving average ($${ind.SMA50.toFixed(2)}). Stocks trading above key moving averages tend to remain in an uptrend.`
-          : `Price is ${Math.abs(pctFromSMA50).toFixed(1)}% below its 50-day moving average ($${ind.SMA50.toFixed(2)}). This indicates short-to-medium term weakness.`,
-        above ? "good" : "bad"
-      );
-    }
-
-    if (ind.BB_upper != null && ind.BB_lower != null && currentPrice != null) {
-      const range  = ind.BB_upper - ind.BB_lower;
-      const bbPos  = range > 0 ? (currentPrice - ind.BB_lower) / range : 0.5;
-      let bbResult = "neutral", bbMsg;
-      if (bbPos > 0.85) {
-        bbResult = "bad";
-        bbMsg = `Price is near the upper Bollinger Band ($${ind.BB_upper.toFixed(2)}) — statistically expensive relative to recent volatility. Your framework flags this as a potential sell zone.`;
-      } else if (bbPos < 0.15) {
-        bbResult = "good";
-        bbMsg = `Price is near the lower Bollinger Band ($${ind.BB_lower.toFixed(2)}) — statistically cheap relative to recent volatility. A potential bounce zone per your framework.`;
-      } else {
-        bbResult = "neutral";
-        bbMsg = `Price sits within the Bollinger Bands (upper: $${ind.BB_upper.toFixed(2)}, lower: $${ind.BB_lower.toFixed(2)}) — no extreme band signal. Momentum is not stretched.`;
-      }
-      record("Technical Signals", "Bollinger Band position", `${(bbPos * 100).toFixed(0)}% within bands`, bbMsg, bbResult);
-    }
-
     // ── Support & Resistance ─────────────────────────────────────────
+    const tech       = await techPromise;
+    const techLevels = tech?.levels || {};
     if (techLevels.support != null && techLevels.resistance != null && currentPrice != null) {
       const distToSupport    = ((currentPrice - techLevels.support)    / currentPrice) * 100;
       const distToResistance = ((techLevels.resistance - currentPrice) / currentPrice) * 100;
@@ -2247,23 +2206,6 @@ app.post("/api/check-stock", async (req, res) => {
       }
     })();
 
-    // 8. Risk management
-    record(
-      "Risk Management",
-      "Risk per trade",
-      "1–2% max portfolio risk",
-      "The SCI framework mandates capping risk at 1–2% of total portfolio per trade to protect capital over the long run.",
-      "neutral"
-    );
-
-    record(
-      "Risk Management",
-      "Risk/reward",
-      "Needs user entry, stop, and target",
-      "Every trade must offer more upside than downside. A risk/reward ratio above 1:1.5 is preferred. Requires a defined entry, stop loss, and price target.",
-      "neutral"
-    );
-
     const suggestion = finalSuggestion(goods, bads);
 
     return res.json({
@@ -2294,9 +2236,7 @@ app.post("/api/check-stock", async (req, res) => {
       sciScore,
       findings,
       news,
-      levels: Object.keys(techLevels).length ? techLevels : null,
-      technicalIndicators: Object.keys(ind).length ? ind : null,
-      trend: techTrend || null
+      levels: Object.keys(techLevels).length ? techLevels : null
     });
   } catch (err) {
     console.error("SCI check-stock route error:", err);
