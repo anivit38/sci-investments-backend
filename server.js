@@ -116,6 +116,8 @@ const modelPath = path.join(__dirname, 'model', 'sci_v1_regression.json');
 sciV1.loadModelFromDisk(modelPath);
 const SCI = require('./services/sci-formula-engine');
 const sciCombiner = require('./services/sciCombiner');
+const { hurstRS, volRegime } = require('./services/regimeModel');
+const quant = require('./quant');
 
 
 // ---- Firebase Admin init (uses GOOGLE_SERVICE_ACCOUNT_KEY from env) ----
@@ -1515,6 +1517,12 @@ app.post("/api/check-stock", async (req, res) => {
     const finData = stock.financialData || {};
     const profile = stock.assetProfile || {};
 
+    // TSX/international tickers (e.g. SHOP.TO) come back priced in CAD, not USD —
+    // surface the real currency so the frontend doesn't mislabel it as "$".
+    const currency = priceData.currency || summary.currency || finData.financialCurrency || "USD";
+    const isNonUsd = currency !== "USD";
+    const cur = (n) => (isNonUsd ? `${n} ${currency}` : `$${n}`);
+
     const currentPrice = priceData.regularMarketPrice ?? null;
     const volume = priceData.regularMarketVolume ?? null;
     const avgVolume =
@@ -1856,7 +1864,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "WACC",
         `${waccPct.toFixed(2)}%`,
-        `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote} Below 7% is capital-efficient; above 12% is expensive.`,
+        `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote} Below 7% is capital-efficient; above 12% is expensive.${isNonUsd ? ` Note: this model uses a US treasury risk-free rate as a proxy — ${currency}-denominated figures make the result directionally useful but less precise than for USD stocks.` : ""}`,
         waccResult
       );
     } else {
@@ -1936,8 +1944,8 @@ app.post("/api/check-stock", async (req, res) => {
           record(
             "Financial Models",
             "DCF implied price",
-            `$${dcfPerShare.toFixed(2)} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
-            `Simple FCF-based DCF using WACC as discount rate and 2.5% terminal growth. Implied fair value $${dcfPerShare.toFixed(2)} vs market price $${currentPrice.toFixed(2)}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
+            `${cur(dcfPerShare.toFixed(2))} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
+            `Simple FCF-based DCF using WACC as discount rate and 2.5% terminal growth. Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
             dcfResult
           );
         }
@@ -2081,14 +2089,14 @@ app.post("/api/check-stock", async (req, res) => {
       const distToResistance = ((techLevels.resistance - currentPrice) / currentPrice) * 100;
 
       record(
-        "Support & Resistance", "20-day support level", `$${techLevels.support.toFixed(2)}`,
-        `Support at $${techLevels.support.toFixed(2)} is ${distToSupport.toFixed(1)}% below the current price. This is where buyers have historically stepped in. A good place to consider a stop loss — if price breaks below this level convincingly, the thesis has failed.`,
+        "Support & Resistance", "20-day support level", cur(techLevels.support.toFixed(2)),
+        `Support at ${cur(techLevels.support.toFixed(2))} is ${distToSupport.toFixed(1)}% below the current price. This is where buyers have historically stepped in. A good place to consider a stop loss — if price breaks below this level convincingly, the thesis has failed.`,
         distToSupport > 3 ? "good" : distToSupport > 1 ? "neutral" : "bad"
       );
 
       record(
-        "Support & Resistance", "20-day resistance level", `$${techLevels.resistance.toFixed(2)}`,
-        `Resistance at $${techLevels.resistance.toFixed(2)} is ${distToResistance.toFixed(1)}% above the current price. Price has struggled to break above this level. A confirmed breakout above it would be a strong bullish signal with target upside.`,
+        "Support & Resistance", "20-day resistance level", cur(techLevels.resistance.toFixed(2)),
+        `Resistance at ${cur(techLevels.resistance.toFixed(2))} is ${distToResistance.toFixed(1)}% above the current price. Price has struggled to break above this level. A confirmed breakout above it would be a strong bullish signal with target upside.`,
         distToResistance > 5 ? "good" : distToResistance > 2 ? "neutral" : "bad"
       );
 
@@ -2106,7 +2114,11 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
 
-    // 7. Regime detection — Hurst exponent + volatility-GMM
+    // 7. Regime detection — Hurst exponent + volatility regime
+    // (logic lives in services/regimeModel.js so the quant layer can reuse
+    // the exact same regime model instead of building a second one — see
+    // SCI_QUANT_LAYER_SPEC.md prime directive #4)
+    let regimeSnapshot = null; // { H, vr, logRet } — consumed by the quant layer below
     (function computeRegime() {
       const closes = historicalRows.map(r => r.close).filter(c => c > 0);
       if (closes.length < 60) {
@@ -2121,63 +2133,9 @@ app.post("/api/check-stock", async (req, res) => {
         logRet.push(Math.log(closes[i] / closes[i - 1]));
       }
 
-      // ── Hurst Exponent (R/S analysis) ──────────────────────────────
-      function hurstRS(returns) {
-        const lags = [8, 16, 32, 64, 128].filter(l => l < returns.length * 0.5);
-        if (lags.length < 2) return 0.5;
-        const pts = lags.map(lag => {
-          const chunks = [];
-          for (let start = 0; start + lag <= returns.length; start += lag) {
-            const sub = returns.slice(start, start + lag);
-            const mu = sub.reduce((a, b) => a + b, 0) / sub.length;
-            let cum = 0, maxCum = -Infinity, minCum = Infinity;
-            const diffs = sub.map(v => { cum += (v - mu); maxCum = Math.max(maxCum, cum); minCum = Math.min(minCum, cum); return v - mu; });
-            const R = maxCum - minCum;
-            const S = Math.sqrt(diffs.map(d => d * d).reduce((a, b) => a + b, 0) / sub.length);
-            if (S > 0) chunks.push(R / S);
-          }
-          const avgRS = chunks.length ? chunks.reduce((a, b) => a + b, 0) / chunks.length : null;
-          return avgRS ? { logLag: Math.log(lag), logRS: Math.log(avgRS) } : null;
-        }).filter(Boolean);
-
-        if (pts.length < 2) return 0.5;
-        const n = pts.length;
-        const sx = pts.reduce((a, p) => a + p.logLag, 0);
-        const sy = pts.reduce((a, p) => a + p.logRS, 0);
-        const sxy = pts.reduce((a, p) => a + p.logLag * p.logRS, 0);
-        const sxx = pts.reduce((a, p) => a + p.logLag * p.logLag, 0);
-        const H = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-        return Math.max(0.01, Math.min(0.99, H));
-      }
-
-      // ── Volatility GMM (2-state: low-vol trending vs high-vol mean-reverting) ──
-      function volRegime(returns) {
-        const w = 20;
-        const annVols = [];
-        for (let i = w; i <= returns.length; i++) {
-          const slice = returns.slice(i - w, i);
-          const mu = slice.reduce((a, b) => a + b, 0) / w;
-          const variance = slice.map(r => (r - mu) ** 2).reduce((a, b) => a + b, 0) / w;
-          annVols.push(Math.sqrt(variance * 252));
-        }
-        if (!annVols.length) return { current: null, regime: "unknown" };
-        const sorted = [...annVols].sort((a, b) => a - b);
-        const median = sorted[Math.floor(sorted.length / 2)];
-        const current = annVols[annVols.length - 1];
-        // Count days in each state over last 40 readings
-        const recent = annVols.slice(-40);
-        const highDays = recent.filter(v => v > median * 1.1).length;
-        const lowDays  = recent.filter(v => v <= median * 1.1).length;
-        return {
-          currentPct: +(current * 100).toFixed(1),
-          medianPct:  +(median * 100).toFixed(1),
-          highDays, lowDays,
-          regime: highDays > lowDays ? "high-vol" : "low-vol"
-        };
-      }
-
       const H  = hurstRS(logRet);
       const vr = volRegime(logRet);
+      regimeSnapshot = { H, vr, logRet };
 
       // Interpret
       let regimeLabel, regimeResult, regimeMeaning;
@@ -2208,12 +2166,30 @@ app.post("/api/check-stock", async (req, res) => {
 
     const suggestion = finalSuggestion(goods, bads);
 
+    // ── SCI Quant Prediction Layer — single marked integration point ──────
+    // Additive only (SCI_QUANT_LAYER_SPEC.md §1, §8.2): consumes the regime
+    // snapshot + historical rows already computed above and appends a
+    // `quant` field. Does not alter anything above this line.
+    let quantResult;
+    try {
+      quantResult = await quant.runQuantLayer(upper, {
+        historicalRows,
+        regimeSnapshot,
+        currentPrice,
+        sector: profile.sector || profile.industry || "Unknown",
+      });
+    } catch (e) {
+      quantResult = { available: false, reason: e.message };
+    }
+
     return res.json({
       symbol: upper,
       name: priceData.longName || upper,
       industry: profile.industry || "Unknown",
+      currency,
       method: "SCI analysis method",
       source: "SCI PDF methodology",
+      quant: quantResult,
       summary: {
         goods,
         bads,
@@ -2231,7 +2207,8 @@ app.post("/api/check-stock", async (req, res) => {
         ask,
         spreadPct,
         comparativeVolumePercent: compVol,
-        sentimentScore: news.averageSentiment
+        sentimentScore: news.averageSentiment,
+        currency
       },
       sciScore,
       findings,
