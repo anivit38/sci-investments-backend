@@ -1138,6 +1138,7 @@ async function fetchStockData(symbol) {
       "summaryDetail",
       "defaultKeyStatistics",
       "assetProfile",
+      "cashflowStatementHistory",
     ];
     const data = await yahooFinance.quoteSummary(
       symbol,
@@ -1927,27 +1928,108 @@ app.post("/api/check-stock", async (req, res) => {
     }
 
     // DCF implied price (Gordon Growth / Free Cash Flow proxy)
-    const fcf = num(finData.freeCashflow);
-    if (fcf != null && V > 0 && E > 0) {
-      const RF   = 0.0525;
-      const ERP  = 0.055;
-      const Re   = RF + (num(keyStats.beta) ?? 1.0) * ERP;
-      const WACC = (E / V * Re) + (totalDebt / V * (totalDebt > 0 ? intExp / totalDebt : 0) * (1 - taxRate));
-      const g    = 0.025; // terminal growth rate 2.5%
-      if (WACC > g) {
-        const dcfValue = fcf / (WACC - g);
-        const sharesOut = num(keyStats.sharesOutstanding) ?? num(priceData.sharesOutstanding);
-        if (sharesOut && sharesOut > 0 && currentPrice) {
-          const dcfPerShare = dcfValue / sharesOut;
-          const upside = (dcfPerShare / currentPrice - 1) * 100;
-          const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
-          record(
-            "Financial Models",
-            "DCF implied price",
-            `${cur(dcfPerShare.toFixed(2))} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
-            `Simple FCF-based DCF using WACC as discount rate and 2.5% terminal growth. Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
-            dcfResult
-          );
+    //
+    // FCF base is regime-aware: a single-year FCF (e.g. Yahoo's TTM
+    // financialData.freeCashflow) can be a temporary spike or dip, and the
+    // Gordon Growth formula (fcf / (WACC - g)) amplifies that distortion
+    // because the denominator is small. Instead, fit a linear trend through
+    // the company's annual FCF history and only trust the latest-year value
+    // as the base if that trend is both reliable (R² gate) and material
+    // (normalized-slope gate). Otherwise fall back to the multi-year average,
+    // which is more robust for mean-reverting / lumpy FCF profiles.
+    const fcfStatements = (stock.cashflowStatementHistory?.cashflowStatements || [])
+      .map((s) => {
+        const ocf   = num(s.totalCashFromOperatingActivities);
+        const capex = num(s.capitalExpenditures);
+        if (ocf == null || capex == null) return null;
+        const endDate = s.endDate ? new Date(s.endDate).getTime() : 0;
+        return { endDate, fcf: ocf - Math.abs(capex) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.endDate - b.endDate); // oldest → newest
+
+    let fcfHistory = fcfStatements.map((s) => s.fcf);
+    if (fcfHistory.length === 0) {
+      // No annual history available from this data source — fall back to
+      // the single TTM figure as the only data point we have.
+      const ttmFcf = num(finData.freeCashflow);
+      if (ttmFcf != null) fcfHistory = [ttmFcf];
+    }
+
+    if (fcfHistory.length > 0 && V > 0 && E > 0) {
+      const n = fcfHistory.length;
+      const avgFcf = fcfHistory.reduce((a, b) => a + b, 0) / n;
+
+      if (avgFcf <= 0) {
+        record(
+          "Financial Models",
+          "DCF implied price",
+          "DCF not meaningful (non-positive FCF)",
+          "Average free cash flow over the available history is zero or negative, so a Gordon Growth DCF would require dividing by a non-positive base. The DCF is skipped for this company — the other valuation models still apply.",
+          "neutral"
+        );
+      } else {
+        // Single linear-trend fit (least squares) through the FCF history,
+        // indexed 0..n-1 in chronological order.
+        let r2 = 0;
+        let normalizedSlopePct = 0;
+        let regime = "mean-reverting";
+        let fcfBase = avgFcf;
+
+        if (n >= 2) {
+          const xs = fcfHistory.map((_, i) => i);
+          const xMean = xs.reduce((a, b) => a + b, 0) / n;
+          const yMean = avgFcf;
+          let sXY = 0, sXX = 0;
+          for (let i = 0; i < n; i++) {
+            sXY += (xs[i] - xMean) * (fcfHistory[i] - yMean);
+            sXX += (xs[i] - xMean) ** 2;
+          }
+          const slope = sXX === 0 ? 0 : sXY / sXX;
+          const intercept = yMean - slope * xMean;
+
+          let ssRes = 0, ssTot = 0;
+          for (let i = 0; i < n; i++) {
+            const yPred = slope * xs[i] + intercept;
+            ssRes += (fcfHistory[i] - yPred) ** 2;
+            ssTot += (fcfHistory[i] - yMean) ** 2;
+          }
+          r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+          normalizedSlopePct = (slope / avgFcf) * 100; // $/yr ÷ avg FCF, as %/yr
+
+          const isTrending = r2 >= 0.65 && Math.abs(normalizedSlopePct) > 7;
+          if (isTrending) {
+            regime = "trending";
+            fcfBase = fcfHistory[n - 1]; // current-year (latest) FCF
+          } else {
+            regime = "mean-reverting";
+            fcfBase = avgFcf;
+          }
+        }
+
+        const RF   = 0.0525;
+        const ERP  = 0.055;
+        const Re   = RF + (num(keyStats.beta) ?? 1.0) * ERP;
+        const WACC = (E / V * Re) + (totalDebt / V * (totalDebt > 0 ? intExp / totalDebt : 0) * (1 - taxRate));
+        const g    = 0.025; // terminal growth rate 2.5%
+        if (WACC > g) {
+          const dcfValue = fcfBase / (WACC - g);
+          const sharesOut = num(keyStats.sharesOutstanding) ?? num(priceData.sharesOutstanding);
+          if (sharesOut && sharesOut > 0 && currentPrice) {
+            const dcfPerShare = dcfValue / sharesOut;
+            const upside = (dcfPerShare / currentPrice - 1) * 100;
+            const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
+            const regimeNote = n >= 2
+              ? `FCF regime: ${regime} (R²=${r2.toFixed(2)}, normalized slope=${normalizedSlopePct.toFixed(1)}%/yr over ${n}y) — base = ${regime === "trending" ? "latest-year" : `${n}-year average`} FCF of ${cur((fcfBase / 1e9).toFixed(2))}B.`
+              : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B).`;
+            record(
+              "Financial Models",
+              "DCF implied price",
+              `${cur(dcfPerShare.toFixed(2))} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
+              `FCF-based DCF using WACC as discount rate and 2.5% terminal growth. ${regimeNote} Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
+              dcfResult
+            );
+          }
         }
       }
     }
