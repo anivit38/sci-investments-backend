@@ -2021,7 +2021,7 @@ app.post("/api/check-stock", async (req, res) => {
             const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
             const regimeNote = n >= 2
               ? `FCF regime: ${regime} (R²=${r2.toFixed(2)}, normalized slope=${normalizedSlopePct.toFixed(1)}%/yr over ${n}y) — base = ${regime === "trending" ? "latest-year" : `${n}-year average`} FCF of ${cur((fcfBase / 1e9).toFixed(2))}B.`
-              : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B).`;
+              : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B). [DEBUG moduleExists=${stock.cashflowStatementHistory != null} rawStatements=${(stock.cashflowStatementHistory?.cashflowStatements || []).length} usableStatements=${fcfStatements.length}]`;
             record(
               "Financial Models",
               "DCF implied price",
