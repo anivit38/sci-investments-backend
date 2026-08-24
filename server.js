@@ -94,6 +94,7 @@ function vwapFromMinute(candles) {
 
 
 const { getFundamentals } = require('./services/FundamentalsService');
+const { loadFmpAll } = require('./services/fmpRawService');
 const { getTechnical, getTechnicalForUser } = require('./services/TechnicalService');
 const { getIntradayIndicators } = require('./services/IntradayService'); 
 const analyzeRouter      = require('./routes/analyze');
@@ -1138,7 +1139,6 @@ async function fetchStockData(symbol) {
       "summaryDetail",
       "defaultKeyStatistics",
       "assetProfile",
-      "cashflowStatementHistory",
     ];
     const data = await yahooFinance.quoteSummary(
       symbol,
@@ -1937,16 +1937,23 @@ app.post("/api/check-stock", async (req, res) => {
     // as the base if that trend is both reliable (R² gate) and material
     // (normalized-slope gate). Otherwise fall back to the multi-year average,
     // which is more robust for mean-reverting / lumpy FCF profiles.
-    const fcfStatements = (stock.cashflowStatementHistory?.cashflowStatements || [])
-      .map((s) => {
-        const ocf   = num(s.totalCashFromOperatingActivities);
-        const capex = num(s.capitalExpenditures);
-        if (ocf == null || capex == null) return null;
-        const endDate = s.endDate ? new Date(s.endDate).getTime() : 0;
-        return { endDate, fcf: ocf - Math.abs(capex) };
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.endDate - b.endDate); // oldest → newest
+    //
+    // Annual history comes from FMP (Yahoo's cashflowStatementHistory module
+    // only returns netIncome/endDate for unauthenticated requests now — the
+    // operatingCashFlow/capex fields needed here have been paywalled).
+    let fcfStatements = [];
+    try {
+      const { cf } = await loadFmpAll(upper);
+      fcfStatements = (cf || [])
+        .map((s) => {
+          const freeCashFlow = num(s.freeCashFlow);
+          if (freeCashFlow == null) return null;
+          const endDate = s.date ? new Date(s.date).getTime() : 0;
+          return { endDate, fcf: freeCashFlow };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.endDate - b.endDate); // oldest → newest
+    } catch (_) { /* fall through to TTM fallback below */ }
 
     let fcfHistory = fcfStatements.map((s) => s.fcf);
     if (fcfHistory.length === 0) {
@@ -2021,7 +2028,7 @@ app.post("/api/check-stock", async (req, res) => {
             const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
             const regimeNote = n >= 2
               ? `FCF regime: ${regime} (R²=${r2.toFixed(2)}, normalized slope=${normalizedSlopePct.toFixed(1)}%/yr over ${n}y) — base = ${regime === "trending" ? "latest-year" : `${n}-year average`} FCF of ${cur((fcfBase / 1e9).toFixed(2))}B.`
-              : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B). [DEBUG raw0=${JSON.stringify(stock.cashflowStatementHistory?.cashflowStatements?.[0]).slice(0, 500)}]`;
+              : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B).`;
             record(
               "Financial Models",
               "DCF implied price",

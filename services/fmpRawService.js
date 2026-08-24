@@ -40,9 +40,9 @@ async function loadFmpAll(symbol) {
     return entry.data;
   }
 
-  let profileRes, ratiosRes, incRes, bsRes;
+  let profileRes, ratiosRes, incRes, bsRes, cfRes;
   try {
-    [profileRes, ratiosRes, incRes, bsRes] = await Promise.all([
+    [profileRes, ratiosRes, incRes, bsRes, cfRes] = await Promise.all([
       axios.get(`https://financialmodelingprep.com/api/v3/profile/${symbol}`, {
         params: { apikey: FMP_API_KEY },
       }),
@@ -55,6 +55,14 @@ async function loadFmpAll(symbol) {
       axios.get(`https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}`, {
         params: { apikey: FMP_API_KEY, limit: 2 },
       }),
+      // Annual cash-flow history (up to 5y) — used by the DCF's regime-aware
+      // FCF base. Yahoo's equivalent module stopped returning the needed
+      // fields (operatingCashFlow/capex), so this is fetched from FMP's
+      // "stable" API instead (the legacy /api/v3 cash-flow endpoint was
+      // sunset for non-legacy subscriptions).
+      axios.get(`https://financialmodelingprep.com/stable/cash-flow-statement`, {
+        params: { symbol, apikey: FMP_API_KEY, limit: 5, period: "annual" },
+      }).catch(() => null),
     ]);
   } catch (err) {
     if (err.response?.status === 429 && entry) {
@@ -72,6 +80,7 @@ async function loadFmpAll(symbol) {
     rawRatios: ratiosRes?.data?.[0]   || {},
     inc:       incRes?.data            || [],
     bs:        bsRes?.data             || [],
+    cf:        Array.isArray(cfRes?.data) ? cfRes.data : [],
   };
 
   cache[symbol] = { fetchedAt: now, data };
