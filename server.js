@@ -2064,11 +2064,12 @@ app.post("/api/check-stock", async (req, res) => {
             const regimeNote = n >= 2
               ? `FCF regime: ${regime} (R²=${r2.toFixed(2)}, normalized slope=${normalizedSlopePct.toFixed(1)}%/yr over ${n}y) — base = ${regime === "trending" ? "latest-year" : `${n}-year average`} FCF of ${cur((fcfBase / 1e9).toFixed(2))}B.`
               : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B).`;
+            const DEBUG = ` [DEBUG fcfHistoryByYear=${JSON.stringify(fcfStatements.map(s => ({ year: new Date(s.endDate).getFullYear(), fcfB: +(s.fcf/1e9).toFixed(3) })))} n=${n} r2=${r2} normSlopePct=${normalizedSlopePct} regime=${regime} fcfBaseB=${fcfBase/1e9} beta=${num(keyStats.beta)} RF=${RF} ERP=${ERP} Re=${Re} totalDebtB=${totalDebt/1e9} intExpB=${intExp/1e9} Rd=${totalDebt>0?intExp/totalDebt:0} taxRate=${taxRate} EB=${E/1e9} VB=${V/1e9} WACC=${WACC} g=${g} dcfValueB=${dcfValue/1e9} sharesOutB=${sharesOut/1e9} currentPrice=${currentPrice} dcfPerShare=${dcfPerShare}]`;
             record(
               "Financial Models",
               "DCF implied price",
               `${cur(dcfPerShare.toFixed(2))} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
-              `FCF-based DCF using WACC as discount rate and 2.5% terminal growth. ${regimeNote} Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
+              `FCF-based DCF using WACC as discount rate and 2.5% terminal growth. ${regimeNote} Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}${DEBUG}`,
               dcfResult
             );
           }
