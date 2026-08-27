@@ -95,6 +95,7 @@ function vwapFromMinute(candles) {
 
 const { getFundamentals } = require('./services/FundamentalsService');
 const { loadFmpAll } = require('./services/fmpRawService');
+const { evaluateFund } = require('./services/fundEvalService');
 const { getTechnical, getTechnicalForUser } = require('./services/TechnicalService');
 const { getIntradayIndicators } = require('./services/IntradayService'); 
 const analyzeRouter      = require('./routes/analyze');
@@ -1518,6 +1519,13 @@ app.post("/api/check-stock", async (req, res) => {
     const finData = stock.financialData || {};
     const profile = stock.assetProfile || {};
 
+    // Fund/ETF detection — drives which evaluation rubric runs (see the
+    // "Fund Evaluation" block near the end of this route, and
+    // fundEvalService.js for the rubric itself).
+    const isFund = ["ETF", "MUTUALFUND", "MUTUAL_FUND", "INDEX"].includes(
+      String(priceData.quoteType || "").toUpperCase()
+    );
+
     // TSX/international tickers (e.g. SHOP.TO) come back priced in CAD, not USD —
     // surface the real currency so the frontend doesn't mislabel it as "$".
     const currency = priceData.currency || summary.currency || finData.financialCurrency || "USD";
@@ -2271,10 +2279,27 @@ app.post("/api/check-stock", async (req, res) => {
       quantResult = { available: false, reason: e.message };
     }
 
+    // Fund/ETF evaluation — a different rubric than the stock checks above
+    // (return vs benchmark, Sharpe, information ratio, downside capture,
+    // drawdown recovery), appended as its own "Fund Evaluation" section.
+    // Routed through the same record() the stock checks use so goods/bads
+    // counts (and therefore the overall Buy/Stay-away suggestion) account
+    // for it consistently.
+    if (isFund) {
+      try {
+        const { profile: fmpProfile } = await loadFmpAll(upper);
+        const fundFindings = await evaluateFund(upper, fmpProfile);
+        fundFindings.forEach(f => record(f.section, f.stat, f.value, f.meaning, f.result));
+      } catch (e) {
+        record("Fund Evaluation", "Fund evaluation", "Unavailable", `Fund evaluation could not run: ${e.message}`, "neutral");
+      }
+    }
+
     return res.json({
       symbol: upper,
       name: priceData.longName || upper,
       industry: profile.industry || "Unknown",
+      isFund,
       currency,
       method: "SCI analysis method",
       source: "SCI PDF methodology",
