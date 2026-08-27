@@ -1351,6 +1351,33 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+// Country-level news for the portfolio globe tab — keyless Google News RSS,
+// same approach FundamentalsService.js already uses for per-stock news
+// (no API key, no cost). Always resolves 200 with an empty items array on
+// failure rather than throwing, so the client shows "no news available"
+// instead of fabricating anything.
+app.get("/api/country-news", async (req, res) => {
+  const country = String(req.query.country || "").trim();
+  if (!country) return res.status(400).json({ message: "country required." });
+  try {
+    const RSSParser = require("rss-parser");
+    const parser = new RSSParser();
+    const feed = await parser.parseURL(
+      `https://news.google.com/rss/search?q=${encodeURIComponent(`${country} economy OR markets`)}&hl=en-US&gl=US&ceid=US:en`
+    );
+    const items = (feed.items || []).slice(0, 6).map(item => ({
+      title: item.title || null,
+      link: item.link || null,
+      source: item.creator || null,
+      publishedAt: item.pubDate || null,
+      snippet: (item.contentSnippet || "").slice(0, 200),
+    }));
+    res.json({ country, items });
+  } catch (e) {
+    res.json({ country, items: [], error: e.message });
+  }
+});
+
 app.post("/signup", async (req, res) => {
   const { email, username, password } = req.body;
   if (!email || !username || !password)
