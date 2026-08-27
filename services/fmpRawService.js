@@ -45,19 +45,28 @@ async function loadFmpAll(symbol) {
 
   let profileRes, ratiosRes, incRes, bsRes, cfRes;
   try {
+    // NOTE: these all used to hit /api/v3/<endpoint>/<symbol> — FMP retired
+    // that legacy path for non-legacy subscriptions (same issue the DCF's
+    // cash-flow fetch hit). Migrated to /stable/<endpoint>?symbol=... , which
+    // this key can still reach. Field names inside the responses shifted too
+    // (e.g. assetTurnoverRatio -> assetTurnover, returnOnAssets/Equity no
+    // longer appear in /stable/ratios at all) — getMetric()'s mapping below
+    // is NOT re-verified against the new shape beyond what this fix needed;
+    // some ratios may now come back null where they used to resolve, which
+    // callers already handle via their existing "Unavailable" fallback.
     [profileRes, ratiosRes, incRes, bsRes, cfRes] = await Promise.all([
-      axios.get(`https://financialmodelingprep.com/api/v3/profile/${symbol}`, {
-        params: { apikey: FMP_API_KEY },
-      }),
-      axios.get(`https://financialmodelingprep.com/api/v3/ratios/${symbol}`, {
-        params: { apikey: FMP_API_KEY, limit: 1 },
-      }),
-      axios.get(`https://financialmodelingprep.com/api/v3/income-statement/${symbol}`, {
-        params: { apikey: FMP_API_KEY, limit: 2 },
-      }),
-      axios.get(`https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}`, {
-        params: { apikey: FMP_API_KEY, limit: 2 },
-      }),
+      axios.get(`https://financialmodelingprep.com/stable/profile`, {
+        params: { symbol, apikey: FMP_API_KEY },
+      }).catch(() => null),
+      axios.get(`https://financialmodelingprep.com/stable/ratios`, {
+        params: { symbol, apikey: FMP_API_KEY, limit: 1 },
+      }).catch(() => null),
+      axios.get(`https://financialmodelingprep.com/stable/income-statement`, {
+        params: { symbol, apikey: FMP_API_KEY, limit: 2 },
+      }).catch(() => null),
+      axios.get(`https://financialmodelingprep.com/stable/balance-sheet-statement`, {
+        params: { symbol, apikey: FMP_API_KEY, limit: 2 },
+      }).catch(() => null),
       // Annual cash-flow history (up to 5y) — used by the DCF's regime-aware
       // FCF base. Yahoo's equivalent module stopped returning the needed
       // fields (operatingCashFlow/capex), so this is fetched from FMP's
