@@ -36,7 +36,10 @@ async function loadFmpAll(symbol) {
   const now   = Date.now();
   const entry = cache[symbol];
 
-  if (entry && now - entry.fetchedAt < CACHE_TTL) {
+  // The `cf` (cash-flow) field was added after this cache format shipped —
+  // an entry cached before that (or from any process using the older code)
+  // never has it, and would otherwise short-circuit the fetch below forever.
+  if (entry && now - entry.fetchedAt < CACHE_TTL && Array.isArray(entry.data?.cf)) {
     return entry.data;
   }
 
