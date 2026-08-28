@@ -2100,6 +2100,13 @@ app.post("/api/check-stock", async (req, res) => {
     // Annual history comes from FMP (Yahoo's cashflowStatementHistory module
     // only returns netIncome/endDate for unauthenticated requests now — the
     // operatingCashFlow/capex fields needed here have been paywalled).
+        // Structured, machine-readable mirror of the DCF's raw inputs — lets the
+    // frontend recompute the two-stage valuation client-side (e.g. a PM
+    // dragging a forecast-years slider) without a backend round-trip per
+    // change, using the exact same numbers this route used. Stays null if
+    // the DCF wasn't computed (e.g. non-positive FCF).
+    let dcfRawInputs = null;
+
     let fcfStatements = [];
     try {
       const { cf } = await loadFmpAll(upper);
@@ -2261,6 +2268,27 @@ app.post("/api/check-stock", async (req, res) => {
               `Two-stage DCF: ${dcfForecastYears}-year explicit forecast${forecastLenNote} at ${(growthRateUsed * 100).toFixed(1)}%/yr (source: ${growthSourceLabel}${fallbackNote}), then a Gordon Growth terminal value at ${(g * 100).toFixed(1)}%. ${regimeNote} WACC ${(WACC * 100).toFixed(2)}% (RF ${(RF * 100).toFixed(2)}%${rfIsLive ? ` live as of ${rfAsOf}` : " static fallback"}, ERP ${(ERP * 100).toFixed(1)}% fixed, β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%).${costOfDebtNote} PV of explicit phase ${cur((pvExplicit / 1e9).toFixed(1))}B + PV of terminal value ${cur((pvTerminal / 1e9).toFixed(1))}B = implied equity value ${cur((equityValue / 1e9).toFixed(1))}B ÷ ${(sharesOut / 1e9).toFixed(2)}B shares = ${cur(dcfPerShare.toFixed(2))}/share vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
               dcfResult
             );
+
+            // Raw inputs for client-side recomputation (see comment above
+            // where dcfRawInputs is declared). Every number here is exactly
+            // what this request used — the frontend's recompute must match
+            // this route's own math, or the modal would show a value that
+            // doesn't correspond to what a fresh backend call would return.
+            dcfRawInputs = {
+              fcfBase, n, r2, normalizedSlopePct, regime,
+              WACC, RF, rfIsLive, rfAsOf, ERP, beta, Re, Rd,
+              costOfDebtMissing: intExpMissing,
+              totalDebt, E, V, taxRate,
+              terminalG: g,
+              sharesOut, currentPrice, currency,
+              analystGrowthRate: analystGrowth?.rate ?? null,
+              historicalGrowthRate: historicalGrowth,
+              defaultForecastYears: 7,
+              defaultGrowthSource: "analyst",
+              usedForecastYears: dcfForecastYears,
+              usedGrowthSource: dcfGrowthSource,
+              usedCostOfDebtOverride: dcfCostOfDebtOverride,
+            };
           }
         }
       }
@@ -2521,6 +2549,7 @@ app.post("/api/check-stock", async (req, res) => {
       method: "SCI analysis method",
       source: "SCI PDF methodology",
       quant: quantResult,
+      dcf: dcfRawInputs,
       summary: {
         goods,
         bads,
