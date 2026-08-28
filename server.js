@@ -1668,8 +1668,10 @@ app.post("/api/check-stock", async (req, res) => {
       return n == null ? null : n * 100;
     }
 
-    function addFinding(arr, section, stat, value, meaning, result, impact) {
-      arr.push({ section, stat, value, meaning, result, impact });
+    function addFinding(arr, section, stat, value, meaning, result, impact, config) {
+      const f = { section, stat, value, meaning, result, impact };
+      if (config) f.config = config;
+      arr.push(f);
     }
 
     function finalSuggestion(goods, bads) {
@@ -1683,7 +1685,15 @@ app.post("/api/check-stock", async (req, res) => {
     let bads = 0;
     let neutrals = 0;
 
-    function record(section, stat, value, meaning, result) {
+    // `config` (optional 6th arg) is the machine-readable version of a
+    // threshold-based check: its raw formula inputs and the pass/fail
+    // boundaries that produced `result`, each with its principled default.
+    // This is what lets the frontend show "the math behind every step" and
+    // let a PM adjust a specific check's threshold with the number
+    // recomputing live — see evalThreshold() below, which both computes
+    // `result` here AND builds this same config object, so the two can
+    // never drift apart.
+    function record(section, stat, value, meaning, result, config) {
       let impact = "neutral";
       if (result === "good") {
         goods++;
@@ -1694,7 +1704,35 @@ app.post("/api/check-stock", async (req, res) => {
       } else {
         neutrals++;
       }
-      addFinding(findings, section, stat, value, meaning, result, impact);
+      addFinding(findings, section, stat, value, meaning, result, impact, config);
+    }
+
+    // Shared helper for the common "value vs. one or two fixed thresholds"
+    // shape used by most quantitative checks below (EV/EBITDA, WACC,
+    // growth rates, margins, ratios, valuation multiples). Building the
+    // config here — once — instead of duplicating threshold logic in every
+    // call site keeps the displayed thresholds guaranteed consistent with
+    // what actually produced `result`.
+    //
+    // thresholds: array of one of:
+    //   { key, label, value, direction: 'below'|'above', tone }
+    //   { key, label, min, max, direction: 'range', tone }
+    //   Evaluated in array order; first match wins. No match -> 'neutral'.
+    function evalThreshold(formula, inputs, computedValue, unit, thresholds) {
+      let result = "neutral";
+      for (const t of thresholds) {
+        const hit = t.direction === "below" ? computedValue < t.value
+          : t.direction === "above" ? computedValue > t.value
+          : computedValue >= t.min && computedValue <= t.max; // 'range'
+        if (hit) { result = t.tone; break; }
+      }
+      return {
+        result,
+        config: {
+          formula, inputs, computedValue, unit,
+          thresholds: thresholds.map(t => ({ ...t, default: t.value })),
+        },
+      };
     }
 
     // 1. Liquidity / Tradability Check from PDF
@@ -1940,16 +1978,25 @@ app.post("/api/check-stock", async (req, res) => {
       }
     }
     if (evToEbitda != null && Number.isFinite(evToEbitda)) {
-      let result = "neutral";
-      if (evToEbitda < 0)       result = "bad";    // loss-making
-      else if (evToEbitda < 10) result = "good";   // undervalued zone
-      else if (evToEbitda > 25) result = "bad";    // very expensive
+      const ev = num(keyStats.enterpriseValue);
+      const ebitda = num(finData.ebitda ?? keyStats.ebitda);
+      const { result, config } = evalThreshold(
+        "EV ÷ EBITDA",
+        { EV: ev, EBITDA: ebitda },
+        evToEbitda, "×",
+        [
+          { key: "lossMaking", label: "Loss-making below", value: 0, direction: "below", tone: "bad" },
+          { key: "undervalued", label: "Undervalued zone below", value: 10, direction: "below", tone: "good" },
+          { key: "expensive", label: "Expensive above", value: 25, direction: "above", tone: "bad" },
+        ]
+      );
       record(
         "Financial Models",
         "EV/EBITDA",
         `${evToEbitda.toFixed(1)}×`,
         `EV/EBITDA of ${evToEbitda.toFixed(1)}×. Below 10× may indicate undervaluation; 10–15× is fair value; above 25× is expensive. Negative means the company is loss-making at the EBITDA level.`,
-        result
+        result,
+        config
       );
     } else {
       record(
@@ -2010,19 +2057,30 @@ app.post("/api/check-stock", async (req, res) => {
       Re   = RF + beta * ERP;
       WACC = (E / V * Re) + (totalDebt / V * Rd * (1 - taxRate));
       const waccPct = WACC * 100;
-      let waccResult = "neutral";
-      if (waccPct < 7)        waccResult = "good";   // low cost of capital
-      else if (waccPct > 12)  waccResult = "bad";    // expensive to finance
       const roeProxy = num(finData.returnOnEquity);
       const spreadNote = roeProxy != null
         ? ` ROE is ${(roeProxy * 100).toFixed(1)}% vs WACC ${waccPct.toFixed(1)}% — spread of ${((roeProxy - WACC) * 100).toFixed(1)}pp.`
         : "";
+      // Only the pass/fail boundary (7% / 12%) is PM-adjustable here — RF
+      // and ERP feed the WACC *value* itself and are deliberately not
+      // configurable (see the comment block above): a fact and a fixed
+      // methodology constant, not per-check judgment calls.
+      const { result: waccResult, config: waccConfig } = evalThreshold(
+        "(E/V)×Re + (D/V)×Rd×(1−tax)",
+        { RF, beta, ERP, Re, Rd, totalDebt, E, V, taxRate },
+        waccPct, "%",
+        [
+          { key: "efficient", label: "Capital-efficient below", value: 7, direction: "below", tone: "good" },
+          { key: "expensive", label: "Expensive above", value: 12, direction: "above", tone: "bad" },
+        ]
+      );
       record(
         "Financial Models",
         "WACC",
         `${waccPct.toFixed(2)}%`,
         `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (RF ${(RF * 100).toFixed(2)}%${rfIsLive ? ` live 10Y Treasury as of ${rfAsOf}` : " static fallback — live feed unavailable"}, β ${beta.toFixed(2)}, ERP ${(ERP * 100).toFixed(1)}% fixed, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote}${costOfDebtNote} Below 7% is capital-efficient; above 12% is expensive.${isNonUsd ? ` Note: this model uses a US treasury risk-free rate as a proxy — ${currency}-denominated figures make the result directionally useful but less precise than for USD stocks.` : ""}`,
-        waccResult
+        waccResult,
+        waccConfig
       );
     } else {
       record(
@@ -2036,17 +2094,21 @@ app.post("/api/check-stock", async (req, res) => {
 
     const revenueGrowth = pct(finData.revenueGrowth);
     if (revenueGrowth != null) {
-      let result = "neutral";
-      if (revenueGrowth > 20) result = "bad";
-      else if (revenueGrowth >= 5 && revenueGrowth <= 15) result = "good";
-      else if (revenueGrowth < 2) result = "bad";
-
+      const { result, config } = evalThreshold(
+        "YoY revenue growth", { revenueGrowth }, revenueGrowth, "%",
+        [
+          { key: "earlyStageRisk", label: "Early-stage risk above", value: 20, direction: "above", tone: "bad" },
+          { key: "target", label: "Steady/sustainable range", min: 5, max: 15, direction: "range", tone: "good" },
+          { key: "stagnation", label: "Stagnation below", value: 2, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Financial Models",
         "Revenue growth",
         `${revenueGrowth.toFixed(2)}%`,
         "SCI target range is 5–15% annual revenue growth — steady and sustainable. Below 2% signals stagnation; above 20% may indicate early-stage risk.",
-        result
+        result,
+        config
       );
     } else {
       record(
@@ -2060,18 +2122,20 @@ app.post("/api/check-stock", async (req, res) => {
 
     const earningsGrowth = pct(finData.earningsGrowth);
     if (earningsGrowth != null) {
-      let result = "neutral";
-      if (earningsGrowth < 0) result = "bad";
-      else if (earningsGrowth >= 5 && earningsGrowth < 10) result = "good";
-      else if (earningsGrowth >= 10) result = "good";
-      else if (earningsGrowth > 0 && earningsGrowth < 5) result = "neutral";
-
+      const { result, config } = evalThreshold(
+        "YoY EPS growth", { earningsGrowth }, earningsGrowth, "%",
+        [
+          { key: "poor", label: "Poor below", value: 0, direction: "below", tone: "bad" },
+          { key: "acceptable", label: "Acceptable-or-better above", value: 5, direction: "above", tone: "good" },
+        ]
+      );
       record(
         "Financial Models",
         "EPS / earnings growth",
         `${earningsGrowth.toFixed(2)}%`,
         "EPS growth scale: below 0% is poor, 0–5% weak, 5–10% acceptable, 10–15% good, 15–20% strong, above 20% exceptional.",
-        result
+        result,
+        config
       );
     } else {
       record(
@@ -2100,7 +2164,7 @@ app.post("/api/check-stock", async (req, res) => {
     // Annual history comes from FMP (Yahoo's cashflowStatementHistory module
     // only returns netIncome/endDate for unauthenticated requests now — the
     // operatingCashFlow/capex fields needed here have been paywalled).
-        // Structured, machine-readable mirror of the DCF's raw inputs — lets the
+    // Structured, machine-readable mirror of the DCF's raw inputs — lets the
     // frontend recompute the two-stage valuation client-side (e.g. a PM
     // dragging a forecast-years slider) without a backend round-trip per
     // change, using the exact same numbers this route used. Stays null if
@@ -2302,6 +2366,13 @@ app.post("/api/check-stock", async (req, res) => {
     const roe            = pct(finData.returnOnEquity);
 
     if (grossMargin != null) {
+      const { result, config } = evalThreshold(
+        "Gross profit ÷ revenue", { grossMargin }, grossMargin, "%",
+        [
+          { key: "strong", label: "Strong above", value: 40, direction: "above", tone: "good" },
+          { key: "thin", label: "Thin at/below", value: 20, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Profit & Margins", "Gross margin", `${grossMargin.toFixed(1)}%`,
         grossMargin > 40
@@ -2309,13 +2380,20 @@ app.post("/api/check-stock", async (req, res) => {
           : grossMargin > 20
           ? `At ${grossMargin.toFixed(1)}%, gross margins are moderate — acceptable but not exceptional. Compare to competitors in the same industry to judge.`
           : `At ${grossMargin.toFixed(1)}%, gross margins are thin. There is very little buffer between revenue and the cost of making the product.`,
-        grossMargin > 40 ? "good" : grossMargin > 20 ? "neutral" : "bad"
+        result, config
       );
     } else {
       record("Profit & Margins", "Gross margin", "Unavailable", "Gross margin data not available from this data source.", "neutral");
     }
 
     if (netMargin != null) {
+      const { result, config } = evalThreshold(
+        "Net income ÷ revenue", { netMargin }, netMargin, "%",
+        [
+          { key: "profitable", label: "Moderately-or-more profitable above", value: 5, direction: "above", tone: "good" },
+          { key: "lossMaking", label: "Loss-making at/below", value: 0, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Profit & Margins", "Net margin", `${netMargin.toFixed(1)}%`,
         netMargin > 15
@@ -2325,13 +2403,20 @@ app.post("/api/check-stock", async (req, res) => {
           : netMargin > 0
           ? `At ${netMargin.toFixed(1)}%, net margins are very thin. A small revenue dip could push this business into losses.`
           : `Net margin is negative (${netMargin.toFixed(1)}%) — the company is losing money. Per your framework, negative net margin is a red flag.`,
-        netMargin > 5 ? "good" : netMargin > 0 ? "neutral" : "bad"
+        result, config
       );
     } else {
       record("Profit & Margins", "Net margin", "Unavailable", "Net margin data not available.", "neutral");
     }
 
     if (roa != null) {
+      const { result, config } = evalThreshold(
+        "Net income ÷ total assets", { roa }, roa, "%",
+        [
+          { key: "efficient", label: "Efficient above", value: 5, direction: "above", tone: "good" },
+          { key: "destroysValue", label: "Value-destroying at/below", value: 0, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Profit & Margins", "Return on Assets (ROA)", `${roa.toFixed(1)}%`,
         roa > 5
@@ -2339,11 +2424,18 @@ app.post("/api/check-stock", async (req, res) => {
           : roa > 0
           ? `ROA of ${roa.toFixed(1)}% is positive but modest. The company earns on its assets but could be more efficient.`
           : `ROA is negative — per your framework, this is a red flag indicating the company destroys value on its assets.`,
-        roa > 5 ? "good" : roa > 0 ? "neutral" : "bad"
+        result, config
       );
     }
 
     if (roe != null) {
+      const { result, config } = evalThreshold(
+        "Net income ÷ shareholder equity", { roe }, roe, "%",
+        [
+          { key: "excellent", label: "Excellent above", value: 15, direction: "above", tone: "good" },
+          { key: "destroysValue", label: "Value-destroying at/below", value: 0, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Profit & Margins", "Return on Equity (ROE)", `${roe.toFixed(1)}%`,
         roe > 15
@@ -2351,7 +2443,7 @@ app.post("/api/check-stock", async (req, res) => {
           : roe > 0
           ? `ROE of ${roe.toFixed(1)}% is positive — the company generates some return for shareholders, but has room to improve.`
           : `ROE is negative — the company is destroying shareholder value.`,
-        roe > 15 ? "good" : roe > 0 ? "neutral" : "bad"
+        result, config
       );
     }
 
@@ -2360,6 +2452,13 @@ app.post("/api/check-stock", async (req, res) => {
     const currentRatioVal = num(finData.currentRatio);
 
     if (debtToEquity != null) {
+      const { result, config } = evalThreshold(
+        "Total liabilities ÷ shareholder equity", { debtToEquity }, debtToEquity, "×",
+        [
+          { key: "conservative", label: "Conservative below", value: 1.5, direction: "below", tone: "good" },
+          { key: "highLeverage", label: "High-leverage warning above", value: 3, direction: "above", tone: "bad" },
+        ]
+      );
       record(
         "Debt & Safety", "Debt-to-equity ratio", debtToEquity.toFixed(2),
         debtToEquity < 0.5
@@ -2369,13 +2468,20 @@ app.post("/api/check-stock", async (req, res) => {
           : debtToEquity < 3
           ? `D/E of ${debtToEquity.toFixed(2)} indicates high leverage. Per your framework, high debt increases risk especially in rising interest rate environments.`
           : `D/E of ${debtToEquity.toFixed(2)} is very high — your framework flags this as a high-leverage warning. Companies burning through loans to stay afloat may look attractive but carry serious risk.`,
-        debtToEquity < 1.5 ? "good" : debtToEquity < 3 ? "neutral" : "bad"
+        result, config
       );
     } else {
       record("Debt & Safety", "Debt-to-equity ratio", "Unavailable", "Debt ratio data not available from this source.", "neutral");
     }
 
     if (currentRatioVal != null) {
+      const { result, config } = evalThreshold(
+        "Current assets ÷ current liabilities", { currentRatioVal }, currentRatioVal, "×",
+        [
+          { key: "liquid", label: "Comfortably liquid above", value: 1.5, direction: "above", tone: "good" },
+          { key: "liquidityRisk", label: "Liquidity risk at/below", value: 1, direction: "below", tone: "bad" },
+        ]
+      );
       record(
         "Debt & Safety", "Current ratio", currentRatioVal.toFixed(2),
         currentRatioVal > 2
@@ -2383,7 +2489,7 @@ app.post("/api/check-stock", async (req, res) => {
           : currentRatioVal > 1
           ? `Current ratio of ${currentRatioVal.toFixed(2)} means the company can cover short-term debts, but with limited buffer. Acceptable, not comfortable.`
           : `Current ratio below 1 (${currentRatioVal.toFixed(2)}) is a warning sign — the company has more near-term debt than short-term assets. Liquidity risk.`,
-        currentRatioVal > 1.5 ? "good" : currentRatioVal > 1 ? "neutral" : "bad"
+        result, config
       );
     } else {
       record("Debt & Safety", "Current ratio", "Unavailable", "Current ratio data not available.", "neutral");
@@ -2394,24 +2500,35 @@ app.post("/api/check-stock", async (req, res) => {
     const priceToBook = num(stock.summaryDetail?.priceToBook ?? stock.defaultKeyStatistics?.priceToBook);
 
     if (trailingPE != null) {
-      let peResult = "neutral", peMeaning;
+      let peMeaning;
       if (trailingPE < 0) {
-        peResult = "bad";
         peMeaning = `P/E is negative — the company is not currently profitable. Stay away per your framework.`;
       } else if (trailingPE < 15) {
-        peResult = "good";
         peMeaning = `P/E of ${trailingPE.toFixed(1)}x is low — the stock may be undervalued relative to earnings. Verify it is not a value trap (check the trend in earnings).`;
       } else if (trailingPE <= 25) {
-        peResult = "neutral";
         peMeaning = `P/E of ${trailingPE.toFixed(1)}x is in a fair range for most established companies.`;
       } else {
-        peResult = "bad";
         peMeaning = `P/E of ${trailingPE.toFixed(1)}x is elevated — the market is pricing in high growth. Any earnings disappointment could cause a sharp correction.`;
       }
-      record("Valuation", "P/E ratio (trailing 12 months)", `${trailingPE.toFixed(1)}x`, peMeaning, peResult);
+      const { result: peResult, config: peConfig } = evalThreshold(
+        "Price ÷ trailing 12-month EPS", { trailingPE }, trailingPE, "×",
+        [
+          { key: "unprofitable", label: "Unprofitable below", value: 0, direction: "below", tone: "bad" },
+          { key: "undervalued", label: "Possibly undervalued below", value: 15, direction: "below", tone: "good" },
+          { key: "elevated", label: "Elevated above", value: 25, direction: "above", tone: "bad" },
+        ]
+      );
+      record("Valuation", "P/E ratio (trailing 12 months)", `${trailingPE.toFixed(1)}x`, peMeaning, peResult, peConfig);
     }
 
     if (priceToBook != null) {
+      const { result, config } = evalThreshold(
+        "Price ÷ book value per share", { priceToBook }, priceToBook, "×",
+        [
+          { key: "reasonable", label: "Reasonable below", value: 3, direction: "below", tone: "good" },
+          { key: "elevated", label: "Elevated above", value: 5, direction: "above", tone: "bad" },
+        ]
+      );
       record(
         "Valuation", "Price-to-book ratio", `${priceToBook.toFixed(2)}x`,
         priceToBook < 1
@@ -2419,7 +2536,7 @@ app.post("/api/check-stock", async (req, res) => {
           : priceToBook < 3
           ? `P/B of ${priceToBook.toFixed(2)}x is reasonable — a small premium to book value, normal for profitable companies.`
           : `P/B of ${priceToBook.toFixed(2)}x is elevated — the market prices in significant intangibles (brand, IP, growth). Justified for quality companies, risky if growth slows.`,
-        priceToBook < 3 ? "good" : priceToBook < 5 ? "neutral" : "bad"
+        result, config
       );
     }
 
