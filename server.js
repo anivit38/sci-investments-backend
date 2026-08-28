@@ -1525,14 +1525,102 @@ app.get('/api/technical/:symbol', async (req, res) => {
 });
 
 /*──────────────────────────────────────────
+|  DCF helpers — live risk-free rate, analyst growth, historical growth  |
+└──────────────────────────────────────────*/
+
+// Live 10-year US Treasury yield (via FMP's treasury-rates endpoint) — a
+// fact, not a modeling choice, so this replaces the old hardcoded 5.25%
+// constant rather than being exposed as a PM-adjustable parameter. Cached
+// a few hours since it only moves once a day; falls back to the last known
+// good value, and only to a static default (explicitly flagged as such) if
+// the live feed has never once succeeded.
+let riskFreeCache = { rate: null, asOf: null, fetchedAt: 0 };
+const RISK_FREE_CACHE_TTL = 6 * 60 * 60 * 1000; // 6h
+const RISK_FREE_STATIC_FALLBACK = 0.045;
+
+async function getRiskFreeRate() {
+  const now = Date.now();
+  if (riskFreeCache.rate != null && now - riskFreeCache.fetchedAt < RISK_FREE_CACHE_TTL) {
+    return { rate: riskFreeCache.rate, asOf: riskFreeCache.asOf, isLive: true };
+  }
+  try {
+    const res = await axios.get("https://financialmodelingprep.com/stable/treasury-rates", {
+      params: { apikey: process.env.FMP_API_KEY, limit: 1 },
+    });
+    const row = res.data?.[0];
+    const y10 = Number(row?.year10);
+    if (Number.isFinite(y10) && y10 > 0 && y10 < 20) {
+      riskFreeCache = { rate: y10 / 100, asOf: row.date, fetchedAt: now };
+      return { rate: riskFreeCache.rate, asOf: riskFreeCache.asOf, isLive: true };
+    }
+  } catch (_) { /* fall through */ }
+  if (riskFreeCache.rate != null) {
+    return { rate: riskFreeCache.rate, asOf: riskFreeCache.asOf, isLive: true, stale: true };
+  }
+  return { rate: RISK_FREE_STATIC_FALLBACK, asOf: null, isLive: false };
+}
+
+// Analyst consensus near-term growth rate — uses only the two nearest-term
+// annual revenue estimates (most analyst coverage, most reliable) rather
+// than far-out years, which for many tickers have thin coverage and swing
+// wildly. A growth figure outside a plausible band is rejected rather than
+// trusted blindly — this sanity check applies identically to every ticker,
+// it isn't a way to steer any specific result.
+async function getAnalystGrowthRate(symbol) {
+  try {
+    const res = await axios.get("https://financialmodelingprep.com/stable/analyst-estimates", {
+      params: { symbol, period: "annual", limit: 6, apikey: process.env.FMP_API_KEY },
+    });
+    const rows = (res.data || [])
+      .filter(r => Number.isFinite(Number(r.revenueAvg)) && Number(r.revenueAvg) > 0 && r.date)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    if (rows.length < 2) return null;
+    const [first, second] = rows;
+    const growth = Number(second.revenueAvg) / Number(first.revenueAvg) - 1;
+    if (!Number.isFinite(growth) || growth < -0.5 || growth > 1.0) return null;
+    return { rate: growth, fromDate: first.date, toDate: second.date };
+  } catch (_) {
+    return null;
+  }
+}
+
+// Historical FCF CAGR from the same annual FCF history the regime test
+// already uses — first year to last year. Rejected (returns null) if the
+// base year is non-positive (CAGR is meaningless off a non-positive base)
+// or if the result is outside a plausible band.
+function historicalFcfGrowth(fcfHistory) {
+  const n = fcfHistory.length;
+  if (n < 2) return null;
+  const first = fcfHistory[0], last = fcfHistory[n - 1];
+  if (first <= 0 || last <= 0) return null;
+  const cagr = Math.pow(last / first, 1 / (n - 1)) - 1;
+  if (!Number.isFinite(cagr) || cagr < -0.5 || cagr > 1.0) return null;
+  return cagr;
+}
+
+/*──────────────────────────────────────────
 |  12) STOCK CHECKER                       |
 └──────────────────────────────────────────*/
 app.post("/api/check-stock", async (req, res) => {
   try {
-    let { symbol } = req.body || {};
+    let { symbol, dcfOptions } = req.body || {};
     if (!symbol) return res.status(400).json({ message: "symbol required." });
 
     const upper = String(symbol).toUpperCase().trim();
+
+    // PM-adjustable DCF parameters (see the DCF block below). Forecast
+    // years clamped to the 3–10 range; growth source restricted to the
+    // three supported options, defaulting to analyst consensus; cost-of-
+    // debt override only used when the data source doesn't report interest
+    // expense. Risk-free rate and ERP are deliberately NOT here — those are
+    // methodology/fact inputs, not PM opinions.
+    const dcfForecastYears = Math.max(3, Math.min(10, Number(dcfOptions?.forecastYears) || 7));
+    const dcfGrowthSource = ["analyst", "historical", "decaying"].includes(dcfOptions?.growthSource)
+      ? dcfOptions.growthSource : "analyst";
+    const dcfCostOfDebtOverride = Number.isFinite(Number(dcfOptions?.costOfDebtOverride))
+      ? Number(dcfOptions.costOfDebtOverride) : null;
+
+    
 
     const stock = await fetchStockData(upper);
     if (!stock || !stock.price) {
@@ -1875,19 +1963,52 @@ app.post("/api/check-stock", async (req, res) => {
 
     // WACC — weighted average cost of capital
     // Re = Rf + β × ERP  (CAPM);  Rd = interest expense / total debt
+    //
+    // RF is fetched live (10Y US Treasury) — a fact, not a modeling choice,
+    // so it's never hardcoded and never PM-adjustable. ERP is a fixed,
+    // documented methodology constant (5.5%, a standard long-run US equity
+    // risk premium) — also not PM-adjustable, since it's a predetermined
+    // part of the methodology rather than a per-ticker opinion. Both Re and
+    // WACC are hoisted (let, not const-inside-the-if) so the DCF block
+    // below can reuse the exact same numbers instead of recomputing them —
+    // previously the DCF section duplicated this whole calculation
+    // independently, which is how the two could in principle drift apart.
     const beta         = num(keyStats.beta) ?? 1.0;
     const totalDebt    = num(finData.totalDebt) ?? 0;
     const totalCash    = num(finData.totalCash ?? finData.totalCashAndShortTermInvestments) ?? 0;
-    const intExp       = Math.abs(num(finData.interestExpense) ?? 0);
+    const intExpRaw    = num(finData.interestExpense);
+    const intExpMissing = intExpRaw == null && totalDebt > 0;
+    const intExp       = Math.abs(intExpRaw ?? 0);
     const taxRate      = num(finData.effectiveTaxRate) ?? 0.21;
     const E            = num(marketCap) ?? 0;
     const V            = E + totalDebt;
+
+    const { rate: RF, asOf: rfAsOf, isLive: rfIsLive } = await getRiskFreeRate();
+    const ERP = 0.055; // fixed methodology constant — not PM-adjustable
+
+    // Cost of debt: never silently assume 0% when interest expense is
+    // simply missing from the data source. If it's missing, flag it
+    // visibly and let the PM supply their own estimate via
+    // dcfOptions.costOfDebtOverride; otherwise proceed with debt cost
+    // excluded (0%) but say so explicitly, so a reader knows WACC may be
+    // understated rather than seeing an unflagged, seemingly-precise 0%.
+    let Rd = 0;
+    let costOfDebtNote = "";
+    if (totalDebt > 0) {
+      if (!intExpMissing) {
+        Rd = intExp / totalDebt;
+      } else if (dcfCostOfDebtOverride != null) {
+        Rd = dcfCostOfDebtOverride;
+        costOfDebtNote = ` Cost of debt unavailable from the data source — using your override of ${(dcfCostOfDebtOverride * 100).toFixed(2)}%.`;
+      } else {
+        costOfDebtNote = " Cost of debt unavailable — interest expense not reported by the data source. Debt cost is excluded from WACC (0%), so WACC may be slightly understated; pass dcfOptions.costOfDebtOverride to supply your own estimate.";
+      }
+    }
+
+    let Re = null, WACC = null;
     if (V > 0 && E > 0) {
-      const RF   = 0.0525;  // ~5.25% 10-year US treasury
-      const ERP  = 0.055;   // equity risk premium (long-run avg)
-      const Re   = RF + beta * ERP;
-      const Rd   = totalDebt > 0 ? intExp / totalDebt : 0;
-      const WACC = (E / V * Re) + (totalDebt / V * Rd * (1 - taxRate));
+      Re   = RF + beta * ERP;
+      WACC = (E / V * Re) + (totalDebt / V * Rd * (1 - taxRate));
       const waccPct = WACC * 100;
       let waccResult = "neutral";
       if (waccPct < 7)        waccResult = "good";   // low cost of capital
@@ -1900,7 +2021,7 @@ app.post("/api/check-stock", async (req, res) => {
         "Financial Models",
         "WACC",
         `${waccPct.toFixed(2)}%`,
-        `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote} Below 7% is capital-efficient; above 12% is expensive.${isNonUsd ? ` Note: this model uses a US treasury risk-free rate as a proxy — ${currency}-denominated figures make the result directionally useful but less precise than for USD stocks.` : ""}`,
+        `Weighted Average Cost of Capital = ${waccPct.toFixed(2)}% (RF ${(RF * 100).toFixed(2)}%${rfIsLive ? ` live 10Y Treasury as of ${rfAsOf}` : " static fallback — live feed unavailable"}, β ${beta.toFixed(2)}, ERP ${(ERP * 100).toFixed(1)}% fixed, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%, D/V ${(totalDebt / V * 100).toFixed(0)}%).${spreadNote}${costOfDebtNote} Below 7% is capital-efficient; above 12% is expensive.${isNonUsd ? ` Note: this model uses a US treasury risk-free rate as a proxy — ${currency}-denominated figures make the result directionally useful but less precise than for USD stocks.` : ""}`,
         waccResult
       );
     } else {
@@ -1962,16 +2083,19 @@ app.post("/api/check-stock", async (req, res) => {
       );
     }
 
-    // DCF implied price (Gordon Growth / Free Cash Flow proxy)
+    // DCF implied price — two-stage: an explicit forecast phase (distinct
+    // yearly cash flows, each discounted individually) followed by a
+    // Gordon Growth terminal value computed at the end of that phase and
+    // discounted back. This replaces the previous single-stage perpetuity
+    // (fcfBase / (WACC-g)), which had no mechanism to reflect any growth
+    // above the 2.5% terminal rate for even a single year — a structural
+    // undervaluation for any company growing faster than that.
     //
-    // FCF base is regime-aware: a single-year FCF (e.g. Yahoo's TTM
-    // financialData.freeCashflow) can be a temporary spike or dip, and the
-    // Gordon Growth formula (fcf / (WACC - g)) amplifies that distortion
-    // because the denominator is small. Instead, fit a linear trend through
-    // the company's annual FCF history and only trust the latest-year value
-    // as the base if that trend is both reliable (R² gate) and material
-    // (normalized-slope gate). Otherwise fall back to the multi-year average,
-    // which is more robust for mean-reverting / lumpy FCF profiles.
+    // FCF base is regime-aware (unchanged): fit a linear trend through
+    // annual FCF history and only trust the latest-year value as the base
+    // if that trend is reliable (R² gate) and material (normalized-slope
+    // gate); otherwise use the multi-year average — more robust for
+    // mean-reverting / lumpy FCF profiles.
     //
     // Annual history comes from FMP (Yahoo's cashflowStatementHistory module
     // only returns netIncome/endDate for unauthenticated requests now — the
@@ -1998,7 +2122,7 @@ app.post("/api/check-stock", async (req, res) => {
       if (ttmFcf != null) fcfHistory = [ttmFcf];
     }
 
-    if (fcfHistory.length > 0 && V > 0 && E > 0) {
+    if (fcfHistory.length > 0 && V > 0 && E > 0 && Re != null && WACC != null) {
       const n = fcfHistory.length;
       const avgFcf = fcfHistory.reduce((a, b) => a + b, 0) / n;
 
@@ -2007,7 +2131,7 @@ app.post("/api/check-stock", async (req, res) => {
           "Financial Models",
           "DCF implied price",
           "DCF not meaningful (non-positive FCF)",
-          "Average free cash flow over the available history is zero or negative, so a Gordon Growth DCF would require dividing by a non-positive base. The DCF is skipped for this company — the other valuation models still apply.",
+          "Average free cash flow over the available history is zero or negative, so a DCF would require dividing by a non-positive base. The DCF is skipped for this company — the other valuation models still apply.",
           "neutral"
         );
       } else {
@@ -2049,27 +2173,92 @@ app.post("/api/check-stock", async (req, res) => {
           }
         }
 
-        const RF   = 0.0525;
-        const ERP  = 0.055;
-        const Re   = RF + (num(keyStats.beta) ?? 1.0) * ERP;
-        const WACC = (E / V * Re) + (totalDebt / V * (totalDebt > 0 ? intExp / totalDebt : 0) * (1 - taxRate));
-        const g    = 0.025; // terminal growth rate 2.5%
+        const g = 0.025; // terminal growth rate — fixed methodology constant, same status as ERP
         if (WACC > g) {
-          const dcfValue = fcfBase / (WACC - g);
           const sharesOut = num(keyStats.sharesOutstanding) ?? num(priceData.sharesOutstanding);
           if (sharesOut && sharesOut > 0 && currentPrice) {
-            const dcfPerShare = dcfValue / sharesOut;
+            // Resolve the explicit-phase growth rate per the PM's selected
+            // source, with an explicit, always-displayed fallback chain —
+            // never a silent substitution or fabricated number.
+            const historicalGrowth = historicalFcfGrowth(fcfHistory);
+            let analystGrowth = null;
+            try { analystGrowth = await getAnalystGrowthRate(upper); } catch (_) { /* treated as unavailable */ }
+
+            let growthRateUsed, growthSourceLabel, growthFallbackOccurred = false, growthPathFn;
+            if (dcfGrowthSource === "historical") {
+              if (historicalGrowth != null) {
+                growthRateUsed = historicalGrowth;
+                growthSourceLabel = "historical FCF CAGR";
+              } else {
+                growthRateUsed = g;
+                growthSourceLabel = "terminal rate (no historical FCF trend available)";
+                growthFallbackOccurred = true;
+              }
+              growthPathFn = () => growthRateUsed;
+            } else if (dcfGrowthSource === "decaying") {
+              const base = analystGrowth?.rate ?? historicalGrowth;
+              if (base != null) {
+                const capped = Math.max(Math.min(base, 0.20), g);
+                growthRateUsed = capped;
+                growthSourceLabel = `${analystGrowth != null ? "analyst" : "historical"}-anchored start rate, capped at ${(capped * 100).toFixed(1)}%, decaying linearly to terminal by year ${dcfForecastYears}`;
+                growthFallbackOccurred = analystGrowth == null;
+                growthPathFn = (t) => dcfForecastYears <= 1 ? g : capped - (capped - g) * (t - 1) / (dcfForecastYears - 1);
+              } else {
+                growthRateUsed = g;
+                growthSourceLabel = "terminal rate (no analyst or historical data — flat)";
+                growthFallbackOccurred = true;
+                growthPathFn = () => g;
+              }
+            } else { // "analyst" (default)
+              if (analystGrowth != null) {
+                growthRateUsed = analystGrowth.rate;
+                growthSourceLabel = "analyst consensus (near-term revenue growth)";
+              } else if (historicalGrowth != null) {
+                growthRateUsed = historicalGrowth;
+                growthSourceLabel = "historical FCF CAGR (analyst estimates unavailable)";
+                growthFallbackOccurred = true;
+              } else {
+                growthRateUsed = g;
+                growthSourceLabel = "terminal rate (no analyst or historical data available)";
+                growthFallbackOccurred = true;
+              }
+              growthPathFn = () => growthRateUsed;
+            }
+
+            // Two-stage valuation: explicit forecast phase discounted
+            // year-by-year, then a Gordon Growth terminal value at the end
+            // of the forecast period, itself discounted back to present.
+            let fcfT = fcfBase;
+            let pvExplicit = 0;
+            for (let t = 1; t <= dcfForecastYears; t++) {
+              fcfT = fcfT * (1 + growthPathFn(t));
+              pvExplicit += fcfT / Math.pow(1 + WACC, t);
+            }
+            const terminalFcf = fcfT * (1 + g);
+            const terminalValue = terminalFcf / (WACC - g);
+            const pvTerminal = terminalValue / Math.pow(1 + WACC, dcfForecastYears);
+            const equityValue = pvExplicit + pvTerminal;
+
+            const dcfPerShare = equityValue / sharesOut;
             const upside = (dcfPerShare / currentPrice - 1) * 100;
             const dcfResult = upside > 10 ? "good" : upside < -10 ? "bad" : "neutral";
+
             const regimeNote = n >= 2
               ? `FCF regime: ${regime} (R²=${r2.toFixed(2)}, normalized slope=${normalizedSlopePct.toFixed(1)}%/yr over ${n}y) — base = ${regime === "trending" ? "latest-year" : `${n}-year average`} FCF of ${cur((fcfBase / 1e9).toFixed(2))}B.`
               : `Only ${n} year(s) of FCF data available — using it directly as the base (${cur((fcfBase / 1e9).toFixed(2))}B).`;
-            const DEBUG = ` [DEBUG fcfHistoryByYear=${JSON.stringify(fcfStatements.map(s => ({ year: new Date(s.endDate).getFullYear(), fcfB: +(s.fcf/1e9).toFixed(3) })))} n=${n} r2=${r2} normSlopePct=${normalizedSlopePct} regime=${regime} fcfBaseB=${fcfBase/1e9} beta=${num(keyStats.beta)} RF=${RF} ERP=${ERP} Re=${Re} totalDebtB=${totalDebt/1e9} intExpB=${intExp/1e9} Rd=${totalDebt>0?intExp/totalDebt:0} taxRate=${taxRate} EB=${E/1e9} VB=${V/1e9} WACC=${WACC} g=${g} dcfValueB=${dcfValue/1e9} sharesOutB=${sharesOut/1e9} currentPrice=${currentPrice} dcfPerShare=${dcfPerShare}]`;
+
+            const forecastLenNote = dcfForecastYears < 7
+              ? " (shorter forecast = more conservative, lowers valuation)"
+              : dcfForecastYears > 7
+              ? " (longer forecast = more aggressive, raises valuation)"
+              : "";
+            const fallbackNote = growthFallbackOccurred ? " — FALLBACK: requested source had no usable data" : "";
+
             record(
               "Financial Models",
               "DCF implied price",
               `${cur(dcfPerShare.toFixed(2))} (${upside > 0 ? "+" : ""}${upside.toFixed(0)}% vs current)`,
-              `FCF-based DCF using WACC as discount rate and 2.5% terminal growth. ${regimeNote} Implied fair value ${cur(dcfPerShare.toFixed(2))} vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}${DEBUG}`,
+              `Two-stage DCF: ${dcfForecastYears}-year explicit forecast${forecastLenNote} at ${(growthRateUsed * 100).toFixed(1)}%/yr (source: ${growthSourceLabel}${fallbackNote}), then a Gordon Growth terminal value at ${(g * 100).toFixed(1)}%. ${regimeNote} WACC ${(WACC * 100).toFixed(2)}% (RF ${(RF * 100).toFixed(2)}%${rfIsLive ? ` live as of ${rfAsOf}` : " static fallback"}, ERP ${(ERP * 100).toFixed(1)}% fixed, β ${beta.toFixed(2)}, Re ${(Re * 100).toFixed(1)}%, Rd ${(Rd * 100).toFixed(1)}%).${costOfDebtNote} PV of explicit phase ${cur((pvExplicit / 1e9).toFixed(1))}B + PV of terminal value ${cur((pvTerminal / 1e9).toFixed(1))}B = implied equity value ${cur((equityValue / 1e9).toFixed(1))}B ÷ ${(sharesOut / 1e9).toFixed(2)}B shares = ${cur(dcfPerShare.toFixed(2))}/share vs market price ${cur(currentPrice.toFixed(2))}. ${upside > 10 ? "Stock appears undervalued." : upside < -10 ? "Stock appears overvalued." : "Stock appears fairly priced."}`,
               dcfResult
             );
           }
