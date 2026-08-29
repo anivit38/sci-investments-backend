@@ -1319,6 +1319,28 @@ app.get("/api/search-ticker", async (req, res) => {
   const raw = (req.query.q || "").trim();
   if (!raw) return res.status(400).json({ error: "Missing query" });
 
+  // Multi-result mode for a live autocomplete dropdown (portfolio editor).
+  // Uses Yahoo's general search rather than the SEC ticker list below —
+  // the SEC list only covers US public-company stock issuers, so it can
+  // never surface something like a Fidelity mutual fund; Yahoo's search
+  // spans equities, ETFs, and mutual funds together.
+  if (req.query.multi === "1") {
+    try {
+      const r = await yahooFinance.search(raw, { quotesCount: 8, newsCount: 0 });
+      const results = (r.quotes || [])
+        .filter(q => q.symbol && (q.shortname || q.longname))
+        .map(q => ({
+          symbol: q.symbol,
+          name: q.shortname || q.longname,
+          type: q.quoteType || null, // EQUITY | ETF | MUTUALFUND | INDEX | ...
+          exchange: q.exchange || null,
+        }));
+      return res.json({ results });
+    } catch (e) {
+      return res.json({ results: [] });
+    }
+  }
+
   const q = raw.toLowerCase();
   try {
     const tickers = await getSecTickers();
