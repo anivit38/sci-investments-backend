@@ -1324,21 +1324,47 @@ app.get("/api/search-ticker", async (req, res) => {
   // the SEC list only covers US public-company stock issuers, so it can
   // never surface something like a Fidelity mutual fund; Yahoo's search
   // spans equities, ETFs, and mutual funds together.
+  //
+  // Deliberately hits Yahoo's search endpoint directly rather than going
+  // through yahoo-finance2: that library performs a cookie/crumb auth
+  // handshake before every call, and it is that handshake — not the search
+  // itself — that gets throttled ("Too Many Requests"), which made the
+  // library return nothing here while the plain endpoint answered fine.
+  // The search endpoint needs no auth, just a browser User-Agent.
   if (req.query.multi === "1") {
-    try {
-      const r = await yahooFinance.search(raw, { quotesCount: 8, newsCount: 0 });
-      const results = (r.quotes || [])
-        .filter(q => q.symbol && (q.shortname || q.longname))
-        .map(q => ({
-          symbol: q.symbol,
-          name: q.shortname || q.longname,
-          type: q.quoteType || null, // EQUITY | ETF | MUTUALFUND | INDEX | ...
-          exchange: q.exchange || null,
-        }));
-      return res.json({ results });
-    } catch (e) {
-      return res.json({ results: [] });
+    const hosts = ["query2", "query1"]; // query1 is a straight mirror; retry there if query2 is unhappy
+    for (const host of hosts) {
+      try {
+        const r = await axios.get(`https://${host}.finance.yahoo.com/v1/finance/search`, {
+          params: { q: raw, quotesCount: 10, newsCount: 0 },
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+          timeout: 6000,
+        });
+        const results = (r.data?.quotes || [])
+          .map(q => {
+            // Yahoo sometimes returns names with a stray trailing quote/comma
+            // (e.g. 'Fidelity Insights Class A",') — tidy those rather than
+            // rendering the artifact straight into the dropdown.
+            const name = String(q.shortname || q.longname || "").replace(/["',\s]+$/, "").trim();
+            return {
+              symbol: q.symbol,
+              name,
+              type: q.quoteType || null, // EQUITY | ETF | MUTUALFUND | INDEX | ...
+              exchange: q.exchange || null,
+            };
+          })
+          // Drop rows with no usable name, and rows where Yahoo echoes the
+          // symbol back as the name (opaque Canadian fund ids like
+          // "0P0001HRPA.TO") — a PM can't identify those from the dropdown,
+          // so showing them is worse than omitting them.
+          .filter(q => q.symbol && q.name && q.name.toUpperCase() !== q.symbol.toUpperCase())
+          .slice(0, 8);
+        return res.json({ results });
+      } catch (e) {
+        // try the next host; fall through to [] if both fail
+      }
     }
+    return res.json({ results: [] });
   }
 
   const q = raw.toLowerCase();
